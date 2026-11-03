@@ -8,6 +8,7 @@ from iptv_auto.database import (
     SCHEMA_VERSION,
     DatabaseSchemaError,
     connect_database,
+    database_session,
     initialize_database,
 )
 
@@ -16,8 +17,7 @@ class DatabaseSchemaTests(unittest.TestCase):
     def _tables(self, path):
         with connect_database(path) as db:
             return {
-                row["name"]
-                for row in db.execute(
+                row["name"] for row in db.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
@@ -30,7 +30,7 @@ class DatabaseSchemaTests(unittest.TestCase):
             self.assertTrue({
                 "runs", "sources", "source_checks", "lines", "channels",
                 "source_lines", "line_channels", "measurements", "deep_probes",
-                "line_scores", "source_scores", "blacklists",
+                "line_scores", "source_scores", "blacklists", "publications",
             }.issubset(tables))
             with connect_database(path) as db:
                 self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
@@ -49,6 +49,24 @@ class DatabaseSchemaTests(unittest.TestCase):
             with patch("iptv_auto.database.connect_database", side_effect=tracked_connect):
                 initialize_database(path)
 
+            self.assertEqual(len(opened), 1)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                opened[0].execute("SELECT 1")
+
+    def test_database_session_always_closes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "session.sqlite3"
+            real_connect = connect_database
+            opened = []
+
+            def tracked_connect(db_path):
+                conn = real_connect(db_path)
+                opened.append(conn)
+                return conn
+
+            with patch("iptv_auto.database.connect_database", side_effect=tracked_connect):
+                with database_session(path) as db:
+                    db.execute("CREATE TABLE sample (id INTEGER)")
             self.assertEqual(len(opened), 1)
             with self.assertRaises(sqlite3.ProgrammingError):
                 opened[0].execute("SELECT 1")
