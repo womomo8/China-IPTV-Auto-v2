@@ -1,8 +1,10 @@
 """Versioned SQLite schema for the single v2 processing pipeline."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
+from typing import Iterator
 
 
 SCHEMA_VERSION = 1
@@ -133,12 +135,25 @@ CREATE TABLE IF NOT EXISTS source_scores (
 
 CREATE TABLE IF NOT EXISTS blacklists (
     blacklist_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    target_type TEXT NOT NULL,
+    target_type TEXT NOT NULL CHECK (target_type IN ('source', 'line', 'url')),
     target_id TEXT NOT NULL,
     reason TEXT NOT NULL,
     evidence_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS publications (
+    publication_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES runs(run_id),
+    published_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    playlist_path TEXT NOT NULL,
+    content_sha256 TEXT,
+    entry_count INTEGER NOT NULL DEFAULT 0,
+    previous_sha256 TEXT,
+    preserved_previous INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_source_checks_source_time
@@ -161,6 +176,8 @@ CREATE INDEX IF NOT EXISTS idx_source_lines_line
     ON source_lines(line_id);
 CREATE INDEX IF NOT EXISTS idx_blacklists_target_active
     ON blacklists(target_type, target_id, active);
+CREATE INDEX IF NOT EXISTS idx_publications_run_time
+    ON publications(run_id, published_at);
 
 PRAGMA user_version = 1;
 COMMIT;
@@ -186,8 +203,19 @@ def connect_database(path: str | Path) -> sqlite3.Connection:
         raise
 
 
+@contextmanager
+def database_session(path: str | Path) -> Iterator[sqlite3.Connection]:
+    """Transaction scope that always closes the SQLite connection."""
+    connection = connect_database(path)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 def initialize_database(path: str | Path) -> None:
-    """Create a fresh v2 database atomically; never silently migrate unknown schemas."""
+    """Create a fresh v2 database; never silently migrate an unknown schema."""
     connection = connect_database(path)
     try:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -196,7 +224,6 @@ def initialize_database(path: str | Path) -> None:
         ).fetchall()
 
         if version == SCHEMA_VERSION:
-            # Idempotent verification: the schema script uses IF NOT EXISTS.
             connection.executescript(SCHEMA)
             return
 
