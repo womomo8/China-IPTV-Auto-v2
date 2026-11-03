@@ -1,6 +1,6 @@
 import unittest
 
-from iptv_auto.identity import stable_result_id, stable_channel_id
+from iptv_auto.identity import normalize_url, stable_result_id, stable_channel_id
 
 
 class IdentityTests(unittest.TestCase):
@@ -21,6 +21,20 @@ class IdentityTests(unittest.TestCase):
             stable_channel_id(" CCTV ", "CCTV 5"),
             stable_channel_id("cctv", "CCTV5"),
         )
+
+    def test_ipv6_authority_keeps_brackets(self):
+        self.assertEqual(
+            normalize_url("http://[2001:DB8::1]:80/live"),
+            "http://[2001:db8::1]/live",
+        )
+
+    def test_non_default_and_zero_ports_are_preserved(self):
+        self.assertEqual(normalize_url("http://example.com:8080/a"), "http://example.com:8080/a")
+        self.assertEqual(normalize_url("http://example.com:0/a"), "http://example.com:0/a")
+
+    def test_invalid_port_does_not_crash_identity(self):
+        value = "http://example.com:99999/live"
+        self.assertEqual(normalize_url(value), value)
 
 
 if __name__ == "__main__":
