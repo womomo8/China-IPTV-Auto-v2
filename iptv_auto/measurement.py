@@ -17,7 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .database import database_session
-
+from .ipv4 import check_ipv4_url
 
 MAX_READ_BYTES = 4096
 MAX_ALLOWED_CONCURRENCY = 12
