@@ -1,4 +1,3 @@
-
 """Persistent source pool, fetch history and evidence-based source scoring."""
 from __future__ import annotations
 
@@ -15,7 +14,7 @@ from .identity import normalize_url, stable_source_id
 POOL_CAPACITY = 30
 NEW_SOURCES_PER_RUN = 8
 SUCCESS_STATUSES = {"ok", "success", "passed"}
-FULL_COVERAGE_CHANNELS = 20
+SOURCE_SCORE_HISTORY_LIMIT = 20
 
 
 @dataclass(frozen=True)
@@ -30,10 +29,9 @@ class RegistryResult:
 class SourceScore:
     source_id: str
     total_score: float
-    line_success_rate: float
     fetch_success_rate: float
-    effective_rounds: int
-    channel_count: int
+    accepted_line_rate: float
+    effective_checks: int
 
 
 def _now() -> str:
@@ -132,6 +130,7 @@ class SourceRegistry:
             """
         ).fetchone()
         return str(row["source_id"]) if row else None
+
     def _deactivate_weakest(self, db) -> str | None:
         source_id = self._lowest_scored_source(db)
         if source_id is None:
@@ -177,7 +176,7 @@ class SourceRegistry:
                 seen.add(value)
 
         with database_session(self.database_path) as db:
-             # Manual sources are processed first, but use the same eviction rules.
+            # Manual sources are processed first, but use the same eviction rules.
             for _candidate, identity in manual:
                 source_id, url, name, _kind = identity
 
@@ -399,7 +398,7 @@ class SourceRegistry:
         run_id: int | None = None,
         scored_at: str | None = None,
     ) -> SourceScore | None:
-        """Calculate source reliability from persisted fetch and line history."""
+        """Score source reliability using only its 20 most recent fetch checks."""
         if not isinstance(source_id, str) or not source_id.strip():
             raise ValueError("source_id 不能为空")
 
@@ -415,87 +414,49 @@ class SourceRegistry:
 
             checks = db.execute(
                 """
-                SELECT run_id, status
+                SELECT run_id, status, discovered_lines, accepted_lines
                   FROM source_checks
                  WHERE source_id = ?
                  ORDER BY checked_at DESC, source_check_id DESC
+                 LIMIT ?
                 """,
-                (source_id,),
+                (source_id, SOURCE_SCORE_HISTORY_LIMIT),
             ).fetchall()
 
             if not checks:
                 return None
 
-            fetch_total = len(checks)
-            fetch_successes = sum(_is_success(row["status"]) for row in checks)
-            fetch_rate = fetch_successes / fetch_total if fetch_total else 0.0
+            effective_checks = len(checks)
+            fetch_successes = sum(
+                _is_success(row["status"]) for row in checks
+            )
+            fetch_rate = fetch_successes / effective_checks
 
-            line_rows = db.execute(
-                """
-                SELECT m.status, m.evidence_json
-                  FROM source_lines sl
-                  JOIN measurements m ON m.line_id = sl.line_id
-                 WHERE sl.source_id = ?
-                 ORDER BY m.measured_at DESC, m.measurement_id DESC
-                """,
-                (source_id,),
-            ).fetchall()
-
-            basic_rows = []
-            for row in line_rows:
-                try:
-                    evidence = json.loads(row["evidence_json"] or "{}")
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    evidence = {}
-                if (
-                    isinstance(evidence, dict)
-                    and evidence.get("measurement_stage") == "stability_retest"
-                ):
-                    continue
-                basic_rows.append(row)
-
-            effective_rounds = len(basic_rows)
-            if effective_rounds:
-                line_successes = sum(
-                    str(row["status"]).lower() == "success"
-                    for row in basic_rows
-                )
-                line_rate = line_successes / effective_rounds
-            else:
-                line_rate = 0.0
-
-            channel_count = int(
-                db.execute(
-                    """
-                    SELECT COUNT(DISTINCT lc.channel_id)
-                      FROM source_lines sl
-                      JOIN line_channels lc ON lc.line_id = sl.line_id
-                     WHERE sl.source_id = ?
-                    """,
-                    (source_id,),
-                ).fetchone()[0]
+            discovered_total = sum(
+                max(0, int(row["discovered_lines"] or 0))
+                for row in checks
+            )
+            accepted_total = sum(
+                max(0, int(row["accepted_lines"] or 0))
+                for row in checks
+            )
+            accepted_rate = (
+                accepted_total / discovered_total
+                if discovered_total > 0
+                else 0.0
             )
 
-            # A source with fetch history but no line measurements is not
-            # treated as a successful line source.
-            coverage_score = min(
-                100.0,
-                channel_count / FULL_COVERAGE_CHANNELS * 100.0,
-            )
             total = round(
-                line_rate * 55.0
-                + fetch_rate * 30.0
-                + coverage_score * 0.15,
+                fetch_rate * 60.0 + accepted_rate * 40.0,
                 2,
             )
 
             score = SourceScore(
                 source_id=source_id,
                 total_score=total,
-                line_success_rate=round(line_rate, 4),
                 fetch_success_rate=round(fetch_rate, 4),
-                effective_rounds=effective_rounds,
-                channel_count=channel_count,
+                accepted_line_rate=round(accepted_rate, 4),
+                effective_checks=effective_checks,
             )
 
             selected_run_id = run_id
@@ -509,13 +470,12 @@ class SourceRegistry:
                 raise ValueError(f"任务记录不存在：run_id={selected_run_id}")
 
             components = {
-                "line_success_rate": score.line_success_rate,
                 "fetch_success_rate": score.fetch_success_rate,
-                "effective_rounds": score.effective_rounds,
-                "channel_count": score.channel_count,
-                "line_weight": 55,
-                "fetch_weight": 30,
-                "channel_coverage_weight": 15,
+                "accepted_line_rate": score.accepted_line_rate,
+                "effective_checks": score.effective_checks,
+                "history_limit": SOURCE_SCORE_HISTORY_LIMIT,
+                "fetch_weight": 60,
+                "accepted_line_weight": 40,
             }
 
             db.execute(
