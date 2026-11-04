@@ -334,7 +334,7 @@ def test_stability_retests_are_saved_with_stage_evidence(
     with sqlite3.connect(path) as db:
         rows = db.execute(
             """
-            SELECT status, round_no, evidence_json
+            SELECT line_id, status, round_no, evidence_json
               FROM measurements
              WHERE run_id = ?
             """,
@@ -342,11 +342,21 @@ def test_stability_retests_are_saved_with_stage_evidence(
         ).fetchall()
 
     assert len(rows) == 10
-    assert all(row[0] == "success" for row in rows)
-    assert len({row[1] for row in rows}) == 10
+    assert all(row[1] == "success" for row in rows)
+
+    rounds_by_line = {}
 
     for row in rows:
-        evidence = json.loads(row[2])
+        rounds_by_line.setdefault(row[0], set()).add(row[2])
+
+    assert len(rounds_by_line) == 5
+    assert all(
+        rounds == {1, 2}
+        for rounds in rounds_by_line.values()
+    )
+
+    for row in rows:
+        evidence = json.loads(row[3])
         assert evidence["measurement_stage"] == "stability_retest"
         assert evidence["media_playback_confirmed"] is False
         assert evidence["environment_type"] == "cloud"
