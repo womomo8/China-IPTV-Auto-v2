@@ -257,7 +257,85 @@ def test_concurrency_is_limited_to_three(tmp_path):
             runner_identity="test-runner",
             max_concurrency=4,
         )
+def test_run_deep_probes_resumes_existing_pending_record(
+    tmp_path,
+    monkeypatch,
+):
+    database_path, run_id = _database(tmp_path)
 
+    with sqlite3.connect(database_path) as db:
+        cursor = db.execute(
+            """
+            INSERT INTO deep_probes
+                (
+                    run_id,
+                    line_id,
+                    probed_at,
+                    runner_identity,
+                    environment_type,
+                    status,
+                    evidence_json
+                )
+            VALUES (?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                run_id,
+                "line-1",
+                "2026-01-01T00:00:00+00:00",
+                "test-runner",
+                "cloud",
+                json.dumps({"probe_state": "pending"}),
+            ),
+        )
+        original_probe_id = cursor.lastrowid
+
+    def fake_probe(**kwargs):
+        return deep_probe.DeepProbeRecord(
+            channel_id=kwargs["channel_id"],
+            line_id=kwargs["line_id"],
+            status="passed",
+            has_video=True,
+            has_audio=True,
+            width=1920,
+            height=1080,
+            video_codec="h264",
+            audio_codec="aac",
+            duration_seconds=10.0,
+            evidence={"resumed": True},
+        )
+
+    monkeypatch.setattr(deep_probe, "_probe_one", fake_probe)
+
+    result = deep_probe.run_deep_probes(
+        database_path,
+        run_id,
+        [
+            {
+                "channel_id": "channel-a",
+                "line_id": "line-1",
+                "total_score": 90,
+            }
+        ],
+        runner_identity="test-runner",
+        timeout_seconds=5,
+    )
+
+    assert result.passed_count == 1
+
+    with sqlite3.connect(database_path) as db:
+        rows = db.execute(
+            """
+            SELECT probe_id, status
+              FROM deep_probes
+             WHERE run_id = ?
+               AND line_id = 'line-1'
+            """,
+            (run_id,),
+        ).fetchall()
+
+    assert len(rows) == 1
+    assert rows[0][0] == original_probe_id
+    assert rows[0][1] == "passed"
 
 def test_timeout_is_limited_to_sixty_seconds(tmp_path):
     database_path, run_id = _database(tmp_path)
