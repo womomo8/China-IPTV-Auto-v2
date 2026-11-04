@@ -299,6 +299,13 @@ def _discover_and_ingest(
                 "source_type": source["source_type"],
                 "duplicate_count": ingest_result.duplicate_count,
                 "rejected_count": len(ingest_result.rejected),
+                "ipv4_admission": {
+                    "passed": ingest_result.ipv4_passed_count,
+                    "excluded": ingest_result.ipv4_excluded_count,
+                    "temporary_failure": (
+                        ingest_result.ipv4_temporary_failure_count
+                    ),
+                },
             },
         )
 
@@ -323,6 +330,11 @@ def _discover_and_ingest(
         "parsed_entries": parsed_count,
         "accepted_entries": accepted_count,
         "rejected_entries": rejected_count,
+        "ipv4_admission": {
+            "passed": ipv4_passed_count,
+            "excluded": ipv4_excluded_count,
+            "temporary_failure": ipv4_temporary_failure_count,
+        },
         "scored_sources": source_scores,
     }
 
