@@ -280,6 +280,12 @@ def _discover_and_ingest(
         accepted_count += ingest_result.accepted_count
         rejected_count += len(ingest_result.rejected)
 
+        ipv4_passed_count += ingest_result.ipv4_passed_count
+        ipv4_excluded_count += ingest_result.ipv4_excluded_count
+        ipv4_temporary_failure_count += (
+            ingest_result.ipv4_temporary_failure_count
+        )
+
         source_registry.record_source_check(
             run_id=run_id,
             source_id=source["source_id"],
