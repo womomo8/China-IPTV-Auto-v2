@@ -108,7 +108,10 @@ def run_stability_retests(
         raise ValueError("当前只允许 cloud，不能冒充福建移动家庭实测")
     if type(retests) is not int or not (1 <= retests <= MAX_RETESTS):
         raise ValueError("稳定性复测次数必须为1或2")
-
+    if type(max_concurrency) is not int or not (
+        1 <= max_concurrency <= MAX_CONCURRENCY
+    ):
+        raise ValueError("稳定性复测并发数必须是1至3之间的整数")
     timeout, concurrency = _validate_runtime_options(
         timeout_seconds,
         max_concurrency,
