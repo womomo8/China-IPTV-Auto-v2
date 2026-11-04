@@ -473,19 +473,15 @@ def _load_candidates_and_reserve_rounds(
                 (line_id, runner_identity, environment_type),
             ).fetchall()
 
-            occupied_rounds = set()
-            basic_rounds = []
-            for historical in history:
-                historical_round = int(historical["round_no"])
-                occupied_rounds.add(historical_round)
-                if not _is_stability_retest(
-                    _decode_evidence(historical["evidence_json"])
-                ):
-                    basic_rounds.append(historical_round)
 
-            # Stability retests occupy their round numbers but do not advance
-            # the basic-round sequence.
-            next_round = max(basic_rounds, default=0) + 1
+            occupied_rounds = set()
+            for historical in history:
+                occupied_rounds.add(int(historical["round_no"]))
+
+            # Fill the lowest unused round numbers first.
+            # Stability retests occupy their numbers but do not count
+            # toward the required basic measurement rounds.
+            next_round = 1
 
             # Complete the three basic attempts in this run. A failed attempt
             # remains a failed attempt; it is not silently retried as success.
