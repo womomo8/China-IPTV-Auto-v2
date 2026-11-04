@@ -151,7 +151,33 @@ class LineRegistryTests(unittest.TestCase):
 
         self.assertEqual(result.accepted_count, 0)
         self.assertEqual(result.rejected[0].reason, "blacklisted")
+    def test_blacklisted_normalized_url_is_rejected(self):
+        entry = make_entry(
+            url="https://EXAMPLE.com:443/live.m3u8"
+        )
 
+        with database_session(self.db_path) as db:
+            db.execute(
+                """
+                INSERT INTO blacklists
+                    (target_type, target_id, reason, created_at)
+                VALUES (
+                    'url',
+                    'https://example.com/live.m3u8',
+                    'confirmed invalid content',
+                    '2026-11-04T00:00:00Z'
+                )
+                """
+            )
+
+        result = self.registry.ingest(
+            run_id=1,
+            source_id="source-test",
+            entries=[entry],
+        )
+
+        self.assertEqual(result.accepted_count, 0)
+        self.assertEqual(result.rejected[0].reason, "blacklisted")
     def test_transient_failures_are_not_added_to_blacklist(self):
         entry = make_entry()
         result = self.registry.ingest(
