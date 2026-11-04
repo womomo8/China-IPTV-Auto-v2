@@ -158,22 +158,28 @@ class SourceRegistryTests(unittest.TestCase):
         score = self.registry.calculate_source_score(item.source_id)
         self.assertIsNone(score)
 
-    def test_source_score_uses_real_history(self):
+    def test_source_score_uses_fetch_history_not_line_quality(self):
         item = Candidate("有历史来源", "https://example.com/history.m3u")
         self.registry.sync_candidates([item])
 
-        with database_session(self.db_path) as db:
-            db.execute(
-                """
-                INSERT INTO source_checks
-                    (run_id, source_id, checked_at, status,
-                     discovered_lines, accepted_lines)
-                VALUES (1, ?, '2026-11-04T00:00:00Z',
-                        'success', 1, 1)
-                """,
-                (item.source_id,),
-            )
+        self.registry.record_source_check(
+            run_id=1,
+            source_id=item.source_id,
+            status="success",
+            discovered_lines=100,
+            accepted_lines=75,
+        )
 
+        score = self.registry.calculate_source_score(item.source_id)
+
+        self.assertIsNotNone(score)
+        self.assertEqual(score.fetch_success_rate, 1.0)
+        self.assertEqual(score.accepted_line_rate, 0.75)
+        self.assertEqual(score.effective_checks, 1)
+        self.assertEqual(score.total_score, 90.0)
+
+        # Line measurements must not affect source reliability scoring.
+        with database_session(self.db_path) as db:
             db.execute(
                 """
                 INSERT INTO lines
@@ -183,15 +189,6 @@ class SourceRegistryTests(unittest.TestCase):
                         '2026-11-04T00:00:00Z')
                 """
             )
-
-            db.execute(
-                """
-                INSERT INTO channels
-                    (channel_id, category, name)
-                VALUES ('channel-test', '体育', 'CCTV-5')
-                """
-            )
-
             db.execute(
                 """
                 INSERT INTO source_lines
@@ -201,37 +198,20 @@ class SourceRegistryTests(unittest.TestCase):
                 """,
                 (item.source_id,),
             )
-
             db.execute(
                 """
-                INSERT INTO line_channels
-                    (line_id, channel_id, first_seen_at, last_seen_at)
-                VALUES ('line-test', 'channel-test',
-                        '2026-11-04T00:00:00Z',
-                        '2026-11-04T00:00:00Z')
+                INSERT INTO measurements
+                    (run_id, line_id, round_no, measured_at,
+                     runner_identity, environment_type, status)
+                VALUES (1, 'line-test', 1, '2026-11-04T00:00:00Z',
+                        'test', 'cloud', 'failed')
                 """
             )
 
-            for round_no in (1, 2, 3):
-                db.execute(
-                    """
-                    INSERT INTO measurements
-                        (run_id, line_id, round_no, measured_at,
-                         runner_identity, environment_type, status)
-                    VALUES (1, 'line-test', ?, '2026-11-04T00:00:00Z',
-                            'test', 'cloud', 'success')
-                    """,
-                    (round_no,),
-                )
-
-        score = self.registry.calculate_source_score(item.source_id)
-
-        self.assertIsNotNone(score)
-        self.assertEqual(score.line_success_rate, 1.0)
-        self.assertEqual(score.fetch_success_rate, 1.0)
-        self.assertEqual(score.effective_rounds, 3)
-        self.assertEqual(score.channel_count, 1)
-        self.assertGreater(score.total_score, 80)
+        score_after_measurement = self.registry.calculate_source_score(
+            item.source_id
+        )
+        self.assertEqual(score_after_measurement.total_score, 90.0)
 
     def test_lowest_scored_manual_source_can_be_evicted(self):
         manual = Candidate(
