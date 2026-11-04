@@ -320,7 +320,25 @@ def test_two_placeholder_frames_are_confirmed(
     assert result.records[0].category == "placeholder"
     assert result.blacklisted_count == 1
 
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("unknown", False),
+        ("no_flag_detected", True),
+        ("confirmed", True),
+    ],
+)
+def test_already_checked_only_skips_completed_results(
+    status,
+    expected,
+):
+    evidence = json.dumps({
+        "content_check": {
+            "status": status,
+        }
+    })
 
+    assert content_check._already_checked(evidence) is expected
 def test_ocr_failure_is_unknown_not_clean(
     tmp_path,
     monkeypatch,
