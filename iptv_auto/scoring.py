@@ -1,4 +1,3 @@
-
 """Evidence-based line scoring and bounded deep-probe candidate selection."""
 from __future__ import annotations
 
@@ -232,17 +231,6 @@ def _content_verdict(evidence_json: object) -> str:
     ):
         return "clean"
 
-    # Legacy deep-probe evidence may contain a single explicit clean flag.
-    if (
-        content_class in CLEAN_CONTENT_CLASSES
-        and (
-            ad_detected is False
-            or placeholder_detected is False
-        )
-        and status not in {"unknown", "confirmed"}
-    ):
-        return "clean"
-
     return "unknown"
 
 
@@ -318,6 +306,7 @@ def _load_source_scores(db, line_id: str) -> list[float]:
 def _score_one_line(
     db,
     *,
+    run_id: int,
     line_id: str,
     url: str,
     runner_identity: str,
@@ -329,12 +318,13 @@ def _score_one_line(
         SELECT status, latency_ms, throughput_kbps, measured_at,
                round_no, error_class, evidence_json
           FROM measurements
-         WHERE line_id = ?
+         WHERE run_id = ?
+           AND line_id = ?
            AND runner_identity = ?
            AND environment_type = ?
          ORDER BY measured_at DESC, measurement_id DESC
         """,
-        (line_id, runner_identity, environment_type),
+        (run_id, line_id, runner_identity, environment_type),
     ).fetchall()
 
     # Stability retests are additional evidence, never basic rounds.
@@ -356,12 +346,13 @@ def _score_one_line(
         """
         SELECT status, evidence_json, probed_at
           FROM deep_probes
-         WHERE line_id = ?
+         WHERE run_id = ?
+           AND line_id = ?
            AND runner_identity = ?
            AND environment_type = ?
          ORDER BY probed_at DESC, probe_id DESC
         """,
-        (line_id, runner_identity, environment_type),
+        (run_id, line_id, runner_identity, environment_type),
     ).fetchall()
 
     success_score, completed_rounds, successful_rounds = (
@@ -454,6 +445,7 @@ def score_lines(
         for line in lines:
             result = _score_one_line(
                 db,
+                run_id=run_id,
                 line_id=line["line_id"],
                 url=line["url"],
                 runner_identity=runner_identity,
