@@ -43,7 +43,7 @@ def _database(tmp_path: Path) -> tuple[Path, int]:
             )
             db.execute(
                 """
-                INSERT INTO channels
+                INSERT OR IGNORE INTO channels
                     (channel_id, category, name)
                 VALUES (?, '测试', ?)
                 """,
@@ -257,6 +257,8 @@ def test_concurrency_is_limited_to_three(tmp_path):
             runner_identity="test-runner",
             max_concurrency=4,
         )
+
+
 def test_run_deep_probes_resumes_existing_pending_record(
     tmp_path,
     monkeypatch,
@@ -336,6 +338,7 @@ def test_run_deep_probes_resumes_existing_pending_record(
     assert len(rows) == 1
     assert rows[0][0] == original_probe_id
     assert rows[0][1] == "passed"
+
 
 def test_timeout_is_limited_to_sixty_seconds(tmp_path):
     database_path, run_id = _database(tmp_path)
