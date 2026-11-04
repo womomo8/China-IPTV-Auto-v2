@@ -111,11 +111,14 @@ def validate_entry(entry: PlaylistEntry) -> str | None:
             address = None
 
         if address is not None:
-            if (
+            # IPTV UDP/RTP multicast is a legitimate transport type.
+            if address.is_multicast:
+                if scheme not in {"udp", "rtp"}:
+                    return "non_public_ip_address"
+            elif (
                 address.is_private
                 or address.is_loopback
                 or address.is_link_local
-                or address.is_multicast
                 or address.is_reserved
                 or address.is_unspecified
             ):
