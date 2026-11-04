@@ -1,5 +1,4 @@
-
-"""Short stability retests for lines that passed deep probing and content checks."""
+"""Short stability retests for lines that passed all required gates."""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -79,6 +78,13 @@ def _is_stability_retest(evidence: dict[str, Any]) -> bool:
     return evidence.get("measurement_stage") == "stability_retest"
 
 
+def _deep_probe_eligible(components_json: object) -> bool:
+    """Require explicit eligibility from the current scoring result."""
+    components = _decode_evidence(components_json)
+
+    return components.get("eligible_for_deep_probe") is True
+
+
 def _content_check_passed(evidence_json: str) -> bool:
     """Only explicit no-flag content checks may enter stability retesting."""
     evidence = _decode_evidence(evidence_json)
@@ -96,7 +102,7 @@ def _content_check_passed(evidence_json: str) -> bool:
 
 
 def _select_lines(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep at most five eligible unique lines per channel."""
+    """Select the five highest-scoring unique eligible lines per channel."""
     grouped: dict[str, list[dict[str, Any]]] = {}
 
     for row in rows:
@@ -108,7 +114,10 @@ def _select_lines(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for channel_id in sorted(grouped):
         items = sorted(
             grouped[channel_id],
-            key=lambda item: item["line_id"],
+            key=lambda item: (
+                -float(item["total_score"]),
+                item["line_id"],
+            ),
         )
 
         count = 0
@@ -119,6 +128,7 @@ def _select_lines(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
             line_id = item["line_id"]
 
+            # One physical line is measured only once per run.
             if line_id in seen_line_ids:
                 continue
 
@@ -139,14 +149,17 @@ def run_stability_retests(
     timeout_seconds: float = 8.0,
     max_concurrency: int = MAX_CONCURRENCY,
 ) -> StabilityRunResult:
-    """Run or resume up to two stability checks on content-cleared lines.
+    """Run or resume up to two stability checks on fully cleared lines.
 
-    Only lines that passed deep probing and have an explicit clean content
-    check are eligible. Cloud probing is never represented as a home-network
-    or Fujian Mobile test.
+    Eligibility requires all of the following:
+    - deep probe passed in this run and environment;
+    - current-run score explicitly grants deep-probe eligibility;
+    - content check explicitly confirms clean content;
+    - no active line or URL blacklist entry exists.
 
-    Pending reservations are resumed using their original measurement IDs
-    and round numbers. Completed records are never repeated or overwritten.
+    Cloud probing is never represented as a home-network or Fujian Mobile
+    test. Pending reservations are resumed without changing their IDs or
+    round numbers. Completed records are never repeated or overwritten.
     """
 
     if type(run_id) is not int or run_id <= 0:
@@ -207,8 +220,13 @@ def run_stability_retests(
                 lc.line_id,
                 l.url,
                 l.headers_json,
-                dp.evidence_json
+                dp.evidence_json,
+                ls.total_score,
+                ls.components_json
               FROM deep_probes AS dp
+              JOIN line_scores AS ls
+                ON ls.run_id = dp.run_id
+               AND ls.line_id = dp.line_id
               JOIN lines AS l
                 ON l.line_id = dp.line_id
               JOIN line_channels AS lc
@@ -230,7 +248,10 @@ def run_stability_retests(
                              AND b.target_id = l.url)
                        )
                )
-             ORDER BY c.channel_id, lc.line_id
+             ORDER BY
+                c.channel_id,
+                ls.total_score DESC,
+                lc.line_id
             """,
             (
                 run_id,
@@ -239,11 +260,24 @@ def run_stability_retests(
             ),
         ).fetchall()
 
-        eligible_rows = [
-            dict(row)
-            for row in rows
-            if _content_check_passed(row["evidence_json"])
-        ]
+        eligible_rows = []
+
+        for row in rows:
+            item = dict(row)
+
+            if not _deep_probe_eligible(item["components_json"]):
+                continue
+
+            if not _content_check_passed(item["evidence_json"]):
+                continue
+
+            score = _finite_nonnegative(item["total_score"])
+
+            if score is None:
+                continue
+
+            item["total_score"] = score
+            eligible_rows.append(item)
 
         selected = _select_lines(eligible_rows)
 
