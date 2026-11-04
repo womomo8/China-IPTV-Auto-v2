@@ -16,10 +16,11 @@ from .database import database_session
 MAX_CANDIDATES_PER_CHANNEL = 5
 MAX_CONCURRENCY = 3
 MAX_TIMEOUT_SECONDS = 15
+MAX_OCR_TIMEOUT_SECONDS = 10
+MAX_FRAME_BYTES = 4 * 1024 * 1024
 SAMPLE_TIMES = (1, 4, 7)
 SUPPORTED_ENVIRONMENTS = {"cloud"}
 
-# 只有明确、重复出现的文字证据才会触发确认。
 KEYWORDS = {
     "advertisement": (
         "广告",
@@ -71,7 +72,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _resolve_binary(value: str | Path | None, name: str) -> str | None:
+def _resolve_binary(
+    value: str | Path | None,
+    name: str,
+) -> str | None:
     if value is None:
         return shutil.which(name)
 
@@ -80,6 +84,7 @@ def _resolve_binary(value: str | Path | None, name: str) -> str | None:
         return None
 
     path = Path(text)
+
     if path.is_absolute() or path.parent != Path("."):
         return str(path) if path.is_file() else None
 
@@ -87,21 +92,30 @@ def _resolve_binary(value: str | Path | None, name: str) -> str | None:
 
 
 def _header_args(headers: dict[str, Any]) -> list[str]:
-    lines = []
+    lines: list[str] = []
 
     for key, value in headers.items():
         if not isinstance(key, str) or not isinstance(value, str):
             continue
-        if not key.strip() or "\r" in key or "\n" in key:
+
+        if not key.strip():
             continue
+
+        if any(char in key for char in "\r\n:"):
+            continue
+
         if "\r" in value or "\n" in value:
             continue
+
         lines.append(f"{key}: {value}")
 
     if not lines:
         return []
 
-    return ["-headers", "\r\n".join(lines) + "\r\n"]
+    return [
+        "-headers",
+        "\r\n".join(lines) + "\r\n",
+    ]
 
 
 def _extract_frame(
@@ -110,20 +124,30 @@ def _extract_frame(
     headers: dict[str, Any],
     second: int,
 ) -> tuple[bytes | None, str]:
-    """Extract one small PNG frame; failures remain unknown."""
+    """Extract one scaled PNG frame; errors remain unknown."""
     command = [
         ffmpeg_binary,
         "-hide_banner",
         "-nostdin",
-        "-loglevel", "error",
-        "-rw_timeout", "8000000",
+        "-loglevel",
+        "error",
+        "-rw_timeout",
+        "8000000",
         *_header_args(headers),
-        "-i", url,
-        "-ss", str(second),
-        "-frames:v", "1",
-        "-vf", "scale=640:-2",
-        "-f", "image2pipe",
-        "-vcodec", "png",
+        "-i",
+        url,
+        "-ss",
+        str(second),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=640:-2",
+        "-threads",
+        "1",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "png",
         "pipe:1",
     ]
 
@@ -141,8 +165,14 @@ def _extract_frame(
     except OSError as exc:
         return None, f"ffmpeg_error_{type(exc).__name__}"
 
-    if result.returncode != 0 or not result.stdout:
+    if result.returncode != 0:
         return None, "frame_unavailable"
+
+    if not result.stdout:
+        return None, "empty_frame"
+
+    if len(result.stdout) > MAX_FRAME_BYTES:
+        return None, "frame_too_large"
 
     return result.stdout, "ok"
 
@@ -151,7 +181,7 @@ def _recognize_text(
     tesseract_binary: str,
     frame: bytes,
 ) -> tuple[str, str]:
-    """Chinese OCR. Missing language data is unknown, never clean."""
+    """Recognize Chinese and English text from one image."""
     command = [
         tesseract_binary,
         "stdin",
@@ -168,7 +198,7 @@ def _recognize_text(
             input=frame,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=10,
+            timeout=MAX_OCR_TIMEOUT_SECONDS,
             check=False,
         )
     except subprocess.TimeoutExpired:
@@ -179,13 +209,17 @@ def _recognize_text(
     if result.returncode != 0:
         return "", "ocr_failed"
 
-    text = result.stdout.decode("utf-8", errors="replace").strip()
+    text = result.stdout.decode(
+        "utf-8",
+        errors="replace",
+    ).strip()
+
     return text[:2000], "ok"
 
 
 def _classify_text(text: str) -> set[str]:
     normalized = "".join(text.split()).lower()
-    found = set()
+    found: set[str] = set()
 
     for category, words in KEYWORDS.items():
         if any(word.lower() in normalized for word in words):
@@ -194,21 +228,24 @@ def _classify_text(text: str) -> set[str]:
     return found
 
 
-def _select_lines(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Select no more than five unique lines per channel."""
+def _select_lines(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Select at most five unique lines for each channel."""
     grouped: dict[str, list[dict[str, Any]]] = {}
 
     for row in rows:
         grouped.setdefault(row["channel_id"], []).append(row)
 
-    selected = []
-    seen: set[str] = set()
+    selected: list[dict[str, Any]] = []
+    seen_line_ids: set[str] = set()
 
     for channel_id in sorted(grouped):
         items = sorted(
             grouped[channel_id],
             key=lambda item: item["line_id"],
         )
+
         count = 0
 
         for item in items:
@@ -216,60 +253,55 @@ def _select_lines(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 break
 
             line_id = item["line_id"]
-            if line_id in seen:
+
+            if line_id in seen_line_ids:
                 continue
 
-            seen.add(line_id)
+            seen_line_ids.add(line_id)
             selected.append(item)
             count += 1
 
     return selected
 
 
-def _blacklist_confirmed(
-    db,
-    line_id: str,
-    url: str,
-    category: str,
-    evidence: dict[str, Any],
-) -> None:
-    """Add line and URL blacklist entries only for confirmed content flags."""
-    reason = f"confirmed_{category}_content"
-    timestamp = _now()
-    evidence_json = json.dumps(evidence, ensure_ascii=False)
+def _unknown_record(
+    item: dict[str, Any],
+    reason: str,
+    *,
+    missing_tools: list[str] | None = None,
+) -> ContentCheckRecord:
+    evidence: dict[str, Any] = {
+        "engine": "ffmpeg_tesseract",
+        "content_check_version": 1,
+        "environment_type": "cloud",
+        "status": "unknown",
+        "content_class": "unknown",
+        "ad_detected": None,
+        "placeholder_detected": None,
+        "sample_times_seconds": list(SAMPLE_TIMES),
+        "successful_ocr_frames": 0,
+        "required_matching_frames": 2,
+        "frame_results": [],
+        "category_counts": {
+            "advertisement": 0,
+            "no_signal": 0,
+            "placeholder": 0,
+        },
+        "reason": reason,
+        "checked_at": _now(),
+    }
 
-    for target_type, target_id in (
-        ("line", line_id),
-        ("url", url),
-    ):
-        existing = db.execute(
-            """
-            SELECT 1
-              FROM blacklists
-             WHERE target_type = ?
-               AND target_id = ?
-               AND active = 1
-             LIMIT 1
-            """,
-            (target_type, target_id),
-        ).fetchone()
+    if missing_tools:
+        evidence["missing_tools"] = missing_tools
 
-        if existing is None:
-            db.execute(
-                """
-                INSERT INTO blacklists
-                    (target_type, target_id, reason,
-                     evidence_json, created_at, active)
-                VALUES (?, ?, ?, ?, ?, 1)
-                """,
-                (
-                    target_type,
-                    target_id,
-                    reason,
-                    evidence_json,
-                    timestamp,
-                ),
-            )
+    return ContentCheckRecord(
+        channel_id=item["channel_id"],
+        line_id=item["line_id"],
+        status="unknown",
+        category="unknown",
+        successful_ocr_frames=0,
+        evidence=evidence,
+    )
 
 
 def _check_one(
@@ -280,27 +312,33 @@ def _check_one(
 ) -> ContentCheckRecord:
     try:
         headers = json.loads(item["headers_json"] or "{}")
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, json.JSONDecodeError):
         headers = {}
 
     if not isinstance(headers, dict):
         headers = {}
 
-    frame_evidence = []
+    frame_evidence: list[dict[str, Any]] = []
+
     category_counts = {
         "advertisement": 0,
         "no_signal": 0,
         "placeholder": 0,
     }
+
     successful_ocr = 0
 
     for second in SAMPLE_TIMES:
-        frame, frame_state = _extract_frame(
-            ffmpeg_binary,
-            item["url"],
-            headers,
-            second,
-        )
+        try:
+            frame, frame_state = _extract_frame(
+                ffmpeg_binary,
+                item["url"],
+                headers,
+                second,
+            )
+        except Exception as exc:
+            frame = None
+            frame_state = f"frame_exception_{type(exc).__name__}"
 
         if frame is None:
             frame_evidence.append({
@@ -312,11 +350,24 @@ def _check_one(
             })
             continue
 
-        text, ocr_state = _recognize_text(tesseract_binary, frame)
-        flags = sorted(_classify_text(text)) if ocr_state == "ok" else []
+        try:
+            text, ocr_state = _recognize_text(
+                tesseract_binary,
+                frame,
+            )
+        except Exception as exc:
+            text = ""
+            ocr_state = f"ocr_exception_{type(exc).__name__}"
+
+        flags = (
+            sorted(_classify_text(text))
+            if ocr_state == "ok"
+            else []
+        )
 
         if ocr_state == "ok":
             successful_ocr += 1
+
             for flag in flags:
                 category_counts[flag] += 1
 
@@ -334,8 +385,9 @@ def _check_one(
         if count >= 2
     ]
 
-    evidence = {
+    evidence: dict[str, Any] = {
         "engine": "ffmpeg_tesseract",
+        "content_check_version": 1,
         "environment_type": "cloud",
         "sample_times_seconds": list(SAMPLE_TIMES),
         "successful_ocr_frames": successful_ocr,
@@ -348,6 +400,7 @@ def _check_one(
     if confirmed:
         category = sorted(confirmed)[0]
         status = "confirmed"
+
         evidence.update({
             "content_class": category,
             "ad_detected": category == "advertisement",
@@ -356,27 +409,37 @@ def _check_one(
                 "no_signal",
             },
         })
+
     elif successful_ocr >= 2:
         category = "none_detected"
         status = "no_flag_detected"
+
         evidence.update({
             "content_class": "clean",
             "ad_detected": False,
             "placeholder_detected": False,
             "note": (
-                "未识别到明确异常关键词；这不等于人工确认画面完全正常"
+                "未识别到明确异常关键词；"
+                "这不等于人工确认画面完全正常"
             ),
         })
+
     else:
         category = "unknown"
         status = "unknown"
+
         evidence.update({
             "content_class": "unknown",
             "ad_detected": None,
             "placeholder_detected": None,
-            "note": "有效OCR帧不足，不能判定线路内容正常或异常",
+            "note": (
+                "有效OCR帧不足，"
+                "不能判定线路内容正常或异常"
+            ),
         })
+
     evidence["status"] = status
+
     return ContentCheckRecord(
         channel_id=item["channel_id"],
         line_id=item["line_id"],
@@ -387,7 +450,361 @@ def _check_one(
     )
 
 
+def _blacklist_confirmed(
+    db,
+    line_id: str,
+    url: str,
+    category: str,
+    evidence: dict[str, Any],
+) -> bool:
+    """Blacklist only a confirmed content problem."""
+    if category not in {
+        "advertisement",
+        "no_signal",
+        "placeholder",
+    }:
+        return False
+
+    reason = f"confirmed_{category}_content"
+    timestamp = _now()
+
+    evidence_json = json.dumps(
+        evidence,
+        ensure_ascii=False,
+    )
+
+    inserted = False
+
+    for target_type, target_id in (
+        ("line", line_id),
+        ("url", url),
+    ):
+        existing = db.execute(
+            """
+            SELECT 1
+              FROM blacklists
+             WHERE target_type = ?
+               AND target_id = ?
+               AND active = 1
+             LIMIT 1
+            """,
+            (target_type, target_id),
+        ).fetchone()
+
+        if existing is not None:
+            continue
+
+        db.execute(
+            """
+            INSERT INTO blacklists
+                (
+                    target_type,
+                    target_id,
+                    reason,
+                    evidence_json,
+                    created_at,
+                    active
+                )
+            VALUES (?, ?, ?, ?, ?, 1)
+            """,
+            (
+                target_type,
+                target_id,
+                reason,
+                evidence_json,
+                timestamp,
+            ),
+        )
+
+        inserted = True
+
+    return inserted
+
+
+def _already_checked(evidence_json: str) -> bool:
+    """Avoid repeating the same content check within one run."""
+    try:
+        evidence = json.loads(evidence_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+    if not isinstance(evidence, dict):
+        return False
+
+    return isinstance(evidence.get("content_check"), dict)
+
+
+def _save_record(
+    database_path: str | Path,
+    run_id: int,
+    runner_identity: str,
+    item: dict[str, Any],
+    record: ContentCheckRecord,
+) -> bool:
+    """Merge content evidence without overwriting FFprobe evidence."""
+    blacklisted = False
+
+    with database_session(database_path) as db:
+        row = db.execute(
+            """
+            SELECT evidence_json
+              FROM deep_probes
+             WHERE run_id = ?
+               AND line_id = ?
+               AND runner_identity = ?
+               AND environment_type = 'cloud'
+               AND status = 'passed'
+            """,
+            (
+                run_id,
+                record.line_id,
+                runner_identity,
+            ),
+        ).fetchone()
+
+        if row is None:
+            return False
+
+        try:
+            original = json.loads(row["evidence_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            original = {}
+
+        if not isinstance(original, dict):
+            original = {}
+
+        # Do not overwrite an existing result from this same run.
+        if isinstance(original.get("content_check"), dict):
+            return False
+
+        original["content_check"] = record.evidence
+
+        db.execute(
+            """
+            UPDATE deep_probes
+               SET evidence_json = ?
+             WHERE run_id = ?
+               AND line_id = ?
+               AND runner_identity = ?
+               AND environment_type = 'cloud'
+               AND status = 'passed'
+            """,
+            (
+                json.dumps(original, ensure_ascii=False),
+                run_id,
+                record.line_id,
+                runner_identity,
+            ),
+        )
+
+        if record.status == "confirmed":
+            blacklisted = _blacklist_confirmed(
+                db,
+                record.line_id,
+                item["url"],
+                record.category,
+                record.evidence,
+            )
+
+    return blacklisted
+
+
 def run_content_checks(
     database_path: str | Path,
     run_id: int,
-   
+    *,
+    runner_identity: str,
+    environment_type: str = "cloud",
+    ffmpeg_binary: str | Path | None = None,
+    tesseract_binary: str | Path | None = None,
+    max_concurrency: int = MAX_CONCURRENCY,
+) -> ContentCheckRunResult:
+    """Check content on deep-probe-passed lines.
+
+    Results are merged into deep_probes.evidence_json under the
+    'content_check' key. Existing FFprobe evidence is preserved.
+
+    Only explicit repeated OCR evidence can create a blacklist entry.
+    Unknown results are not considered clean and are not blacklisted.
+    """
+    if type(run_id) is not int or run_id <= 0:
+        raise ValueError("run_id 必须是正整数")
+
+    if not isinstance(runner_identity, str) or not runner_identity.strip():
+        raise ValueError("runner_identity 必须是非空文本")
+
+    if environment_type not in SUPPORTED_ENVIRONMENTS:
+        raise ValueError(
+            "内容检查目前只允许 cloud，"
+            "不能冒充福建移动家庭实测"
+        )
+
+    if type(max_concurrency) is not int or not (
+        1 <= max_concurrency <= MAX_CONCURRENCY
+    ):
+        raise ValueError(
+            "内容检查并发数必须是1至3之间的整数"
+        )
+
+    selected: list[dict[str, Any]] = []
+
+    with database_session(database_path) as db:
+        run = db.execute(
+            """
+            SELECT runner_identity, environment_type
+              FROM runs
+             WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+
+        if run is None:
+            raise ValueError(
+                f"任务记录不存在：run_id={run_id}"
+            )
+
+        if run["runner_identity"] != runner_identity:
+            raise ValueError(
+                "runner_identity 与任务记录不一致"
+            )
+
+        if run["environment_type"] != environment_type:
+            raise ValueError(
+                "environment_type 与任务记录不一致"
+            )
+
+        rows = db.execute(
+            """
+            SELECT
+                c.channel_id,
+                lc.line_id,
+                l.url,
+                l.headers_json,
+                dp.evidence_json
+              FROM deep_probes AS dp
+              JOIN lines AS l
+                ON l.line_id = dp.line_id
+              JOIN line_channels AS lc
+                ON lc.line_id = dp.line_id
+              JOIN channels AS c
+                ON c.channel_id = lc.channel_id
+             WHERE dp.run_id = ?
+               AND dp.runner_identity = ?
+               AND dp.environment_type = ?
+               AND dp.status = 'passed'
+             ORDER BY c.channel_id, lc.line_id
+            """,
+            (
+                run_id,
+                runner_identity,
+                environment_type,
+            ),
+        ).fetchall()
+
+        eligible = []
+
+        for row in rows:
+            item = dict(row)
+
+            if _already_checked(item["evidence_json"]):
+                continue
+
+            eligible.append(item)
+
+        selected = _select_lines(eligible)
+
+    ffmpeg = _resolve_binary(ffmpeg_binary, "ffmpeg")
+    tesseract = _resolve_binary(tesseract_binary, "tesseract")
+
+    missing_tools = []
+
+    if not ffmpeg:
+        missing_tools.append("ffmpeg")
+
+    if not tesseract:
+        missing_tools.append("tesseract")
+
+    records: list[ContentCheckRecord] = []
+
+    if missing_tools:
+        for item in selected:
+            records.append(
+                _unknown_record(
+                    item,
+                    "required_content_check_tool_missing",
+                    missing_tools=missing_tools,
+                )
+            )
+    else:
+        with ThreadPoolExecutor(
+            max_workers=max_concurrency
+        ) as executor:
+            future_map = {
+                executor.submit(
+                    _check_one,
+                    item,
+                    ffmpeg_binary=ffmpeg,
+                    tesseract_binary=tesseract,
+                ): item
+                for item in selected
+            }
+
+            for future in as_completed(future_map):
+                item = future_map[future]
+
+                try:
+                    record = future.result()
+                except Exception as exc:
+                    record = _unknown_record(
+                        item,
+                        f"content_check_exception_{type(exc).__name__}",
+                    )
+
+                records.append(record)
+
+    blacklisted_count = 0
+
+    item_by_line = {
+        item["line_id"]: item
+        for item in selected
+    }
+
+    for record in records:
+        item = item_by_line[record.line_id]
+
+        if _save_record(
+            database_path,
+            run_id,
+            runner_identity,
+            item,
+            record,
+        ):
+            blacklisted_count += 1
+
+    records.sort(
+        key=lambda record: (
+            record.channel_id,
+            record.line_id,
+        )
+    )
+
+    return ContentCheckRunResult(
+        run_id=run_id,
+        environment_type=environment_type,
+        selected_count=len(selected),
+        checked_count=len(records),
+        clean_count=sum(
+            record.status == "no_flag_detected"
+            for record in records
+        ),
+        confirmed_count=sum(
+            record.status == "confirmed"
+            for record in records
+        ),
+        unknown_count=sum(
+            record.status == "unknown"
+            for record in records
+        ),
+        blacklisted_count=blacklisted_count,
+        records=tuple(records),
+    )
