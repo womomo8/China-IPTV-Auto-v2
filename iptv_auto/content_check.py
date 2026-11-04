@@ -9,8 +9,10 @@ from pathlib import Path
 import shutil
 import subprocess
 from typing import Any
+from urllib.parse import urlsplit
 
 from .database import database_session
+from .ffmpeg_ipv4 import ffmpeg_ipv4_input_options
 from .identity import normalize_url
 
 
@@ -126,6 +128,11 @@ def _extract_frame(
     second: int,
 ) -> tuple[bytes | None, str]:
     """Extract one scaled PNG frame; errors remain unknown."""
+    ipv4_options = ffmpeg_ipv4_input_options(url)
+
+    if ipv4_options is None:
+        return None, "ipv4_transport_not_enforceable"
+
     command = [
         ffmpeg_binary,
         "-hide_banner",
@@ -135,6 +142,7 @@ def _extract_frame(
         "-rw_timeout",
         "8000000",
         *_header_args(headers),
+        *ipv4_options,
         "-i",
         url,
         "-ss",
@@ -314,6 +322,20 @@ def _check_one(
     ffmpeg_binary: str,
     tesseract_binary: str,
 ) -> ContentCheckRecord:
+    url = item["url"]
+    ipv4_options = ffmpeg_ipv4_input_options(url)
+
+    if ipv4_options is None:
+        record = _unknown_record(
+            item,
+            "ipv4_transport_not_enforceable_for_protocol",
+        )
+        record.evidence["ipv4_transport"] = {
+            "status": "not_enforceable",
+            "protocol": urlsplit(url).scheme.lower(),
+        }
+        return record
+
     try:
         headers = json.loads(item["headers_json"] or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -336,7 +358,7 @@ def _check_one(
         try:
             frame, frame_state = _extract_frame(
                 ffmpeg_binary,
-                item["url"],
+                url,
                 headers,
                 second,
             )
@@ -393,6 +415,12 @@ def _check_one(
         "engine": "ffmpeg_tesseract",
         "content_check_version": 1,
         "environment_type": "cloud",
+        "ipv4_transport": {
+            "status": "configured",
+            "method": "tcp_local_addr",
+            "local_addr": "0.0.0.0",
+            "protocol": urlsplit(url).scheme.lower(),
+        },
         "sample_times_seconds": list(SAMPLE_TIMES),
         "successful_ocr_frames": successful_ocr,
         "required_matching_frames": 2,
