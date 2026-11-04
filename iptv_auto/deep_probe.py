@@ -808,52 +808,97 @@ def run_deep_probes(
             if not isinstance(headers, dict):
                 headers = {}
 
-            timestamp = _now()
-
-            cursor = db.execute(
+            existing = db.execute(
                 """
-                INSERT INTO deep_probes
-                    (
-                        run_id,
-                        line_id,
-                        probed_at,
-                        runner_identity,
-                        environment_type,
-                        status,
-                        evidence_json
-                    )
-                VALUES (?, ?, ?, ?, ?, 'pending', ?)
-                ON CONFLICT(
-                    run_id,
-                    line_id,
-                    runner_identity,
-                    environment_type
-                ) DO NOTHING
+                SELECT probe_id, status
+                  FROM deep_probes
+                 WHERE run_id = ?
+                   AND line_id = ?
+                   AND runner_identity = ?
+                   AND environment_type = ?
                 """,
                 (
                     run_id,
                     candidate["line_id"],
-                    timestamp,
                     runner_identity,
                     environment_type,
-                    json.dumps({
-                        "probe_state": "pending",
-                        "environment_type": environment_type,
-                    }),
                 ),
-            )
+            ).fetchone()
 
-            if cursor.rowcount != 1:
-                continue
+            if existing is not None:
+                if existing["status"] != "pending":
+                    continue
+                probe_id = existing["probe_id"]
+            else:
+                timestamp = _now()
+                cursor = db.execute(
+                    """
+                    INSERT INTO deep_probes
+                        (
+                            run_id,
+                            line_id,
+                            probed_at,
+                            runner_identity,
+                            environment_type,
+                            status,
+                            evidence_json
+                        )
+                    VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                    ON CONFLICT(
+                        run_id,
+                        line_id,
+                        runner_identity,
+                        environment_type
+                    ) DO NOTHING
+                    """,
+                    (
+                        run_id,
+                        candidate["line_id"],
+                        timestamp,
+                        runner_identity,
+                        environment_type,
+                        json.dumps({
+                            "probe_state": "pending",
+                            "environment_type": environment_type,
+                        }),
+                    ),
+                )
+
+                if cursor.rowcount == 1:
+                    probe_id = cursor.lastrowid
+                else:
+                    existing = db.execute(
+                        """
+                        SELECT probe_id, status
+                          FROM deep_probes
+                         WHERE run_id = ?
+                           AND line_id = ?
+                           AND runner_identity = ?
+                           AND environment_type = ?
+                        """,
+                        (
+                            run_id,
+                            candidate["line_id"],
+                            runner_identity,
+                            environment_type,
+                        ),
+                    ).fetchone()
+
+                    if (
+                        existing is None
+                        or existing["status"] != "pending"
+                    ):
+                        continue
+
+                    probe_id = existing["probe_id"]
 
             reservations.append({
-                "probe_id": cursor.lastrowid,
+                "probe_id": probe_id,
                 "channel_id": candidate["channel_id"],
                 "line_id": candidate["line_id"],
                 "url": row["url"],
                 "headers": headers,
             })
-
     records: list[DeepProbeRecord] = []
 
     def execute_probe(item: dict[str, Any]) -> DeepProbeRecord:
