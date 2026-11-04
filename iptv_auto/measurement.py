@@ -1,3 +1,4 @@
+
 """Bounded IPv4-first basic stream measurements with persistent history."""
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ MAX_ALLOWED_CONCURRENCY = 12
 MAX_ALLOWED_TIMEOUT_SECONDS = 8.0
 SUPPORTED_ENVIRONMENTS = {"cloud"}
 VALID_STATUSES = {"success", "reachable", "probe_limited", "failed"}
+BASIC_ROUNDS_REQUIRED = 3
 
 
 @dataclass(frozen=True)
@@ -352,9 +354,10 @@ def _load_candidates_and_reserve_rounds(
     run_id: int,
     runner_identity: str,
     environment_type: str,
+    required_rounds: int = BASIC_ROUNDS_REQUIRED,
 ) -> tuple[list[dict[str, Any]], int]:
     """
-    Reserve new basic rounds or resume all pending records.
+    Reserve missing basic rounds or resume pending records.
 
     A write lock is acquired before checking existing reservations. This
     prevents concurrent invocations from allocating duplicate rounds.
@@ -439,28 +442,23 @@ def _load_candidates_and_reserve_rounds(
             if not isinstance(headers, dict):
                 headers = {}
 
-            # Resume every existing pending reservation for this line.
-            # Preserve original IDs and round numbers; do not silently
-            # leave interrupted duplicate reservations behind.
+            # Resume pending reservations first. Terminal records (including
+            # failed attempts) count as completed attempts for this run.
             pending_records = [
                 item for item in basic_existing
                 if item["status"] == "pending"
             ]
+            for pending in pending_records:
+                candidates.append({
+                    "measurement_id": int(pending["measurement_id"]),
+                    "line_id": line_id,
+                    "round_no": int(pending["round_no"]),
+                    "url": row["url"],
+                    "headers": headers,
+                })
 
-            if pending_records:
-                for pending in pending_records:
-                    candidates.append({
-                        "measurement_id": int(pending["measurement_id"]),
-                        "line_id": line_id,
-                        "round_no": int(pending["round_no"]),
-                        "url": row["url"],
-                        "headers": headers,
-                    })
-                continue
-
-            if basic_existing:
-                # A terminal or unknown record already exists for this run
-                # and line. Do not create another basic round in this run.
+            remaining = max(0, required_rounds - len(basic_existing))
+            if remaining == 0:
                 skipped += 1
                 continue
 
@@ -475,60 +473,63 @@ def _load_candidates_and_reserve_rounds(
                 (line_id, runner_identity, environment_type),
             ).fetchall()
 
-            basic_rounds = []
             occupied_rounds = set()
-
-            for item in history:
-                historical_round = int(item["round_no"])
+            basic_rounds = []
+            for historical in history:
+                historical_round = int(historical["round_no"])
                 occupied_rounds.add(historical_round)
-
-                evidence = _decode_evidence(item["evidence_json"])
-                if not _is_stability_retest(evidence):
+                if not _is_stability_retest(
+                    _decode_evidence(historical["evidence_json"])
+                ):
                     basic_rounds.append(historical_round)
 
-            # Stability retests do not advance the basic-round history.
-            # Their numbers are nevertheless occupied because the database
-            # UNIQUE constraint applies across measurement stages.
-            round_no = max(basic_rounds, default=0) + 1
+            # Stability retests occupy their round numbers but do not advance
+            # the basic-round sequence.
+            next_round = max(basic_rounds, default=0) + 1
 
-            while round_no in occupied_rounds:
-                round_no += 1
+            # Complete the three basic attempts in this run. A failed attempt
+            # remains a failed attempt; it is not silently retried as success.
+            for _ in range(remaining):
+                while next_round in occupied_rounds:
+                    next_round += 1
 
-            cursor = db.execute(
-                """
-                INSERT INTO measurements
-                    (run_id, line_id, round_no, measured_at,
-                     runner_identity, environment_type, status,
-                     latency_ms, throughput_kbps, error_class,
-                     evidence_json)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending',
-                        NULL, NULL, '', ?)
-                """,
-                (
-                    run_id,
-                    line_id,
-                    round_no,
-                    timestamp,
-                    runner_identity,
-                    environment_type,
-                    json.dumps({
-                        "measurement_stage": "basic",
-                        "reserved_at": timestamp,
-                        "environment_type": environment_type,
-                        "media_playback_confirmed": False,
-                    }),
-                ),
-            )
+                cursor = db.execute(
+                    """
+                    INSERT INTO measurements
+                        (run_id, line_id, round_no, measured_at,
+                         runner_identity, environment_type, status,
+                         latency_ms, throughput_kbps, error_class,
+                         evidence_json)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending',
+                            NULL, NULL, '', ?)
+                    """,
+                    (
+                        run_id,
+                        line_id,
+                        next_round,
+                        timestamp,
+                        runner_identity,
+                        environment_type,
+                        json.dumps({
+                            "measurement_stage": "basic",
+                            "reserved_at": timestamp,
+                            "environment_type": environment_type,
+                            "media_playback_confirmed": False,
+                        }),
+                    ),
+                )
 
-            measurement_id = int(cursor.lastrowid)
-
-            candidates.append({
-                "measurement_id": measurement_id,
-                "line_id": line_id,
-                "round_no": round_no,
-                "url": row["url"],
-                "headers": headers,
-            })
+                measurement_id = int(cursor.lastrowid)
+                candidates.append({
+                    "measurement_id": measurement_id,
+                    "line_id": line_id,
+                    "round_no": next_round,
+                    "url": row["url"],
+                    "headers": headers,
+                })
+                occupied_rounds.add(next_round)
+                basic_rounds.append(next_round)
+                next_round += 1
 
     return candidates, skipped
 
@@ -541,8 +542,10 @@ def run_basic_measurements(
     environment_type: str = "cloud",
     timeout_seconds: float = 8.0,
     max_concurrency: int = 12,
+    required_rounds: int = BASIC_ROUNDS_REQUIRED,
 ) -> MeasurementRunResult:
-    """Run or resume one bounded basic measurement round per eligible line."""
+    """Run or resume three bounded basic measurement rounds per eligible line."""
+
     if type(run_id) is not int or run_id <= 0:
         raise ValueError("run_id 必须是正整数")
     if not isinstance(runner_identity, str) or not runner_identity.strip():
@@ -551,12 +554,15 @@ def run_basic_measurements(
     timeout, concurrency = _validate_runtime_options(
         timeout_seconds, max_concurrency
     )
+    if type(required_rounds) is not int or required_rounds != BASIC_ROUNDS_REQUIRED:
+        raise ValueError("基础测速轮数必须固定为3轮")
 
     reservations, skipped = _load_candidates_and_reserve_rounds(
         Path(database_path),
         run_id,
         runner_identity,
         environment_type,
+        required_rounds,
     )
 
     def probe(item: dict[str, Any]) -> ProbeResult:
