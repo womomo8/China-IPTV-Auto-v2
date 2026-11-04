@@ -14,6 +14,15 @@ https://example.com/hunan.m3u8
 
 
 class PlaylistTests(unittest.TestCase):
+    def test_channel_name_with_comma_is_preserved(self):
+        playlist = """#EXTM3U
+#EXTINF:-1 group-title="央视",CCTV-5,高清
+https://example.com/live.m3u8
+"""
+        entries = parse_m3u(playlist)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].name, "CCTV-5,高清")
+        self.assertEqual(entries[0].category, "央视")
     def test_parser_keeps_valid_entries_and_drops_placeholder(self):
         entries = parse_m3u(SAMPLE)
         self.assertEqual([e.name for e in entries], ["CCTV-5", "湖南卫视"])
