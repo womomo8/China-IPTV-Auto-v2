@@ -1,4 +1,5 @@
-"""Strict first-stage line validation, blacklist filtering and database registration."""
+
+"""Strict first-stage line validation, IPv4 admission and database registration."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from .identity import (
     stable_channel_id,
     stable_result_id,
 )
+from .ipv4 import check_ipv4_url
 from .playlist import PlaylistEntry
 
 
@@ -41,6 +43,10 @@ class LineIngestResult:
     accepted_line_ids: tuple[str, ...]
     rejected: tuple[EntryRejection, ...]
     duplicate_count: int
+    # Counts refer to the IPv4 gate, before duplicate/blacklist checks.
+    ipv4_passed_count: int = 0
+    ipv4_excluded_count: int = 0
+    ipv4_temporary_failure_count: int = 0
 
 
 def _now() -> str:
@@ -65,10 +71,10 @@ def _validate_headers(headers: object) -> str | None:
 
 
 def validate_entry(entry: PlaylistEntry) -> str | None:
-    """Return a rejection reason, or None when the entry is structurally valid.
+    """Return a rejection reason, or None when structurally valid.
 
-    This function does not perform network measurements. DNS and stream
-    reachability are handled by the measurement stage.
+    IPv4 eligibility is checked separately by the admission gate.
+    This function does not perform DNS or stream measurements.
     """
     if not isinstance(entry, PlaylistEntry):
         return "invalid_entry_type"
@@ -80,8 +86,10 @@ def validate_entry(entry: PlaylistEntry) -> str | None:
     if not name:
         return "empty_channel_name"
 
-    if any(word.casefold() in f"{name} {category}".casefold()
-           for word in PLACEHOLDER_WORDS):
+    if any(
+        word.casefold() in f"{name} {category}".casefold()
+        for word in PLACEHOLDER_WORDS
+    ):
         return "placeholder_channel"
 
     if not url:
@@ -97,31 +105,22 @@ def validate_entry(entry: PlaylistEntry) -> str | None:
         if not parts.hostname:
             return "missing_host"
 
-        # Accessing port validates malformed and out-of-range port values.
         port = parts.port
         if port is not None and not (1 <= port <= 65535):
             return "invalid_port"
 
-        # Reject local, private, loopback and reserved literal IP addresses.
-        # A public hostname is not resolved here: cloud DNS failures are
-        # transient evidence, not proof that a stream is permanently invalid.
         try:
-            address = ipaddress.ip_address(parts.hostname.split("%", 1)[0])
+            address = ipaddress.ip_address(
+                parts.hostname.split("%", 1)[0]
+            )
         except ValueError:
             address = None
 
         if address is not None:
-            # IPTV UDP/RTP multicast is a legitimate transport type.
             if address.is_multicast:
                 if scheme not in {"udp", "rtp"}:
                     return "non_public_ip_address"
-            elif (
-                address.is_private
-                or address.is_loopback
-                or address.is_link_local
-                or address.is_reserved
-                or address.is_unspecified
-            ):
+            elif not address.is_global:
                 return "non_public_ip_address"
 
     except (TypeError, ValueError):
@@ -144,7 +143,7 @@ def validate_entry(entry: PlaylistEntry) -> str | None:
 
 
 class LineRegistry:
-    """Persist validated playlist entries in the existing v2 schema."""
+    """Persist structurally valid and IPv4-eligible playlist entries."""
 
     def __init__(self, database_path: str | Path):
         self.database_path = Path(database_path)
@@ -175,11 +174,10 @@ class LineRegistry:
         entries: Iterable[PlaylistEntry],
         ingested_at: str | None = None,
     ) -> LineIngestResult:
-        """Validate, deduplicate and register entries from one source.
+        """Validate, IPv4-filter, deduplicate and register one source.
 
-        Rejected entries are returned with reasons. They are not automatically
-        blacklisted: only separately confirmed advertising or invalid content
-        may enter the permanent blacklist.
+        DNS checks run before opening the database transaction.
+        Temporary DNS failures are reported but never permanently blacklisted.
         """
         if type(run_id) is not int or run_id <= 0:
             raise ValueError("run_id 必须是已存在的正整数任务编号")
@@ -188,10 +186,49 @@ class LineRegistry:
             raise ValueError("source_id 不能为空")
 
         timestamp = ingested_at or _now()
+
         accepted_ids: list[str] = []
         rejected: list[EntryRejection] = []
         seen_pairs: set[tuple[str, str]] = set()
         duplicate_count = 0
+
+        ipv4_passed_count = 0
+        ipv4_excluded_count = 0
+        ipv4_temporary_failure_count = 0
+
+        # Materialize and filter before opening the DB transaction.
+        eligible_entries: list[PlaylistEntry] = []
+
+        for entry in entries:
+            line_id = str(getattr(entry, "line_id", "") or "")
+            channel_id = str(getattr(entry, "channel_id", "") or "")
+
+            reason = validate_entry(entry)
+            if reason:
+                rejected.append(
+                    EntryRejection(line_id, channel_id, reason)
+                )
+                continue
+
+            admission = check_ipv4_url(entry.url)
+
+            if not admission.allowed:
+                if admission.status == "dns_temporary_failure":
+                    ipv4_temporary_failure_count += 1
+                else:
+                    ipv4_excluded_count += 1
+
+                rejected.append(
+                    EntryRejection(
+                        line_id,
+                        channel_id,
+                        f"ipv4_{admission.status}",
+                    )
+                )
+                continue
+
+            ipv4_passed_count += 1
+            eligible_entries.append(entry)
 
         with database_session(self.database_path) as db:
             run = db.execute(
@@ -208,18 +245,13 @@ class LineRegistry:
             if source is None:
                 raise ValueError(f"来源尚未登记：source_id={source_id}")
             if int(source["active"]) != 1:
-                raise ValueError(f"来源已停用，不能登记线路：source_id={source_id}")
+                raise ValueError(
+                    f"来源已停用，不能登记线路：source_id={source_id}"
+                )
 
-            for entry in entries:
-                line_id = str(getattr(entry, "line_id", "") or "")
-                channel_id = str(getattr(entry, "channel_id", "") or "")
-
-                reason = validate_entry(entry)
-                if reason:
-                    rejected.append(
-                        EntryRejection(line_id, channel_id, reason)
-                    )
-                    continue
+            for entry in eligible_entries:
+                line_id = str(entry.line_id)
+                channel_id = str(entry.channel_id)
 
                 pair = (line_id, channel_id)
                 if pair in seen_pairs:
@@ -229,7 +261,9 @@ class LineRegistry:
 
                 if self._is_blacklisted(db, line_id, entry.url):
                     rejected.append(
-                        EntryRejection(line_id, channel_id, "blacklisted")
+                        EntryRejection(
+                            line_id, channel_id, "blacklisted"
+                        )
                     )
                     continue
 
@@ -303,4 +337,7 @@ class LineRegistry:
             accepted_line_ids=tuple(accepted_ids),
             rejected=tuple(rejected),
             duplicate_count=duplicate_count,
+            ipv4_passed_count=ipv4_passed_count,
+            ipv4_excluded_count=ipv4_excluded_count,
+            ipv4_temporary_failure_count=ipv4_temporary_failure_count,
         )
