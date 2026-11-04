@@ -1,4 +1,5 @@
-"""Evidence-based line quality scoring and deep-probe candidate selection."""
+
+"""Evidence-based line scoring and bounded deep-probe candidate selection."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,10 +21,11 @@ WEIGHTS = {
     "ad_placeholder_risk": 10,
     "source_reliability": 5,
 }
-
 MAX_DEEP_CANDIDATES_PER_CHANNEL = 5
 SUPPORTED_ENVIRONMENTS = {"cloud"}
 TERMINAL_HTTP_STATUSES = {"success", "failed"}
+CLEAN_CONTENT_CLASSES = {"clean", "normal", "live_program"}
+BAD_CONTENT_CLASSES = {"advertisement", "no_signal", "placeholder"}
 
 
 @dataclass(frozen=True)
@@ -107,13 +109,9 @@ def _success_rate_score(
         item for item in measurements
         if item["status"] in TERMINAL_HTTP_STATUSES
     ]
-    successes = sum(
-        item["status"] == "success" for item in completed
-    )
-
+    successes = sum(item["status"] == "success" for item in completed)
     if not completed:
         return 0.0, 0, 0
-
     return (
         _clamp_score(successes / len(completed) * 100),
         len(completed),
@@ -123,10 +121,8 @@ def _success_rate_score(
 
 def _stability_score(measurements: list[dict[str, Any]]) -> float:
     successful = [
-        item for item in measurements
-        if item["status"] == "success"
+        item for item in measurements if item["status"] == "success"
     ]
-
     if len(successful) < 2:
         return 0.0
 
@@ -139,21 +135,16 @@ def _stability_score(measurements: list[dict[str, Any]]) -> float:
         if (value := _finite_number(item["throughput_kbps"])) is not None
         and value > 0
     ]
-
     if len(latencies) < 2 or len(throughputs) < 2:
         return 0.0
 
     latency_mean = mean(latencies)
     throughput_mean = mean(throughputs)
-
-    latency_cv = (
-        pstdev(latencies) / latency_mean if latency_mean > 0 else 1.0
-    )
+    latency_cv = pstdev(latencies) / latency_mean if latency_mean > 0 else 1.0
     throughput_cv = (
         pstdev(throughputs) / throughput_mean
         if throughput_mean > 0 else 1.0
     )
-
     return _clamp_score(
         100.0 - 50.0 * throughput_cv - 30.0 * latency_cv
     )
@@ -166,10 +157,8 @@ def _throughput_score(measurements: list[dict[str, Any]]) -> float:
         and (value := _finite_number(item["throughput_kbps"])) is not None
         and value > 0
     ]
-
     if not values:
         return 0.0
-
     return _clamp_score(mean(values) / 3000.0 * 100.0)
 
 
@@ -178,71 +167,102 @@ def _freshness_score(
     now: datetime,
 ) -> float:
     times = [
-        parsed
-        for item in measurements
+        parsed for item in measurements
         if (parsed := _parse_time(item["measured_at"])) is not None
     ]
-
     if not times:
         return 0.0
 
-    age_hours = max(
-        0.0,
-        (now - max(times)).total_seconds() / 3600.0,
-    )
-
+    age_hours = max(0.0, (now - max(times)).total_seconds() / 3600.0)
     if age_hours <= 6:
         return 100.0
     if age_hours >= 72:
         return 0.0
-
     return _clamp_score(100.0 * (72.0 - age_hours) / 66.0)
 
 
-def _ad_placeholder_score(
-    deep_rows: list[dict[str, Any]],
-) -> float:
-    """Only explicit content evidence changes the neutral unknown score."""
+def _load_content_evidence(evidence_json: object) -> dict[str, Any]:
+    """Read both current nested evidence and legacy top-level evidence."""
+    try:
+        evidence = (
+            json.loads(evidence_json or "{}")
+            if isinstance(evidence_json, (str, bytes))
+            else evidence_json
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(evidence, dict):
+        return {}
+
+    nested = evidence.get("content_check")
+    if isinstance(nested, dict):
+        # The nested content-check record is authoritative when present.
+        return nested
+    return evidence
+
+
+def _content_verdict(evidence_json: object) -> str:
+    """Return bad, clean or unknown; never treat missing evidence as clean."""
+    evidence = _load_content_evidence(evidence_json)
+    if not evidence:
+        return "unknown"
+
+    status = str(evidence.get("status", "")).strip().lower()
+    content_class = str(
+        evidence.get("content_class", "")
+    ).strip().lower()
+
+    ad_detected = evidence.get("ad_detected")
+    placeholder_detected = evidence.get("placeholder_detected")
+
+    if (
+        ad_detected is True
+        or placeholder_detected is True
+        or content_class in BAD_CONTENT_CLASSES
+        or status == "confirmed"
+    ):
+        return "bad"
+
+    if (
+        ad_detected is False
+        and placeholder_detected is False
+        and content_class in CLEAN_CONTENT_CLASSES
+        and status in {"no_flag_detected", "clean", "passed"}
+    ):
+        return "clean"
+
+    # Legacy deep-probe evidence may contain a single explicit clean flag.
+    if (
+        content_class in CLEAN_CONTENT_CLASSES
+        and (
+            ad_detected is False
+            or placeholder_detected is False
+        )
+        and status not in {"unknown", "confirmed"}
+    ):
+        return "clean"
+
+    return "unknown"
+
+
+def _ad_placeholder_score(deep_rows: list[dict[str, Any]]) -> float:
+    """Confirmed bad content is zero; clean evidence is 100; unknown is neutral."""
     if not deep_rows:
         return 50.0
 
-    for row in deep_rows:
-        try:
-            evidence = json.loads(row["evidence_json"] or "{}")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-
-        if not isinstance(evidence, dict):
-            continue
-
-        if evidence.get("ad_detected") is True:
-            return 0.0
-
-        if evidence.get("placeholder_detected") is True:
-            return 0.0
-
-        content_class = str(
-            evidence.get("content_class", "")
-        ).strip().lower()
-
-        if (
-            evidence.get("ad_detected") is False
-            and content_class in {"clean", "normal", "live_program"}
-        ):
-            return 100.0
-
-        if (
-            evidence.get("placeholder_detected") is False
-            and content_class in {"clean", "normal", "live_program"}
-        ):
-            return 100.0
-
+    verdicts = [
+        _content_verdict(row.get("evidence_json"))
+        for row in deep_rows
+    ]
+    if "bad" in verdicts:
+        return 0.0
+    if "clean" in verdicts:
+        return 100.0
     return 50.0
 
 
-def _source_reliability_score(
-    source_scores: list[float],
-) -> float:
+def _source_reliability_score(source_scores: list[float]) -> float:
     if not source_scores:
         return 50.0
     return _clamp_score(mean(source_scores))
@@ -279,8 +299,7 @@ def _load_source_scores(db, line_id: str) -> list[float]:
         SELECT ss.source_id, ss.total_score, ss.scored_at,
                ss.source_score_id
           FROM source_lines AS sl
-          JOIN source_scores AS ss
-            ON ss.source_id = sl.source_id
+          JOIN source_scores AS ss ON ss.source_id = sl.source_id
          WHERE sl.line_id = ?
          ORDER BY ss.scored_at DESC, ss.source_score_id DESC
         """,
@@ -288,14 +307,11 @@ def _load_source_scores(db, line_id: str) -> list[float]:
     ).fetchall()
 
     latest: dict[str, float] = {}
-
     for row in rows:
         source_id = str(row["source_id"])
         score = _finite_number(row["total_score"])
-
         if score is not None and source_id not in latest:
             latest[source_id] = score
-
     return list(latest.values())
 
 
@@ -321,7 +337,7 @@ def _score_one_line(
         (line_id, runner_identity, environment_type),
     ).fetchall()
 
-    # 稳定性复测是额外质量证据，不得冒充基础测速轮次。
+    # Stability retests are additional evidence, never basic rounds.
     measurements = []
     for row in measurement_rows:
         item = dict(row)
@@ -329,14 +345,13 @@ def _score_one_line(
             evidence = json.loads(item.get("evidence_json") or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
             evidence = {}
-
         if (
             isinstance(evidence, dict)
             and evidence.get("measurement_stage") == "stability_retest"
         ):
             continue
-
         measurements.append(item)
+
     deep_rows = db.execute(
         """
         SELECT status, evidence_json, probed_at
@@ -352,35 +367,26 @@ def _score_one_line(
     success_score, completed_rounds, successful_rounds = (
         _success_rate_score(measurements)
     )
-
     source_scores = _load_source_scores(db, line_id)
 
+    ad_score = _ad_placeholder_score([dict(row) for row in deep_rows])
     components = {
         "success_rate": success_score,
         "stability": _stability_score(measurements),
         "throughput": _throughput_score(measurements),
         "freshness": _freshness_score(measurements, now),
-        "ad_placeholder_risk": _ad_placeholder_score(
-            [dict(row) for row in deep_rows]
-        ),
+        "ad_placeholder_risk": ad_score,
         "source_reliability": _source_reliability_score(source_scores),
     }
-
     total = _weighted_total(components)
 
     latest = measurements[0] if measurements else None
-    latest_success = bool(
-        latest and latest["status"] == "success"
-    )
+    latest_success = bool(latest and latest["status"] == "success")
     not_blacklisted = not _is_blacklisted(db, line_id, url)
 
-    # A confirmed advertisement or placeholder cannot enter deep probing.
-    no_confirmed_ad_or_placeholder = (
-        components["ad_placeholder_risk"] > 0.0
-    )
+    # A confirmed ad/no-signal/placeholder can never enter deep probing.
+    no_confirmed_bad_content = ad_score > 0.0
 
-    # Two independent successful HTTP rounds are required before deep probing.
-    # Three rounds remain mandatory for formal publication.
     eligible = (
         completed_rounds >= 2
         and successful_rounds >= 2
@@ -388,7 +394,7 @@ def _score_one_line(
         and latest_success
         and total >= 70.0
         and not_blacklisted
-        and no_confirmed_ad_or_placeholder
+        and no_confirmed_bad_content
     )
 
     return LineScore(
@@ -410,23 +416,17 @@ def score_lines(
     environment_type: str = "cloud",
     now: datetime | None = None,
 ) -> ScoringRunResult:
-    """Score all registered lines and select at most five per channel."""
+    """Score registered lines and select no more than five per channel."""
     if type(run_id) is not int or run_id <= 0:
         raise ValueError("run_id 必须是正整数")
-
     if not isinstance(runner_identity, str) or not runner_identity.strip():
         raise ValueError("runner_identity 必须是非空文本")
-
     if environment_type not in SUPPORTED_ENVIRONMENTS:
-        raise ValueError(
-            "当前版本只允许 cloud 评分环境，不能冒充福建移动家庭实测"
-        )
+        raise ValueError("当前只允许cloud评分，不能冒充福建移动家庭实测")
 
     current_time = now or _now()
-
     if current_time.tzinfo is None:
         current_time = current_time.replace(tzinfo=timezone.utc)
-
     current_time = current_time.astimezone(timezone.utc)
 
     score_results: list[LineScore] = []
@@ -436,27 +436,19 @@ def score_lines(
         run = db.execute(
             """
             SELECT runner_identity, environment_type
-              FROM runs
-             WHERE run_id = ?
+              FROM runs WHERE run_id = ?
             """,
             (run_id,),
         ).fetchone()
-
         if run is None:
             raise ValueError(f"任务记录不存在：run_id={run_id}")
-
         if run["runner_identity"] != runner_identity:
             raise ValueError("runner_identity 与任务记录不一致")
-
         if run["environment_type"] != environment_type:
             raise ValueError("environment_type 与任务记录不一致")
 
         lines = db.execute(
-            """
-            SELECT line_id, url
-              FROM lines
-             ORDER BY line_id
-            """
+            "SELECT line_id, url FROM lines ORDER BY line_id"
         ).fetchall()
 
         for line in lines:
@@ -468,14 +460,12 @@ def score_lines(
                 environment_type=environment_type,
                 now=current_time,
             )
-
             score_results.append(result)
 
             db.execute(
                 """
                 INSERT INTO line_scores
-                    (run_id, line_id, scored_at,
-                     total_score, components_json)
+                    (run_id, line_id, scored_at, total_score, components_json)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, line_id) DO UPDATE SET
                     scored_at = excluded.scored_at,
@@ -493,9 +483,7 @@ def score_lines(
                             "components": result.components,
                             "measurement_rounds": result.measurement_rounds,
                             "successful_rounds": result.successful_rounds,
-                            "eligible_for_deep_probe": (
-                                result.eligible_for_deep_probe
-                            ),
+                            "eligible_for_deep_probe": result.eligible_for_deep_probe,
                         },
                         ensure_ascii=False,
                         sort_keys=True,
@@ -512,20 +500,17 @@ def score_lines(
         channel_rows = db.execute(
             """
             SELECT c.channel_id, c.name, lc.line_id
-              FROM channels AS c
-              JOIN line_channels AS lc
-                ON lc.channel_id = c.channel_id
+              FROM channels c
+              JOIN line_channels lc ON lc.channel_id = c.channel_id
              ORDER BY c.channel_id, lc.line_id
             """
         ).fetchall()
 
         grouped: dict[str, list[DeepProbeCandidate]] = {}
-
         for row in channel_rows:
             scored = eligible_by_line.get(row["line_id"])
             if scored is None:
                 continue
-
             grouped.setdefault(row["channel_id"], []).append(
                 DeepProbeCandidate(
                     channel_id=row["channel_id"],
@@ -548,9 +533,7 @@ def score_lines(
             )
             candidates.extend(items[:MAX_DEEP_CANDIDATES_PER_CHANNEL])
 
-    score_results.sort(
-        key=lambda item: (-item.total_score, item.line_id)
-    )
+    score_results.sort(key=lambda item: (-item.total_score, item.line_id))
     candidates.sort(
         key=lambda item: (
             item.channel_id,
