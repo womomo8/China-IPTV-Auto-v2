@@ -599,8 +599,12 @@ def _save_record(
         if not isinstance(original, dict):
             original = {}
 
-        # Do not overwrite an existing result from this same run.
-        if isinstance(original.get("content_check"), dict):
+        # Keep completed results, but allow unknown results to be retried.
+        existing = original.get("content_check")
+        if isinstance(existing, dict) and existing.get("status") in {
+            "no_flag_detected",
+            "confirmed",
+        }:
             return False
 
         original["content_check"] = record.evidence
