@@ -1,8 +1,8 @@
+
 """Unified orchestration for the China-IPTV-Auto-v2 pipeline.
 
-This module connects the existing processing stages into one resumable run.
-It deliberately does not publish playlists; publication is handled by the
-separate protected publisher stage.
+Connect all existing processing stages into one cloud pipeline.
+Protected publication is intentionally handled by a separate module.
 """
 from __future__ import annotations
 
@@ -10,8 +10,6 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import socket
-import sqlite3
 from typing import Any
 
 from .config import load_config
@@ -28,7 +26,8 @@ from .stability import run_stability_retests
 
 
 ENVIRONMENT_TYPE = "cloud"
-PIPELINE_VERSION = 1
+PIPELINE_VERSION = 2
+DEFAULT_RUNNER_IDENTITY = "cloud:github-actions-v1"
 
 
 class PipelineError(RuntimeError):
@@ -40,19 +39,17 @@ def _now() -> str:
 
 
 def _runner_identity() -> str:
-    """Return a stable, non-personal identity for this cloud runner."""
+    """Use a stable identity across temporary GitHub Actions machines."""
     configured = os.environ.get("IPTV_RUNNER_ID", "").strip()
     if configured:
         return configured[:120]
-
-    host = socket.gethostname().strip() or "github-actions"
-    return f"cloud:{host}"[:120]
+    return DEFAULT_RUNNER_IDENTITY
 
 
-def _json_object(value: str | None) -> dict[str, Any]:
+def _json_object(value: object) -> dict[str, Any]:
     try:
         result = json.loads(value or "{}")
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError):
         return {}
     return result if isinstance(result, dict) else {}
 
@@ -64,7 +61,7 @@ def _save_summary(
     *,
     status: str | None = None,
 ) -> None:
-    """Persist a checkpoint after each completed stage."""
+    """Save a stage checkpoint and close completed or failed runs."""
     with database_session(database_path) as db:
         row = db.execute(
             "SELECT summary_json FROM runs WHERE run_id = ?",
@@ -79,26 +76,37 @@ def _save_summary(
         current["pipeline_version"] = PIPELINE_VERSION
         current["updated_at"] = _now()
 
+        serialized = json.dumps(
+            current,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
         if status is None:
             db.execute(
                 "UPDATE runs SET summary_json = ? WHERE run_id = ?",
-                (
-                    json.dumps(current, ensure_ascii=False, sort_keys=True),
-                    run_id,
-                ),
+                (serialized, run_id),
+            )
+        elif status in {"awaiting_publication", "failed"}:
+            db.execute(
+                """
+                UPDATE runs
+                   SET summary_json = ?,
+                       status = ?,
+                       finished_at = ?
+                 WHERE run_id = ?
+                """,
+                (serialized, status, _now(), run_id),
             )
         else:
             db.execute(
                 """
                 UPDATE runs
-                   SET summary_json = ?, status = ?
+                   SET summary_json = ?,
+                       status = ?
                  WHERE run_id = ?
                 """,
-                (
-                    json.dumps(current, ensure_ascii=False, sort_keys=True),
-                    status,
-                    run_id,
-                ),
+                (serialized, status, run_id),
             )
 
 
@@ -155,8 +163,14 @@ def _create_or_resume_run(
         cursor = db.execute(
             """
             INSERT INTO runs
-                (started_at, finished_at, status,
-                 runner_identity, environment_type, summary_json)
+                (
+                    started_at,
+                    finished_at,
+                    status,
+                    runner_identity,
+                    environment_type,
+                    summary_json
+                )
             VALUES (?, NULL, ?, ?, ?, ?)
             """,
             (
@@ -176,9 +190,7 @@ def _create_or_resume_run(
         return int(cursor.lastrowid)
 
 
-def _active_sources(
-    database_path: Path,
-) -> list[dict[str, str]]:
+def _active_sources(database_path: Path) -> list[dict[str, str]]:
     with database_session(database_path) as db:
         rows = db.execute(
             """
@@ -207,6 +219,7 @@ def _discover_and_ingest(
     database_path: Path,
     run_id: int,
 ) -> dict[str, int]:
+    """Discover sources, synchronize the pool, fetch and register lines."""
     source_registry = SourceRegistry(
         database_path,
         pool_capacity=int(config["sources"]["pool_capacity"]),
@@ -215,7 +228,6 @@ def _discover_and_ingest(
 
     candidates = collect_source_candidates(config)
     sync_result = source_registry.sync_candidates(candidates)
-
     line_registry = LineRegistry(database_path)
 
     fetched_count = 0
@@ -224,10 +236,14 @@ def _discover_and_ingest(
     accepted_count = 0
     rejected_count = 0
 
-    for source in _active_sources(database_path):
+    active_sources = _active_sources(database_path)
+
+    for source in active_sources:
         result = fetch_playlist(
             source["url"],
-            timeout=float(config["discovery"]["request_timeout_seconds"]),
+            timeout=float(
+                config["discovery"]["request_timeout_seconds"]
+            ),
         )
 
         if not result.ok:
@@ -306,21 +322,200 @@ def run_pipeline(
     config_path: str | Path = "config.yaml",
     resume_run_id: int | None = None,
 ) -> dict[str, Any]:
-    """Run or resume the complete pre-publication processing pipeline.
+    """Run the complete pre-publication processing pipeline.
 
     Stages:
-      1. source discovery and source-pool synchronization;
-      2. source fetching, playlist parsing and line registration;
-      3. three-round basic measurements;
-      4. source and line scoring;
-      5. bounded FFmpeg/FFprobe deep probes;
-      6. OCR and content checks;
-      7. up to two stability retests.
+      1. discover and synchronize public/manual sources;
+      2. fetch playlists, parse and register lines;
+      3. perform three basic measurement rounds;
+      4. score lines and select deep-probe candidates;
+      5. perform bounded FFprobe/FFmpeg checks;
+      6. perform conservative OCR content checks;
+      7. perform up to two stability retests.
 
-    Publishing is intentionally excluded until the protected publisher
-    implementation is installed and reviewed.
+    Formal publication is not performed here.
     """
     config = load_config(config_path)
 
     database_path = Path(config["paths"]["database"])
-    database_path.parent.mkdir(parents=True, exist_ok=T
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+
+    initialize_database(database_path)
+
+    runner_identity = _runner_identity()
+    run_id = _create_or_resume_run(
+        database_path,
+        runner_identity=runner_identity,
+        resume_run_id=resume_run_id,
+    )
+
+    summary: dict[str, Any] = {
+        "environment_type": ENVIRONMENT_TYPE,
+        "runner_identity": runner_identity,
+        "current_stage": "source_discovery_and_ingest",
+    }
+
+    try:
+        _save_summary(database_path, run_id, summary)
+
+        source_summary = _discover_and_ingest(
+            config,
+            database_path,
+            run_id,
+        )
+        summary["source_stage"] = source_summary
+
+        summary["current_stage"] = "basic_measurements"
+        _save_summary(database_path, run_id, summary)
+
+        measurement_result = run_basic_measurements(
+            database_path,
+            run_id,
+            runner_identity=runner_identity,
+            environment_type=ENVIRONMENT_TYPE,
+            timeout_seconds=float(
+                config["measurement"]["basic_timeout_seconds"]
+            ),
+            max_concurrency=int(
+                config["measurement"]["max_concurrency"]
+            ),
+            required_rounds=3,
+        )
+
+        summary["basic_measurements"] = {
+            "scheduled": measurement_result.scheduled_count,
+            "skipped_existing": measurement_result.skipped_existing_count,
+            "success": measurement_result.success_count,
+            "reachable": measurement_result.reachable_count,
+            "probe_limited": measurement_result.probe_limited_count,
+            "failed": measurement_result.failed_count,
+        }
+
+        summary["current_stage"] = "line_scoring"
+        _save_summary(database_path, run_id, summary)
+
+        scoring_result = score_lines(
+            database_path,
+            run_id,
+            runner_identity=runner_identity,
+            environment_type=ENVIRONMENT_TYPE,
+        )
+
+        summary["line_scoring"] = {
+            "scored": scoring_result.scored_count,
+            "eligible": scoring_result.eligible_line_count,
+            "deep_candidates": scoring_result.candidate_count,
+        }
+
+        summary["current_stage"] = "deep_probe"
+        _save_summary(database_path, run_id, summary)
+
+        deep_result = run_deep_probes(
+            database_path,
+            run_id,
+            scoring_result.candidates,
+            runner_identity=runner_identity,
+            environment_type=ENVIRONMENT_TYPE,
+            timeout_seconds=float(
+                config["measurement"]["deep_timeout_seconds"]
+            ),
+            max_concurrency=3,
+        )
+
+        summary["deep_probe"] = {
+            "selected": deep_result.selected_count,
+            "passed": deep_result.passed_count,
+            "failed": deep_result.failed_count,
+            "unknown": deep_result.unknown_count,
+        }
+
+        summary["current_stage"] = "content_check"
+        _save_summary(database_path, run_id, summary)
+
+        content_result = run_content_checks(
+            database_path,
+            run_id,
+            runner_identity=runner_identity,
+            environment_type=ENVIRONMENT_TYPE,
+            max_concurrency=3,
+        )
+
+        summary["content_check"] = {
+            "selected": content_result.selected_count,
+            "checked": content_result.checked_count,
+            "clean": content_result.clean_count,
+            "confirmed_bad": content_result.confirmed_count,
+            "unknown": content_result.unknown_count,
+            "blacklisted": content_result.blacklisted_count,
+        }
+
+        summary["current_stage"] = "stability_retest"
+        _save_summary(database_path, run_id, summary)
+
+        stability_result = run_stability_retests(
+            database_path,
+            run_id,
+            runner_identity=runner_identity,
+            environment_type=ENVIRONMENT_TYPE,
+            retests=int(config["measurement"]["stability_retests"]),
+            timeout_seconds=float(
+                config["measurement"]["basic_timeout_seconds"]
+            ),
+            max_concurrency=3,
+        )
+
+        summary["stability_retest"] = {
+            "selected": stability_result.selected_count,
+            "scheduled": stability_result.scheduled_count,
+            "skipped_existing": stability_result.skipped_existing_count,
+            "success": stability_result.success_count,
+            "reachable": stability_result.reachable_count,
+            "probe_limited": stability_result.probe_limited_count,
+            "failed": stability_result.failed_count,
+        }
+
+        summary["current_stage"] = "awaiting_protected_publication"
+        summary["publication_ready"] = False
+        summary["note"] = (
+            "检测阶段已完成；正式发布必须等待受保护的发布模块。"
+        )
+
+        _save_summary(
+            database_path,
+            run_id,
+            summary,
+            status="awaiting_publication",
+        )
+
+        return {
+            "run_id": run_id,
+            "status": "awaiting_publication",
+            "summary": summary,
+        }
+
+    except Exception as exc:
+        summary["current_stage"] = "failed"
+        summary["error"] = {
+            "type": type(exc).__name__,
+            "message": str(exc)[:1000],
+        }
+
+        try:
+            _save_summary(
+                database_path,
+                run_id,
+                summary,
+                status="failed",
+            )
+        except Exception:
+            pass
+
+        raise PipelineError(
+            f"自动处理管道失败，run_id={run_id}："
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+if __name__ == "__main__":
+    result = run_pipeline()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
