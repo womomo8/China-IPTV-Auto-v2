@@ -1,3 +1,4 @@
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -232,7 +233,7 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertEqual(score.channel_count, 1)
         self.assertGreater(score.total_score, 80)
 
-    def test_manual_source_is_not_evicted(self):
+    def test_lowest_scored_manual_source_can_be_evicted(self):
         manual = Candidate(
             "人工来源", "https://example.com/manual.m3u", "manual"
         )
@@ -240,23 +241,56 @@ class SourceRegistryTests(unittest.TestCase):
 
         discovered = [
             Candidate(f"自动来源{i}", f"https://example.com/{i}.m3u")
-            for i in range(30)
+            for i in range(29)
         ]
-        self.registry.sync_candidates(discovered)
+
+        for start in range(0, len(discovered), 8):
+            self.registry.sync_candidates(discovered[start:start + 8])
 
         with database_session(self.db_path) as db:
-            row = db.execute(
+            db.execute(
+                """
+                INSERT INTO source_scores
+                    (run_id, source_id, scored_at, total_score, components_json)
+                VALUES (1, ?, '2026-11-04T00:00:00Z', 10, '{}')
+                """,
+                (manual.source_id,),
+            )
+
+            for item in discovered:
+                db.execute(
+                    """
+                    INSERT INTO source_scores
+                        (run_id, source_id, scored_at,
+                         total_score, components_json)
+                    VALUES (1, ?, '2026-11-04T00:00:00Z', 50, '{}')
+                    """,
+                    (item.source_id,),
+                )
+
+        replacement = Candidate(
+            "新发现来源", "https://example.com/replacement.m3u"
+        )
+        result = self.registry.sync_candidates([replacement])
+
+        self.assertIn(manual.source_id, result.evicted)
+        self.assertIn(replacement.source_id, result.accepted)
+
+        with database_session(self.db_path) as db:
+            manual_row = db.execute(
                 "SELECT active FROM sources WHERE source_id = ?",
                 (manual.source_id,),
             ).fetchone()
-
-        self.assertEqual(row["active"], 1)
-
-        with database_session(self.db_path) as db:
+            replacement_row = db.execute(
+                "SELECT active FROM sources WHERE source_id = ?",
+                (replacement.source_id,),
+            ).fetchone()
             count = db.execute(
                 "SELECT COUNT(*) FROM sources WHERE active = 1"
             ).fetchone()[0]
 
+        self.assertEqual(manual_row["active"], 0)
+        self.assertEqual(replacement_row["active"], 1)
         self.assertEqual(count, 30)
 
 
