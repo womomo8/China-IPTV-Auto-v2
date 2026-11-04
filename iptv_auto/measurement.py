@@ -1,24 +1,20 @@
-"""Bounded basic stream measurements with persistent round history.
 
-Only an actual HTTP(S) response body read is recorded as "success".
-TCP reachability and UDP/RTP probe limitations are deliberately not counted
-as successful media reads and can never satisfy the release success gate.
-"""
+"""Bounded IPv4-first basic stream measurements with persistent history."""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import http.client
 import ipaddress
 import json
 import math
 from pathlib import Path
 import socket
+import ssl
 import time
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
 
 from .database import database_session
 
@@ -27,6 +23,7 @@ MAX_READ_BYTES = 4096
 MAX_ALLOWED_CONCURRENCY = 12
 MAX_ALLOWED_TIMEOUT_SECONDS = 8.0
 SUPPORTED_ENVIRONMENTS = {"cloud"}
+VALID_STATUSES = {"success", "reachable", "probe_limited", "failed"}
 
 
 @dataclass(frozen=True)
@@ -77,132 +74,153 @@ def _finite_nonnegative(value: object) -> float | None:
 def _safe_error_class(exc: BaseException) -> str:
     if isinstance(exc, (TimeoutError, socket.timeout)):
         return "timeout"
-    if isinstance(exc, HTTPError):
-        return "http_error"
-    if isinstance(exc, URLError):
-        reason = exc.reason
-        if isinstance(reason, (TimeoutError, socket.timeout)):
-            return "timeout"
-        return "network_error"
-    if isinstance(exc, (ConnectionError, OSError, socket.gaierror)):
+    if isinstance(exc, socket.gaierror):
+        return "dns_error"
+    if isinstance(exc, (ConnectionError, OSError)):
         return "network_error"
     return "probe_error"
 
 
-def _probe_http(
-    url: str,
-    headers: dict[str, str],
-    timeout_seconds: float,
-) -> ProbeResult:
-    """Read at most MAX_READ_BYTES from an HTTP(S) endpoint."""
-    request_headers = dict(headers)
-    request_headers.setdefault("User-Agent", "China-IPTV-Auto-v2/1.0")
-    request_headers.setdefault("Range", f"bytes=0-{MAX_READ_BYTES - 1}")
+def _connect_ipv4(host: str, port: int, timeout: float) -> tuple[socket.socket, str]:
+    """Create a direct IPv4 socket; never silently fall back to IPv6."""
+    addresses = socket.getaddrinfo(
+        host, port, family=socket.AF_INET, type=socket.SOCK_STREAM
+    )
+    if not addresses:
+        raise OSError("no_ipv4_address")
 
-    request = Request(url, headers=request_headers, method="GET")
+    last_error = None
+    for family, socktype, proto, _canonname, sockaddr in addresses:
+        sock = socket.socket(family, socktype, proto)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(sockaddr)
+            return sock, str(sock.getpeername()[0])
+        except OSError as exc:
+            last_error = exc
+            sock.close()
+
+    if last_error:
+        raise last_error
+    raise OSError("no_ipv4_address")
+
+
+def _probe_http(url: str, headers: dict[str, str], timeout_seconds: float) -> ProbeResult:
+    """Read at most 4096 bytes over a forced IPv4 connection."""
     started = time.monotonic()
+    connection = None
+    peer_ip = None
 
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            status_code = int(response.getcode() or 0)
-            content_type = response.headers.get("Content-Type", "")
-            # A strict read cap applies even when the server ignores Range.
-            body = response.read(MAX_READ_BYTES)
+        parts = urlsplit(url)
+        scheme = parts.scheme.lower()
+        if scheme not in {"http", "https"} or not parts.hostname:
+            raise ValueError("unsupported_http_url")
+
+        host = parts.hostname
+        port = parts.port or (443 if scheme == "https" else 80)
+        target = parts.path or "/"
+        if parts.query:
+            target += "?" + parts.query
+
+        class IPv4HTTPConnection(http.client.HTTPConnection):
+            def connect(self):
+                self.sock, peer = _connect_ipv4(host, port, timeout_seconds)
+                self.peer_ipv4 = peer
+
+        class IPv4HTTPSConnection(http.client.HTTPSConnection):
+            def connect(self):
+                raw, peer = _connect_ipv4(host, port, timeout_seconds)
+                context = ssl.create_default_context()
+                try:
+                    self.sock = context.wrap_socket(raw, server_hostname=host)
+                except Exception:
+                    raw.close()
+                    raise
+                self.peer_ipv4 = peer
+
+        if scheme == "https":
+            connection = IPv4HTTPSConnection(host, port, timeout=timeout_seconds)
+        else:
+            connection = IPv4HTTPConnection(host, port, timeout=timeout_seconds)
+
+        request_headers = dict(headers or {})
+        request_headers.setdefault("User-Agent", "China-IPTV-Auto-v2/1.0")
+        request_headers.setdefault("Range", f"bytes=0-{MAX_READ_BYTES - 1}")
+        request_headers.setdefault("Host", host if port in (80, 443) else f"{host}:{port}")
+
+        connection.request("GET", target, headers=request_headers)
+        response = connection.getresponse()
+        peer_ip = getattr(connection, "peer_ipv4", None)
+        body = response.read(MAX_READ_BYTES)
+        status_code = int(response.status)
+        content_type = response.getheader("Content-Type", "")
 
         elapsed = max(time.monotonic() - started, 0.000001)
-        latency_ms = _finite_nonnegative(elapsed * 1000.0)
-        byte_count = len(body)
+        latency = _finite_nonnegative(elapsed * 1000.0)
 
         evidence = {
             "probe_kind": "http_small_body_read",
             "http_status": status_code,
-            "content_type": content_type[:200],
-            "bytes_read": byte_count,
+            "content_type": str(content_type)[:200],
+            "bytes_read": len(body),
             "byte_limit": MAX_READ_BYTES,
             "range_requested": True,
+            "ip_version": 4,
+            "connected_ipv4": peer_ip,
             "media_playback_confirmed": False,
         }
 
         if not 200 <= status_code < 300:
-            return ProbeResult(
-                "failed", latency_ms, None, "http_status_error", evidence
-            )
+            return ProbeResult("failed", latency, None, "http_status_error", evidence)
 
-        if byte_count == 0:
-            return ProbeResult(
-                "failed", latency_ms, None, "empty_response", evidence
-            )
+        if not body:
+            return ProbeResult("failed", latency, None, "empty_response", evidence)
 
-        throughput = _finite_nonnegative(
-            (byte_count / elapsed) / 1024.0
-        )
+        throughput = _finite_nonnegative((len(body) / elapsed) / 1024.0)
+        return ProbeResult("success", latency, throughput, "", evidence)
 
-        return ProbeResult(
-            "success",
-            latency_ms,
-            throughput,
-            "",
-            evidence,
-        )
-
-    except HTTPError as exc:
+    except Exception as exc:
         elapsed = max(time.monotonic() - started, 0.000001)
+        error = _safe_error_class(exc)
+        if isinstance(exc, OSError) and str(exc) == "no_ipv4_address":
+            error = "no_ipv4_address"
+
         return ProbeResult(
             "failed",
             _finite_nonnegative(elapsed * 1000.0),
             None,
-            "http_status_error",
+            error,
             {
                 "probe_kind": "http_small_body_read",
-                "http_status": int(exc.code),
-                "bytes_read": 0,
-                "byte_limit": MAX_READ_BYTES,
-                "media_playback_confirmed": False,
-            },
-        )
-    except BaseException as exc:
-        elapsed = max(time.monotonic() - started, 0.000001)
-        return ProbeResult(
-            "failed",
-            _finite_nonnegative(elapsed * 1000.0),
-            None,
-            _safe_error_class(exc),
-            {
-                "probe_kind": "http_small_body_read",
+                "ip_version": 4,
+                "connected_ipv4": peer_ip,
                 "bytes_read": 0,
                 "byte_limit": MAX_READ_BYTES,
                 "exception_type": type(exc).__name__,
                 "media_playback_confirmed": False,
             },
         )
+    finally:
+        if connection is not None:
+            connection.close()
 
 
-def _probe_tcp_reachability(
-    url: str,
-    timeout_seconds: float,
-) -> ProbeResult:
-    """Check only TCP connection establishment; never call it media success."""
-    parts = urlsplit(url)
-    host = parts.hostname
-    if not host:
-        return ProbeResult(
-            "failed", None, None, "missing_host",
-            {"probe_kind": "tcp_connect"},
-        )
-
-    default_ports = {"rtsp": 554, "rtmp": 1935}
-    try:
-        port = parts.port or default_ports[parts.scheme.lower()]
-    except (ValueError, KeyError):
-        return ProbeResult(
-            "failed", None, None, "invalid_or_missing_port",
-            {"probe_kind": "tcp_connect"},
-        )
-
+def _probe_tcp_reachability(url: str, timeout_seconds: float) -> ProbeResult:
+    """TCP reachability only; it is never counted as media success."""
     started = time.monotonic()
     try:
-        with socket.create_connection((host, port), timeout=timeout_seconds):
-            elapsed = max(time.monotonic() - started, 0.000001)
+        parts = urlsplit(url)
+        host = parts.hostname
+        if not host:
+            raise ValueError("missing_host")
+
+        default_ports = {"rtsp": 554, "rtmp": 1935}
+        port = parts.port or default_ports[parts.scheme.lower()]
+        sock, peer_ip = _connect_ipv4(host, port, timeout_seconds)
+        sock.close()
+
+        elapsed = max(time.monotonic() - started, 0.000001)
         return ProbeResult(
             "reachable",
             _finite_nonnegative(elapsed * 1000.0),
@@ -210,13 +228,13 @@ def _probe_tcp_reachability(
             "",
             {
                 "probe_kind": "tcp_connect_only",
-                "host": host,
-                "port": port,
+                "ip_version": 4,
+                "connected_ipv4": peer_ip,
                 "media_playback_confirmed": False,
                 "counts_as_measurement_success": False,
             },
         )
-    except BaseException as exc:
+    except Exception as exc:
         elapsed = max(time.monotonic() - started, 0.000001)
         return ProbeResult(
             "failed",
@@ -225,85 +243,48 @@ def _probe_tcp_reachability(
             _safe_error_class(exc),
             {
                 "probe_kind": "tcp_connect_only",
-                "host": host,
-                "port": port,
+                "ip_version": 4,
                 "exception_type": type(exc).__name__,
                 "media_playback_confirmed": False,
             },
         )
 
 
-def _probe_line(
-    url: str,
-    headers: dict[str, str],
-    timeout_seconds: float,
-) -> ProbeResult:
-    """Select a conservative probe according to the stream protocol."""
+def _probe_line(url: str, headers: dict[str, str], timeout_seconds: float) -> ProbeResult:
     try:
-        parts = urlsplit(url)
-        scheme = parts.scheme.lower()
-
+        scheme = urlsplit(url).scheme.lower()
         if scheme in {"http", "https"}:
             return _probe_http(url, headers, timeout_seconds)
-
         if scheme in {"rtsp", "rtmp"}:
             return _probe_tcp_reachability(url, timeout_seconds)
-
         if scheme in {"udp", "rtp"}:
-            # UDP has no connection handshake. A cloud-side socket operation
-            # cannot prove that a multicast stream is arriving or playable.
             return ProbeResult(
-                "probe_limited",
-                None,
-                None,
+                "probe_limited", None, None,
                 "udp_media_probe_requires_receiver",
                 {
                     "probe_kind": "udp_rtp_limited",
                     "scheme": scheme,
                     "media_playback_confirmed": False,
                     "counts_as_measurement_success": False,
-                    "note": (
-                        "需要实际接收端/合适网络环境才能验证组播媒体流；"
-                        "本次云端基础测速不将其判为成功或永久损坏"
-                    ),
                 },
             )
-
         return ProbeResult(
-            "failed",
-            None,
-            None,
-            "unsupported_protocol",
-            {
-                "probe_kind": "unsupported",
-                "scheme": scheme,
-                "media_playback_confirmed": False,
-            },
+            "failed", None, None, "unsupported_protocol",
+            {"probe_kind": "unsupported", "scheme": scheme},
         )
-
     except (TypeError, ValueError) as exc:
         return ProbeResult(
-            "failed",
-            None,
-            None,
-            "malformed_url",
+            "failed", None, None, "malformed_url",
             {"exception_type": type(exc).__name__},
         )
 
 
-def _validate_runtime_options(
-    timeout_seconds: float,
-    max_concurrency: int,
-) -> tuple[float, int]:
+def _validate_runtime_options(timeout_seconds: float, max_concurrency: int) -> tuple[float, int]:
     timeout = _finite_nonnegative(timeout_seconds)
     if timeout is None or timeout <= 0 or timeout > MAX_ALLOWED_TIMEOUT_SECONDS:
         raise ValueError("基础测速超时必须大于0且不能超过8秒")
-
-    if type(max_concurrency) is not int or not (
-        1 <= max_concurrency <= MAX_ALLOWED_CONCURRENCY
-    ):
+    if type(max_concurrency) is not int or not 1 <= max_concurrency <= MAX_ALLOWED_CONCURRENCY:
         raise ValueError("基础测速并发数必须是1至12之间的整数")
-
     return timeout, max_concurrency
 
 
@@ -313,21 +294,215 @@ def _load_candidates_and_reserve_rounds(
     runner_identity: str,
     environment_type: str,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Reserve one unique measurement row per eligible line before probing.
-
-    Reserving first prevents two overlapping invocations from probing the same
-    line in the same run. A process interruption leaves a pending row; it is
-    not silently counted as success and is not measured twice in that run.
-    """
     candidates: list[dict[str, Any]] = []
     skipped = 0
     timestamp = _now()
 
     with database_session(database_path) as db:
         run = db.execute(
+            "SELECT runner_identity, environment_type FROM runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+
+        if run is None:
+            raise ValueError(f"任务记录不存在：run_id={run_id}")
+        if run["runner_identity"] != runner_identity:
+            raise ValueError("runner_identity 与任务记录不一致")
+        if run["environment_type"] != environment_type:
+            raise ValueError("environment_type 与任务记录不一致")
+        if environment_type not in SUPPORTED_ENVIRONMENTS:
+            raise ValueError("基础测速目前只允许 cloud，不能冒充国内家庭实测")
+
+        rows = db.execute(
             """
-            SELECT runner_identity, environment_type
-              FROM runs
-             WHERE run_id = ?
-            """,
-        
+            SELECT l.line_id, l.url, l.headers_json
+              FROM lines AS l
+             WHERE NOT EXISTS (
+                   SELECT 1 FROM blacklists b
+                    WHERE b.active = 1
+                      AND (
+                           (b.target_type = 'line' AND b.target_id = l.line_id)
+                        OR (b.target_type = 'url' AND b.target_id = l.url)
+                      )
+             )
+             ORDER BY l.line_id
+            """
+        ).fetchall()
+
+        for row in rows:
+            line_id = str(row["line_id"])
+
+            existing = db.execute(
+                """
+                SELECT 1 FROM measurements
+                 WHERE run_id = ? AND line_id = ?
+                   AND runner_identity = ? AND environment_type = ?
+                 LIMIT 1
+                """,
+                (run_id, line_id, runner_identity, environment_type),
+            ).fetchone()
+
+            if existing:
+                skipped += 1
+                continue
+
+            history = db.execute(
+                """
+                SELECT round_no, evidence_json
+                  FROM measurements
+                 WHERE line_id = ? AND runner_identity = ?
+                   AND environment_type = ?
+                """,
+                (line_id, runner_identity, environment_type),
+            ).fetchall()
+
+            # Stability retests are not basic measurement rounds.
+            basic_rounds = []
+            for item in history:
+                try:
+                    evidence = json.loads(item["evidence_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    evidence = {}
+                if not (
+                    isinstance(evidence, dict)
+                    and evidence.get("measurement_stage") == "stability_retest"
+                ):
+                    basic_rounds.append(int(item["round_no"]))
+
+            round_no = max(basic_rounds, default=0) + 1
+
+            cursor = db.execute(
+                """
+                INSERT INTO measurements
+                    (run_id, line_id, round_no, measured_at,
+                     runner_identity, environment_type, status,
+                     latency_ms, throughput_kbps, error_class, evidence_json)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, '', ?)
+                """,
+                (
+                    run_id, line_id, round_no, timestamp,
+                    runner_identity, environment_type,
+                    json.dumps({
+                        "measurement_stage": "basic",
+                        "reserved_at": timestamp,
+                        "environment_type": environment_type,
+                        "media_playback_confirmed": False,
+                    }),
+                ),
+            )
+
+            try:
+                headers = json.loads(row["headers_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                headers = {}
+            if not isinstance(headers, dict):
+                headers = {}
+
+            candidates.append({
+                "measurement_id": cursor.lastrowid,
+                "line_id": line_id,
+                "round_no": round_no,
+                "url": row["url"],
+                "headers": headers,
+            })
+
+    return candidates, skipped
+
+
+def run_basic_measurements(
+    database_path: str | Path,
+    run_id: int,
+    *,
+    runner_identity: str,
+    environment_type: str = "cloud",
+    timeout_seconds: float = 8.0,
+    max_concurrency: int = 12,
+) -> MeasurementRunResult:
+    """Run one bounded basic measurement round for each eligible line."""
+    if type(run_id) is not int or run_id <= 0:
+        raise ValueError("run_id 必须是正整数")
+    if not isinstance(runner_identity, str) or not runner_identity.strip():
+        raise ValueError("runner_identity 必须是非空文本")
+
+    timeout, concurrency = _validate_runtime_options(
+        timeout_seconds, max_concurrency
+    )
+
+    reservations, skipped = _load_candidates_and_reserve_rounds(
+        Path(database_path), run_id, runner_identity, environment_type
+    )
+
+    def probe(item: dict[str, Any]) -> ProbeResult:
+        return _probe_line(item["url"], item["headers"], timeout)
+
+    records: list[MeasurementRecord] = []
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(probe, item): item
+            for item in reservations
+        }
+
+        for future in as_completed(futures):
+            item = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = ProbeResult(
+                    "failed", None, None,
+                    f"probe_exception_{type(exc).__name__}",
+                    {"exception_type": type(exc).__name__},
+                )
+
+            status = result.status if result.status in VALID_STATUSES else "failed"
+            latency = _finite_nonnegative(result.latency_ms)
+            throughput = _finite_nonnegative(result.throughput_kbps)
+            error_class = str(result.error_class or "")[:120]
+            evidence = result.evidence if isinstance(result.evidence, dict) else {}
+
+            evidence = dict(evidence)
+            evidence.update({
+                "measurement_stage": "basic",
+                "environment_type": environment_type,
+                "completed_at": _now(),
+                "media_playback_confirmed": False,
+            })
+
+            with database_session(database_path) as db:
+                db.execute(
+                    """
+                    UPDATE measurements
+                       SET measured_at = ?, status = ?,
+                           latency_ms = ?, throughput_kbps = ?,
+                           error_class = ?, evidence_json = ?
+                     WHERE measurement_id = ? AND status = 'pending'
+                    """,
+                    (
+                        _now(), status, latency, throughput, error_class,
+                        json.dumps(evidence, ensure_ascii=False),
+                        item["measurement_id"],
+                    ),
+                )
+
+            records.append(MeasurementRecord(
+                line_id=item["line_id"],
+                round_no=item["round_no"],
+                status=status,
+                latency_ms=latency,
+                throughput_kbps=throughput,
+                error_class=error_class,
+            ))
+
+    records.sort(key=lambda item: (item.line_id, item.round_no))
+
+    return MeasurementRunResult(
+        run_id=run_id,
+        environment_type=environment_type,
+        scheduled_count=len(reservations),
+        skipped_existing_count=skipped,
+        success_count=sum(item.status == "success" for item in records),
+        reachable_count=sum(item.status == "reachable" for item in records),
+        probe_limited_count=sum(item.status == "probe_limited" for item in records),
+        failed_count=sum(item.status == "failed" for item in records),
+        records=tuple(records),
+    )
