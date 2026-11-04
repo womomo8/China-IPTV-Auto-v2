@@ -540,7 +540,7 @@ def _blacklist_confirmed(
 
 
 def _already_checked(evidence_json: str) -> bool:
-    """Avoid repeating the same content check within one run."""
+    """Skip only completed content checks; unknown results can be retried."""
     try:
         evidence = json.loads(evidence_json or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -549,7 +549,15 @@ def _already_checked(evidence_json: str) -> bool:
     if not isinstance(evidence, dict):
         return False
 
-    return isinstance(evidence.get("content_check"), dict)
+    result = evidence.get("content_check")
+
+    if not isinstance(result, dict):
+        return False
+
+    return result.get("status") in {
+        "no_flag_detected",
+        "confirmed",
+    }
 
 
 def _save_record(
