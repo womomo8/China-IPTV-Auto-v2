@@ -524,7 +524,7 @@ def _load_candidates_and_reserve_rounds(
                     "headers": headers,
                 })
                 occupied_rounds.add(next_round)
-                basic_rounds.append(next_round)
+                
                 next_round += 1
 
     return candidates, skipped
