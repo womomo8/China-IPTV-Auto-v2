@@ -1,4 +1,3 @@
-
 import json
 import sqlite3
 
@@ -64,6 +63,7 @@ def _database(
 
         for index in range(1, 8):
             line_id = f"line-{index}"
+            url = f"https://example.com/{index}.ts"
 
             db.execute(
                 """
@@ -83,10 +83,7 @@ def _database(
                     '2026-11-04T00:00:00Z'
                 )
                 """,
-                (
-                    line_id,
-                    f"https://example.com/{index}.ts",
-                ),
+                (line_id, url),
             )
 
             db.execute(
@@ -149,6 +146,29 @@ def _database(
                         content_evidence,
                         ensure_ascii=False,
                     ),
+                ),
+            )
+
+            # Stability retests must use the score from this run.
+            db.execute(
+                """
+                INSERT INTO line_scores
+                    (
+                        run_id,
+                        line_id,
+                        scored_at,
+                        total_score,
+                        components_json
+                    )
+                VALUES (?, ?, '2026-11-04T00:00:00Z', ?, ?)
+                """,
+                (
+                    run_id,
+                    line_id,
+                    float(100 - index),
+                    json.dumps({
+                        "eligible_for_deep_probe": True,
+                    }),
                 ),
             )
 
@@ -235,7 +255,6 @@ def test_only_deep_and_content_passed_lines_are_selected(
         runner_identity="test-runner",
     )
 
-    # 六条深度检测通过，但每频道最多选五条。
     assert result.selected_count == 5
     assert result.scheduled_count == 10
     assert result.success_count == 10
@@ -644,6 +663,64 @@ def test_blacklisted_line_is_excluded_from_stability_retests(
                 'line',
                 'line-1',
                 'test blacklist',
+                '{}',
+                '2026-11-04T00:00:00Z',
+                1
+            )
+            """
+        )
+
+    monkeypatch.setattr(
+        stability,
+        "_probe_line",
+        _successful_probe,
+    )
+
+    result = stability.run_stability_retests(
+        path,
+        run_id,
+        runner_identity="test-runner",
+    )
+
+    assert result.selected_count == 5
+    assert result.scheduled_count == 10
+
+    with sqlite3.connect(path) as db:
+        count = db.execute(
+            """
+            SELECT COUNT(*)
+              FROM measurements
+             WHERE run_id = ?
+               AND line_id = 'line-1'
+            """,
+            (run_id,),
+        ).fetchone()[0]
+
+    assert count == 0
+
+
+def test_blacklisted_url_is_excluded_from_stability_retests(
+    tmp_path,
+    monkeypatch,
+):
+    path, run_id = _database(tmp_path)
+
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """
+            INSERT INTO blacklists
+                (
+                    target_type,
+                    target_id,
+                    reason,
+                    evidence_json,
+                    created_at,
+                    active
+                )
+            VALUES (
+                'url',
+                'https://example.com/1.ts',
+                'test URL blacklist',
                 '{}',
                 '2026-11-04T00:00:00Z',
                 1
