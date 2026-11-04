@@ -165,7 +165,7 @@ def collect_source_candidates(
     *,
     discoverer=None,
 ) -> list[SourceCandidate]:
-    """Merge manual and discovered sources; manual sources are never crowded out."""
+    """Merge manual and discovered sources, prioritizing manual entries in this batch."""
     if discoverer is None:
         discoverer = discover_github_playlists
     source_cfg = config["sources"]
