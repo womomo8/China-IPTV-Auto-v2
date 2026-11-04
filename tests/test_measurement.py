@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from iptv_auto.database import database_session, initialize_database
+from iptv_auto.ipv4 import IPv4Admission
 from iptv_auto.measurement import (
     BASIC_ROUNDS_REQUIRED,
     MAX_READ_BYTES,
@@ -48,6 +49,15 @@ class MeasurementTests(unittest.TestCase):
         self.db_path = Path(self.temp.name) / "measurement.sqlite3"
         initialize_database(self.db_path)
         self._create_run(1)
+
+        # Existing measurement tests use local test servers.
+        # Simulate successful IPv4 admission only in these tests.
+        self._ipv4_admission_patcher = patch(
+            "iptv_auto.measurement.check_ipv4_url",
+            return_value=IPv4Admission(True, "test_allowed"),
+        )
+        self._ipv4_admission_patcher.start()
+        self.addCleanup(self._ipv4_admission_patcher.stop)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -521,6 +531,61 @@ class MeasurementTests(unittest.TestCase):
     def test_missing_run_is_rejected(self):
         with self.assertRaises(ValueError):
             self._run(run_id=999)
+
+    def test_old_ipv6_and_private_lines_are_excluded(self):
+        self._add_line("old-ipv6", "http://[2001:db8::1]/live.ts")
+        self._add_line("old-private", "http://192.168.1.10/live.ts")
+
+        def reject_old_lines(url):
+            return IPv4Admission(False, "ipv4_not_allowed")
+
+        with patch(
+            "iptv_auto.measurement.check_ipv4_url",
+            side_effect=reject_old_lines,
+        ):
+            result = self._run()
+
+        self.assertEqual(result.scheduled_count, 0)
+        self.assertEqual(self._line_measurements("old-ipv6"), [])
+        self.assertEqual(self._line_measurements("old-private"), [])
+
+    def test_temporary_dns_failure_can_be_retried_next_run(self):
+        self._add_line(
+            "dns-retry",
+            "https://temporary-dns.example/live.ts",
+        )
+
+        with patch(
+            "iptv_auto.measurement.check_ipv4_url",
+            side_effect=[
+                IPv4Admission(False, "dns_temporary_failure"),
+                IPv4Admission(True, "ipv4_public"),
+            ],
+        ), patch(
+            "iptv_auto.measurement._probe_line",
+            return_value=ProbeResult(
+                "success",
+                10.0,
+                100.0,
+                "",
+                {
+                    "probe_kind": "http_small_body_read",
+                    "bytes_read": 100,
+                },
+            ),
+        ):
+            first = self._run()
+            second = self._run()
+
+        self.assertEqual(first.scheduled_count, 0)
+        self.assertEqual(second.scheduled_count, 3)
+        self.assertEqual(second.success_count, 3)
+
+        rows = self._line_measurements("dns-retry")
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(
+            all(row["status"] == "success" for row in rows)
+        )
 
 
 if __name__ == "__main__":
