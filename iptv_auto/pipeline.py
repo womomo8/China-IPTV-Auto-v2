@@ -236,6 +236,10 @@ def _discover_and_ingest(
     accepted_count = 0
     rejected_count = 0
 
+    ipv4_passed_count = 0
+    ipv4_excluded_count = 0
+    ipv4_temporary_failure_count = 0
+
     active_sources = _active_sources(database_path)
 
     for source in active_sources:
