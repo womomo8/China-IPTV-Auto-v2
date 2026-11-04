@@ -45,13 +45,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RUN_ID="$(gh api \
+          RUN_ID="$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-            --jq '[.artifacts[]
-              | select(.name == "iptv-database" and .expired == false)]
-              | sort_by(.created_at)
-              | last
-              | .workflow_run.id // empty')"
+            --jq '.artifacts[]
+              | select(.name == "iptv-database" and .expired == false)
+              | select(.workflow_run.id != null)
+              | [.created_at, (.workflow_run.id | tostring)]
+              | @tsv' \
+            | sort \
+            | tail -n 1 \
+            | cut -f 2)"
 
           echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
 
@@ -76,20 +79,70 @@ jobs:
           python -m iptv_auto.pipeline
 
       - name: Checkpoint SQLite database
+        id: checkpoint
         if: always()
         run: |
           if [ -f data/iptv_auto.sqlite3 ]; then
-            python -c "import sqlite3; c=sqlite3.connect('data/iptv_auto.sqlite3'); print(c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()); c.close()"
+            python - <<'PY'
+            import sqlite3
+
+            connection = sqlite3.connect("data/iptv_auto.sqlite3")
+            try:
+                result = connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                print("WAL checkpoint:", result)
+                if result is None or result[0] != 0:
+                    raise SystemExit("SQLite checkpoint was not completed.")
+            finally:
+                connection.close()
+            PY
           else
             echo "Database file does not exist; nothing to checkpoint."
+            exit 1
           fi
 
+      - name: Validate SQLite database
+        id: database
+        if: always()
+        run: |
+          python - <<'PY'
+          import os
+          import sqlite3
+          from pathlib import Path
+
+          path = Path("data/iptv_auto.sqlite3")
+          valid = False
+
+          if path.is_file() and path.stat().st_size > 0:
+              try:
+                  connection = sqlite3.connect(
+                      f"file:{path.resolve()}?mode=ro",
+                      uri=True
+                  )
+                  result = connection.execute(
+                      "PRAGMA integrity_check"
+                  ).fetchone()
+                  connection.close()
+                  valid = result is not None and result[0] == "ok"
+              except sqlite3.Error as error:
+                  print(f"Database integrity check failed: {error}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"valid={'true' if valid else 'false'}\n")
+
+          if valid:
+              print("SQLite database integrity check passed.")
+          else:
+              print("Database is missing, empty, or damaged; it will not be uploaded.")
+          PY
+
       - name: Save SQLite database
-        if: always() && hashFiles('data/iptv_auto.sqlite3') != ''
+        if: always() && steps.checkpoint.outcome == 'success' && steps.database.outputs.valid == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: iptv-database
           path: data/iptv_auto.sqlite3
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
           overwrite: true
