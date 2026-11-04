@@ -293,6 +293,49 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertEqual(replacement_row["active"], 1)
         self.assertEqual(count, 30)
 
+    def test_reactivating_manual_source_keeps_pool_capacity(self):
+        discovered = [
+            Candidate(f"自动来源{i}", f"https://example.com/reactivate-{i}.m3u")
+            for i in range(30)
+        ]
 
+        for start in range(0, len(discovered), 8):
+            self.registry.sync_candidates(discovered[start:start + 8])
+
+        manual = Candidate(
+            "曾被淘汰的人工来源",
+            "https://example.com/reactivated-manual.m3u",
+            "manual",
+        )
+
+        with database_session(self.db_path) as db:
+            db.execute(
+                """
+                INSERT INTO sources
+                    (source_id, name, url, source_type,
+                     first_seen_at, last_seen_at, active)
+                VALUES (?, ?, ?, 'manual',
+                        '2026-11-04T00:00:00Z',
+                        '2026-11-04T00:00:00Z', 0)
+                """,
+                (manual.source_id, manual.name, manual.url),
+            )
+
+        result = self.registry.sync_candidates([manual])
+
+        self.assertIn(manual.source_id, result.accepted)
+        self.assertEqual(len(result.evicted), 1)
+
+        with database_session(self.db_path) as db:
+            active_count = db.execute(
+                "SELECT COUNT(*) FROM sources WHERE active = 1"
+            ).fetchone()[0]
+            manual_row = db.execute(
+                "SELECT active FROM sources WHERE source_id = ?",
+                (manual.source_id,),
+            ).fetchone()
+
+        self.assertEqual(active_count, 30)
+        self.assertEqual(manual_row["active"], 1)
 if __name__ == "__main__":
     unittest.main()
