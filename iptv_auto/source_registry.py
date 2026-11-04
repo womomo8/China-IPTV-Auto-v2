@@ -177,7 +177,7 @@ class SourceRegistry:
                 seen.add(value)
 
         with database_session(self.database_path) as db:
-            # Manual sources are processed first and are never evicted.
+             # Manual sources are processed first, but use the same eviction rules.
             for _candidate, identity in manual:
                 source_id, url, name, _kind = identity
 
