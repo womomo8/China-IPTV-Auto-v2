@@ -311,7 +311,7 @@ def _score_one_line(
     measurement_rows = db.execute(
         """
         SELECT status, latency_ms, throughput_kbps, measured_at,
-               round_no, error_class
+               round_no, error_class, evidence_json
           FROM measurements
          WHERE line_id = ?
            AND runner_identity = ?
@@ -321,8 +321,22 @@ def _score_one_line(
         (line_id, runner_identity, environment_type),
     ).fetchall()
 
-    measurements = [dict(row) for row in measurement_rows]
+    # 稳定性复测是额外质量证据，不得冒充基础测速轮次。
+    measurements = []
+    for row in measurement_rows:
+        item = dict(row)
+        try:
+            evidence = json.loads(item.get("evidence_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            evidence = {}
 
+        if (
+            isinstance(evidence, dict)
+            and evidence.get("measurement_stage") == "stability_retest"
+        ):
+            continue
+
+        measurements.append(item)
     deep_rows = db.execute(
         """
         SELECT status, evidence_json, probed_at
