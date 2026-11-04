@@ -113,7 +113,7 @@ class SourceRegistry:
 
     @staticmethod
     def _lowest_scored_source(db) -> str | None:
-        """Choose the weakest non-manual source; never evict manual sources."""
+        """Choose the weakest active source regardless of how it was added."""
         row = db.execute(
             """
             SELECT s.source_id,
@@ -127,13 +127,11 @@ class SourceRegistry:
                    ), 0) AS score
               FROM sources s
              WHERE s.active = 1
-               AND s.source_type != 'manual'
              ORDER BY score ASC, s.first_seen_at ASC, s.source_id ASC
              LIMIT 1
             """
         ).fetchone()
         return str(row["source_id"]) if row else None
-
     def _deactivate_weakest(self, db) -> str | None:
         source_id = self._lowest_scored_source(db)
         if source_id is None:
