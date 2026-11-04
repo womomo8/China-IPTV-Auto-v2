@@ -11,6 +11,7 @@ import subprocess
 from typing import Any
 
 from .database import database_session
+from .identity import normalize_url
 
 
 MAX_CANDIDATES_PER_CHANNEL = 5
@@ -460,7 +461,7 @@ def _blacklist_confirmed(
     category: str,
     evidence: dict[str, Any],
 ) -> bool:
-    """Blacklist only a confirmed content problem."""
+    """Blacklist confirmed content problems by line ID and URL identities."""
     if category not in {
         "advertisement",
         "no_signal",
@@ -476,12 +477,26 @@ def _blacklist_confirmed(
         ensure_ascii=False,
     )
 
-    inserted = False
-
-    for target_type, target_id in (
+    # Save both URL forms so equivalent URL spellings cannot bypass
+    # the blacklist during a later source ingestion.
+    normalized = normalize_url(url)
+    targets = [
         ("line", line_id),
         ("url", url),
-    ):
+        ("url", normalized),
+    ]
+
+    inserted = False
+    processed: set[tuple[str, str]] = set()
+
+    for target_type, target_id in targets:
+        target = (target_type, target_id)
+
+        # Avoid duplicate inserts when the raw and normalized URLs match.
+        if target in processed:
+            continue
+        processed.add(target)
+
         existing = db.execute(
             """
             SELECT 1
@@ -491,7 +506,7 @@ def _blacklist_confirmed(
                AND active = 1
              LIMIT 1
             """,
-            (target_type, target_id),
+            target,
         ).fetchone()
 
         if existing is not None:
@@ -734,6 +749,8 @@ def run_content_checks(
             if _already_checked(item["evidence_json"]):
                 continue
 
+            normalized_url = normalize_url(item["url"])
+
             blacklist = db.execute(
                 """
                 SELECT 1
@@ -741,11 +758,18 @@ def run_content_checks(
                  WHERE active = 1
                    AND (
                         (target_type = 'line' AND target_id = ?)
-                     OR (target_type = 'url' AND target_id = ?)
+                     OR (
+                            target_type = 'url'
+                        AND target_id IN (?, ?)
+                     )
                    )
                  LIMIT 1
                 """,
-                (item["line_id"], item["url"]),
+                (
+                    item["line_id"],
+                    item["url"],
+                    normalized_url,
+                ),
             ).fetchone()
 
             if blacklist is not None:
