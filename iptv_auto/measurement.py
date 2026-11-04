@@ -24,6 +24,7 @@ MAX_ALLOWED_CONCURRENCY = 12
 MAX_ALLOWED_TIMEOUT_SECONDS = 8.0
 SUPPORTED_ENVIRONMENTS = {"cloud"}
 VALID_STATUSES = {"success", "reachable", "probe_limited", "failed"}
+TERMINAL_STATUSES = VALID_STATUSES
 
 
 @dataclass(frozen=True)
@@ -81,7 +82,21 @@ def _safe_error_class(exc: BaseException) -> str:
     return "probe_error"
 
 
-def _connect_ipv4(host: str, port: int, timeout: float) -> tuple[socket.socket, str]:
+def _decode_evidence(value: object) -> dict[str, Any]:
+    try:
+        evidence = json.loads(value or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return evidence if isinstance(evidence, dict) else {}
+
+
+def _is_stability_retest(evidence: dict[str, Any]) -> bool:
+    return evidence.get("measurement_stage") == "stability_retest"
+
+
+def _connect_ipv4(
+    host: str, port: int, timeout: float
+) -> tuple[socket.socket, str]:
     """Create a direct IPv4 socket; never silently fall back to IPv6."""
     addresses = socket.getaddrinfo(
         host, port, family=socket.AF_INET, type=socket.SOCK_STREAM
@@ -105,7 +120,9 @@ def _connect_ipv4(host: str, port: int, timeout: float) -> tuple[socket.socket, 
     raise OSError("no_ipv4_address")
 
 
-def _probe_http(url: str, headers: dict[str, str], timeout_seconds: float) -> ProbeResult:
+def _probe_http(
+    url: str, headers: dict[str, str], timeout_seconds: float
+) -> ProbeResult:
     """Read at most 4096 bytes over a forced IPv4 connection."""
     started = time.monotonic()
     connection = None
@@ -125,29 +142,46 @@ def _probe_http(url: str, headers: dict[str, str], timeout_seconds: float) -> Pr
 
         class IPv4HTTPConnection(http.client.HTTPConnection):
             def connect(self):
-                self.sock, peer = _connect_ipv4(host, port, timeout_seconds)
+                self.sock, peer = _connect_ipv4(
+                    host, port, timeout_seconds
+                )
                 self.peer_ipv4 = peer
 
         class IPv4HTTPSConnection(http.client.HTTPSConnection):
             def connect(self):
-                raw, peer = _connect_ipv4(host, port, timeout_seconds)
+                raw, peer = _connect_ipv4(
+                    host, port, timeout_seconds
+                )
                 context = ssl.create_default_context()
                 try:
-                    self.sock = context.wrap_socket(raw, server_hostname=host)
+                    self.sock = context.wrap_socket(
+                        raw, server_hostname=host
+                    )
                 except Exception:
                     raw.close()
                     raise
                 self.peer_ipv4 = peer
 
         if scheme == "https":
-            connection = IPv4HTTPSConnection(host, port, timeout=timeout_seconds)
+            connection = IPv4HTTPSConnection(
+                host, port, timeout=timeout_seconds
+            )
         else:
-            connection = IPv4HTTPConnection(host, port, timeout=timeout_seconds)
+            connection = IPv4HTTPConnection(
+                host, port, timeout=timeout_seconds
+            )
 
         request_headers = dict(headers or {})
-        request_headers.setdefault("User-Agent", "China-IPTV-Auto-v2/1.0")
-        request_headers.setdefault("Range", f"bytes=0-{MAX_READ_BYTES - 1}")
-        request_headers.setdefault("Host", host if port in (80, 443) else f"{host}:{port}")
+        request_headers.setdefault(
+            "User-Agent", "China-IPTV-Auto-v2/1.0"
+        )
+        request_headers.setdefault(
+            "Range", f"bytes=0-{MAX_READ_BYTES - 1}"
+        )
+        request_headers.setdefault(
+            "Host",
+            host if port in (80, 443) else f"{host}:{port}",
+        )
 
         connection.request("GET", target, headers=request_headers)
         response = connection.getresponse()
@@ -172,13 +206,21 @@ def _probe_http(url: str, headers: dict[str, str], timeout_seconds: float) -> Pr
         }
 
         if not 200 <= status_code < 300:
-            return ProbeResult("failed", latency, None, "http_status_error", evidence)
+            return ProbeResult(
+                "failed", latency, None, "http_status_error", evidence
+            )
 
         if not body:
-            return ProbeResult("failed", latency, None, "empty_response", evidence)
+            return ProbeResult(
+                "failed", latency, None, "empty_response", evidence
+            )
 
-        throughput = _finite_nonnegative((len(body) / elapsed) / 1024.0)
-        return ProbeResult("success", latency, throughput, "", evidence)
+        throughput = _finite_nonnegative(
+            (len(body) / elapsed) / 1024.0
+        )
+        return ProbeResult(
+            "success", latency, throughput, "", evidence
+        )
 
     except Exception as exc:
         elapsed = max(time.monotonic() - started, 0.000001)
@@ -206,7 +248,9 @@ def _probe_http(url: str, headers: dict[str, str], timeout_seconds: float) -> Pr
             connection.close()
 
 
-def _probe_tcp_reachability(url: str, timeout_seconds: float) -> ProbeResult:
+def _probe_tcp_reachability(
+    url: str, timeout_seconds: float
+) -> ProbeResult:
     """TCP reachability only; it is never counted as media success."""
     started = time.monotonic()
     try:
@@ -217,7 +261,9 @@ def _probe_tcp_reachability(url: str, timeout_seconds: float) -> ProbeResult:
 
         default_ports = {"rtsp": 554, "rtmp": 1935}
         port = parts.port or default_ports[parts.scheme.lower()]
-        sock, peer_ip = _connect_ipv4(host, port, timeout_seconds)
+        sock, peer_ip = _connect_ipv4(
+            host, port, timeout_seconds
+        )
         sock.close()
 
         elapsed = max(time.monotonic() - started, 0.000001)
@@ -250,7 +296,9 @@ def _probe_tcp_reachability(url: str, timeout_seconds: float) -> ProbeResult:
         )
 
 
-def _probe_line(url: str, headers: dict[str, str], timeout_seconds: float) -> ProbeResult:
+def _probe_line(
+    url: str, headers: dict[str, str], timeout_seconds: float
+) -> ProbeResult:
     try:
         scheme = urlsplit(url).scheme.lower()
         if scheme in {"http", "https"}:
@@ -259,7 +307,9 @@ def _probe_line(url: str, headers: dict[str, str], timeout_seconds: float) -> Pr
             return _probe_tcp_reachability(url, timeout_seconds)
         if scheme in {"udp", "rtp"}:
             return ProbeResult(
-                "probe_limited", None, None,
+                "probe_limited",
+                None,
+                None,
                 "udp_media_probe_requires_receiver",
                 {
                     "probe_kind": "udp_rtp_limited",
@@ -269,21 +319,32 @@ def _probe_line(url: str, headers: dict[str, str], timeout_seconds: float) -> Pr
                 },
             )
         return ProbeResult(
-            "failed", None, None, "unsupported_protocol",
+            "failed",
+            None,
+            None,
+            "unsupported_protocol",
             {"probe_kind": "unsupported", "scheme": scheme},
         )
     except (TypeError, ValueError) as exc:
         return ProbeResult(
-            "failed", None, None, "malformed_url",
+            "failed",
+            None,
+            None,
+            "malformed_url",
             {"exception_type": type(exc).__name__},
         )
 
 
-def _validate_runtime_options(timeout_seconds: float, max_concurrency: int) -> tuple[float, int]:
+def _validate_runtime_options(
+    timeout_seconds: float, max_concurrency: int
+) -> tuple[float, int]:
     timeout = _finite_nonnegative(timeout_seconds)
     if timeout is None or timeout <= 0 or timeout > MAX_ALLOWED_TIMEOUT_SECONDS:
         raise ValueError("基础测速超时必须大于0且不能超过8秒")
-    if type(max_concurrency) is not int or not 1 <= max_concurrency <= MAX_ALLOWED_CONCURRENCY:
+    if (
+        type(max_concurrency) is not int
+        or not 1 <= max_concurrency <= MAX_ALLOWED_CONCURRENCY
+    ):
         raise ValueError("基础测速并发数必须是1至12之间的整数")
     return timeout, max_concurrency
 
@@ -294,13 +355,25 @@ def _load_candidates_and_reserve_rounds(
     runner_identity: str,
     environment_type: str,
 ) -> tuple[list[dict[str, Any]], int]:
+    """
+    Reserve new basic rounds or resume pending records.
+
+    A write lock is acquired before checking existing reservations. This
+    prevents concurrent invocations from allocating duplicate rounds.
+    """
     candidates: list[dict[str, Any]] = []
     skipped = 0
     timestamp = _now()
 
     with database_session(database_path) as db:
+        db.execute("BEGIN IMMEDIATE")
+
         run = db.execute(
-            "SELECT runner_identity, environment_type FROM runs WHERE run_id = ?",
+            """
+            SELECT runner_identity, environment_type
+              FROM runs
+             WHERE run_id = ?
+            """,
             (run_id,),
         ).fetchone()
 
@@ -311,7 +384,9 @@ def _load_candidates_and_reserve_rounds(
         if run["environment_type"] != environment_type:
             raise ValueError("environment_type 与任务记录不一致")
         if environment_type not in SUPPORTED_ENVIRONMENTS:
-            raise ValueError("基础测速目前只允许 cloud，不能冒充国内家庭实测")
+            raise ValueError(
+                "基础测速目前只允许 cloud，不能冒充国内家庭实测"
+            )
 
         rows = db.execute(
             """
@@ -321,8 +396,10 @@ def _load_candidates_and_reserve_rounds(
                    SELECT 1 FROM blacklists b
                     WHERE b.active = 1
                       AND (
-                           (b.target_type = 'line' AND b.target_id = l.line_id)
-                        OR (b.target_type = 'url' AND b.target_id = l.url)
+                           (b.target_type = 'line'
+                            AND b.target_id = l.line_id)
+                        OR (b.target_type = 'url'
+                            AND b.target_id = l.url)
                       )
              )
              ORDER BY l.line_id
@@ -332,64 +409,100 @@ def _load_candidates_and_reserve_rounds(
         for row in rows:
             line_id = str(row["line_id"])
 
-            existing = db.execute(
+            existing_rows = db.execute(
                 """
-                SELECT 1 FROM measurements
-                 WHERE run_id = ? AND line_id = ?
-                   AND runner_identity = ? AND environment_type = ?
-                 LIMIT 1
+                SELECT measurement_id, round_no, status, evidence_json
+                  FROM measurements
+                 WHERE run_id = ?
+                   AND line_id = ?
+                   AND runner_identity = ?
+                   AND environment_type = ?
+                 ORDER BY round_no
                 """,
-                (run_id, line_id, runner_identity, environment_type),
-            ).fetchone()
+                (
+                    run_id,
+                    line_id,
+                    runner_identity,
+                    environment_type,
+                ),
+            ).fetchall()
 
-            if existing:
+            basic_existing = [
+                item for item in existing_rows
+                if not _is_stability_retest(
+                    _decode_evidence(item["evidence_json"])
+                )
+            ]
+
+            # Resume the original pending record. Do not allocate a new
+            # measurement ID or round number for an interrupted task.
+            pending = next(
+                (
+                    item for item in basic_existing
+                    if item["status"] == "pending"
+                ),
+                None,
+            )
+
+            if pending is not None:
+                measurement_id = int(pending["measurement_id"])
+                round_no = int(pending["round_no"])
+
+            elif basic_existing:
+                # A terminal record already exists for this run and line.
+                # Unknown statuses are also skipped to avoid duplicating
+                # potentially valid historical records.
                 skipped += 1
                 continue
 
-            history = db.execute(
-                """
-                SELECT round_no, evidence_json
-                  FROM measurements
-                 WHERE line_id = ? AND runner_identity = ?
-                   AND environment_type = ?
-                """,
-                (line_id, runner_identity, environment_type),
-            ).fetchall()
+            else:
+                history = db.execute(
+                    """
+                    SELECT round_no, evidence_json
+                      FROM measurements
+                     WHERE line_id = ?
+                       AND runner_identity = ?
+                       AND environment_type = ?
+                    """,
+                    (line_id, runner_identity, environment_type),
+                ).fetchall()
 
-            # Stability retests are not basic measurement rounds.
-            basic_rounds = []
-            for item in history:
-                try:
-                    evidence = json.loads(item["evidence_json"] or "{}")
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    evidence = {}
-                if not (
-                    isinstance(evidence, dict)
-                    and evidence.get("measurement_stage") == "stability_retest"
-                ):
-                    basic_rounds.append(int(item["round_no"]))
+                basic_rounds = []
+                for item in history:
+                    evidence = _decode_evidence(
+                        item["evidence_json"]
+                    )
+                    if not _is_stability_retest(evidence):
+                        basic_rounds.append(int(item["round_no"]))
 
-            round_no = max(basic_rounds, default=0) + 1
+                round_no = max(basic_rounds, default=0) + 1
 
-            cursor = db.execute(
-                """
-                INSERT INTO measurements
-                    (run_id, line_id, round_no, measured_at,
-                     runner_identity, environment_type, status,
-                     latency_ms, throughput_kbps, error_class, evidence_json)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, '', ?)
-                """,
-                (
-                    run_id, line_id, round_no, timestamp,
-                    runner_identity, environment_type,
-                    json.dumps({
-                        "measurement_stage": "basic",
-                        "reserved_at": timestamp,
-                        "environment_type": environment_type,
-                        "media_playback_confirmed": False,
-                    }),
-                ),
-            )
+                cursor = db.execute(
+                    """
+                    INSERT INTO measurements
+                        (run_id, line_id, round_no, measured_at,
+                         runner_identity, environment_type, status,
+                         latency_ms, throughput_kbps, error_class,
+                         evidence_json)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending',
+                            NULL, NULL, '', ?)
+                    """,
+                    (
+                        run_id,
+                        line_id,
+                        round_no,
+                        timestamp,
+                        runner_identity,
+                        environment_type,
+                        json.dumps({
+                            "measurement_stage": "basic",
+                            "reserved_at": timestamp,
+                            "environment_type": environment_type,
+                            "media_playback_confirmed": False,
+                        }),
+                    ),
+                )
+                measurement_id = int(cursor.lastrowid)
 
             try:
                 headers = json.loads(row["headers_json"] or "{}")
@@ -399,7 +512,7 @@ def _load_candidates_and_reserve_rounds(
                 headers = {}
 
             candidates.append({
-                "measurement_id": cursor.lastrowid,
+                "measurement_id": measurement_id,
                 "line_id": line_id,
                 "round_no": round_no,
                 "url": row["url"],
@@ -418,7 +531,7 @@ def run_basic_measurements(
     timeout_seconds: float = 8.0,
     max_concurrency: int = 12,
 ) -> MeasurementRunResult:
-    """Run one bounded basic measurement round for each eligible line."""
+    """Run or resume one bounded basic measurement round per eligible line."""
     if type(run_id) is not int or run_id <= 0:
         raise ValueError("run_id 必须是正整数")
     if not isinstance(runner_identity, str) or not runner_identity.strip():
@@ -429,7 +542,10 @@ def run_basic_measurements(
     )
 
     reservations, skipped = _load_candidates_and_reserve_rounds(
-        Path(database_path), run_id, runner_identity, environment_type
+        Path(database_path),
+        run_id,
+        runner_identity,
+        environment_type,
     )
 
     def probe(item: dict[str, Any]) -> ProbeResult:
@@ -449,16 +565,26 @@ def run_basic_measurements(
                 result = future.result()
             except Exception as exc:
                 result = ProbeResult(
-                    "failed", None, None,
+                    "failed",
+                    None,
+                    None,
                     f"probe_exception_{type(exc).__name__}",
                     {"exception_type": type(exc).__name__},
                 )
 
-            status = result.status if result.status in VALID_STATUSES else "failed"
+            status = (
+                result.status
+                if result.status in VALID_STATUSES
+                else "failed"
+            )
             latency = _finite_nonnegative(result.latency_ms)
             throughput = _finite_nonnegative(result.throughput_kbps)
             error_class = str(result.error_class or "")[:120]
-            evidence = result.evidence if isinstance(result.evidence, dict) else {}
+            evidence = (
+                result.evidence
+                if isinstance(result.evidence, dict)
+                else {}
+            )
 
             evidence = dict(evidence)
             evidence.update({
@@ -468,21 +594,42 @@ def run_basic_measurements(
                 "media_playback_confirmed": False,
             })
 
+            evidence_json = json.dumps(
+                evidence,
+                ensure_ascii=False,
+                default=str,
+            )
+
             with database_session(database_path) as db:
-                db.execute(
+                cursor = db.execute(
                     """
                     UPDATE measurements
-                       SET measured_at = ?, status = ?,
-                           latency_ms = ?, throughput_kbps = ?,
-                           error_class = ?, evidence_json = ?
-                     WHERE measurement_id = ? AND status = 'pending'
+                       SET measured_at = ?,
+                           status = ?,
+                           latency_ms = ?,
+                           throughput_kbps = ?,
+                           error_class = ?,
+                           evidence_json = ?
+                     WHERE measurement_id = ?
+                       AND status = 'pending'
                     """,
                     (
-                        _now(), status, latency, throughput, error_class,
-                        json.dumps(evidence, ensure_ascii=False),
+                        _now(),
+                        status,
+                        latency,
+                        throughput,
+                        error_class,
+                        evidence_json,
                         item["measurement_id"],
                     ),
                 )
+
+                if cursor.rowcount != 1:
+                    # Do not report an update that did not actually occur.
+                    raise RuntimeError(
+                        "测速记录未能从 pending 状态完成更新："
+                        f"measurement_id={item['measurement_id']}"
+                    )
 
             records.append(MeasurementRecord(
                 line_id=item["line_id"],
@@ -493,16 +640,26 @@ def run_basic_measurements(
                 error_class=error_class,
             ))
 
-    records.sort(key=lambda item: (item.line_id, item.round_no))
+    records.sort(
+        key=lambda item: (item.line_id, item.round_no)
+    )
 
     return MeasurementRunResult(
         run_id=run_id,
         environment_type=environment_type,
         scheduled_count=len(reservations),
         skipped_existing_count=skipped,
-        success_count=sum(item.status == "success" for item in records),
-        reachable_count=sum(item.status == "reachable" for item in records),
-        probe_limited_count=sum(item.status == "probe_limited" for item in records),
-        failed_count=sum(item.status == "failed" for item in records),
+        success_count=sum(
+            item.status == "success" for item in records
+        ),
+        reachable_count=sum(
+            item.status == "reachable" for item in records
+        ),
+        probe_limited_count=sum(
+            item.status == "probe_limited" for item in records
+        ),
+        failed_count=sum(
+            item.status == "failed" for item in records
+        ),
         records=tuple(records),
     )
