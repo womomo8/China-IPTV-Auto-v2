@@ -1,3 +1,4 @@
+
 """Load and strictly validate the single source of truth configuration."""
 from __future__ import annotations
 
@@ -132,7 +133,9 @@ def load_config(path: str | Path = DEFAULT_CONFIG) -> dict[str, Any]:
     _positive_int(measurement, "max_concurrency", "measurement.max_concurrency", maximum=64)
     _exact_value(measurement, "deep_candidates_per_channel", 5, "每频道深入检测候选上限")
     _positive_number(measurement, "deep_timeout_seconds", "measurement.deep_timeout_seconds", maximum=300)
-    _positive_int(measurement, "stability_retests", "measurement.stability_retests", maximum=10)
+
+    # The stability module supports at most two retests; keep config aligned.
+    _positive_int(measurement, "stability_retests", "measurement.stability_retests", maximum=2)
 
     weights = scoring.get("weights")
     if not isinstance(weights, dict) or weights != EXPECTED_WEIGHTS:
