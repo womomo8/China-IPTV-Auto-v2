@@ -32,12 +32,31 @@ class ScoringTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def _add_line(self, line_id, channel_id="channel-1", channel_name="CCTV-5"):
+    def _add_run(self, run_id):
+        with database_session(self.db_path) as db:
+            db.execute(
+                """
+                INSERT INTO runs
+                    (run_id, started_at, status,
+                     runner_identity, environment_type)
+                VALUES (?, '2026-11-04T00:00:00Z',
+                        'running', 'score-test', 'cloud')
+                """,
+                (run_id,),
+            )
+
+    def _add_line(
+        self,
+        line_id,
+        channel_id="channel-1",
+        channel_name="CCTV-5",
+    ):
         with database_session(self.db_path) as db:
             db.execute(
                 """
                 INSERT INTO lines
-                    (line_id, url, first_seen_at, last_seen_at, blacklist_status)
+                    (line_id, url, first_seen_at, last_seen_at,
+                     blacklist_status)
                 VALUES (?, ?, '2026-11-01T00:00:00Z',
                         '2026-11-04T00:00:00Z', 'clear')
                 """,
@@ -66,6 +85,7 @@ class ScoringTests(unittest.TestCase):
         line_id,
         round_no,
         *,
+        run_id=1,
         status="success",
         latency=20.0,
         throughput=3000.0,
@@ -77,11 +97,13 @@ class ScoringTests(unittest.TestCase):
                 INSERT INTO measurements
                     (run_id, line_id, round_no, measured_at,
                      runner_identity, environment_type, status,
-                     latency_ms, throughput_kbps, error_class, evidence_json)
-                VALUES (1, ?, ?, ?, 'score-test', 'cloud', ?,
+                     latency_ms, throughput_kbps, error_class,
+                     evidence_json)
+                VALUES (?, ?, ?, ?, 'score-test', 'cloud', ?,
                         ?, ?, '', '{}')
                 """,
                 (
+                    run_id,
                     line_id,
                     round_no,
                     measured_at,
@@ -91,10 +113,39 @@ class ScoringTests(unittest.TestCase):
                 ),
             )
 
-    def _score(self, now="2026-11-04T01:00:00+00:00"):
+    def _add_deep_probe(
+        self,
+        line_id,
+        *,
+        run_id=1,
+        status="passed",
+        evidence=None,
+    ):
+        with database_session(self.db_path) as db:
+            db.execute(
+                """
+                INSERT INTO deep_probes
+                    (run_id, line_id, probed_at, runner_identity,
+                     environment_type, status, evidence_json)
+                VALUES (?, ?, '2026-11-04T00:30:00Z',
+                        'score-test', 'cloud', ?, ?)
+                """,
+                (
+                    run_id,
+                    line_id,
+                    status,
+                    json.dumps(evidence or {}, ensure_ascii=False),
+                ),
+            )
+
+    def _score(
+        self,
+        now="2026-11-04T01:00:00+00:00",
+        run_id=1,
+    ):
         return score_lines(
             self.db_path,
-            1,
+            run_id,
             runner_identity="score-test",
             environment_type="cloud",
             now=datetime.fromisoformat(now),
@@ -130,7 +181,10 @@ class ScoringTests(unittest.TestCase):
         result = self._score()
 
         self.assertEqual(result.eligible_line_count, 0)
-        self.assertEqual(result.scores[0].components["success_rate"], 50.0)
+        self.assertEqual(
+            result.scores[0].components["success_rate"],
+            50.0,
+        )
 
     def test_reachable_is_not_counted_as_media_success(self):
         self._add_line("line-reachable")
@@ -141,7 +195,10 @@ class ScoringTests(unittest.TestCase):
 
         self.assertEqual(result.eligible_line_count, 0)
         self.assertEqual(result.scores[0].successful_rounds, 0)
-        self.assertEqual(result.scores[0].components["success_rate"], 0.0)
+        self.assertEqual(
+            result.scores[0].components["success_rate"],
+            0.0,
+        )
 
     def test_blacklisted_line_cannot_be_candidate(self):
         self._add_line("line-blocked")
@@ -168,17 +225,11 @@ class ScoringTests(unittest.TestCase):
         self._add_measurement("line-ad", 1)
         self._add_measurement("line-ad", 2)
 
-        with database_session(self.db_path) as db:
-            db.execute(
-                """
-                INSERT INTO deep_probes
-                    (run_id, line_id, probed_at, runner_identity,
-                     environment_type, status, evidence_json)
-                VALUES (1, 'line-ad', '2026-11-04T00:30:00Z',
-                        'score-test', 'cloud', 'failed', ?)
-                """,
-                (json.dumps({"ad_detected": True}),),
-            )
+        self._add_deep_probe(
+            "line-ad",
+            status="failed",
+            evidence={"ad_detected": True},
+        )
 
         result = self._score()
 
@@ -188,27 +239,20 @@ class ScoringTests(unittest.TestCase):
         )
         self.assertEqual(result.eligible_line_count, 0)
 
-    def test_explicit_clean_content_evidence_improves_ad_component(self):
+    def test_complete_clean_content_evidence_improves_ad_component(self):
         self._add_line("line-clean")
         self._add_measurement("line-clean", 1)
         self._add_measurement("line-clean", 2)
 
-        with database_session(self.db_path) as db:
-            db.execute(
-                """
-                INSERT INTO deep_probes
-                    (run_id, line_id, probed_at, runner_identity,
-                     environment_type, status, evidence_json)
-                VALUES (1, 'line-clean', '2026-11-04T00:30:00Z',
-                        'score-test', 'cloud', 'passed', ?)
-                """,
-                (
-                    json.dumps({
-                        "ad_detected": False,
-                        "content_class": "live_program",
-                    }),
-                ),
-            )
+        self._add_deep_probe(
+            "line-clean",
+            evidence={
+                "status": "no_flag_detected",
+                "content_class": "live_program",
+                "ad_detected": False,
+                "placeholder_detected": False,
+            },
+        )
 
         result = self._score()
 
@@ -216,6 +260,77 @@ class ScoringTests(unittest.TestCase):
             result.scores[0].components["ad_placeholder_risk"],
             100.0,
         )
+
+    def test_incomplete_clean_evidence_is_unknown(self):
+        self._add_line("line-incomplete")
+        self._add_measurement("line-incomplete", 1)
+        self._add_measurement("line-incomplete", 2)
+
+        self._add_deep_probe(
+            "line-incomplete",
+            evidence={
+                "ad_detected": False,
+                "content_class": "live_program",
+            },
+        )
+
+        result = self._score()
+
+        self.assertEqual(
+            result.scores[0].components["ad_placeholder_risk"],
+            50.0,
+        )
+
+    def test_measurements_from_other_run_are_not_mixed(self):
+        self._add_run(2)
+        self._add_line("line-run-isolated")
+
+        self._add_measurement("line-run-isolated", 1)
+        self._add_measurement("line-run-isolated", 2)
+
+        self._add_measurement(
+            "line-run-isolated",
+            3,
+            run_id=2,
+            status="failed",
+        )
+        self._add_measurement(
+            "line-run-isolated",
+            4,
+            run_id=2,
+            status="failed",
+        )
+
+        result = self._score(run_id=1)
+
+        self.assertEqual(result.scores[0].measurement_rounds, 2)
+        self.assertEqual(result.scores[0].successful_rounds, 2)
+        self.assertEqual(
+            result.scores[0].components["success_rate"],
+            100.0,
+        )
+        self.assertEqual(result.eligible_line_count, 1)
+
+    def test_deep_probe_evidence_from_other_run_is_not_mixed(self):
+        self._add_run(2)
+        self._add_line("line-deep-isolated")
+        self._add_measurement("line-deep-isolated", 1)
+        self._add_measurement("line-deep-isolated", 2)
+
+        self._add_deep_probe(
+            "line-deep-isolated",
+            run_id=2,
+            status="failed",
+            evidence={"ad_detected": True},
+        )
+
+        result = self._score(run_id=1)
+
+        self.assertEqual(
+            result.scores[0].components["ad_placeholder_risk"],
+            50.0,
+        )
+        self.assertEqual(result.eligible_line_count, 1)
 
     def test_stale_measurement_loses_freshness_points(self):
         self._add_line("line-old")
@@ -232,7 +347,10 @@ class ScoringTests(unittest.TestCase):
 
         result = self._score()
 
-        self.assertEqual(result.scores[0].components["freshness"], 0.0)
+        self.assertEqual(
+            result.scores[0].components["freshness"],
+            0.0,
+        )
 
     def test_deep_candidates_are_limited_to_five_per_channel(self):
         for index in range(7):
@@ -261,7 +379,10 @@ class ScoringTests(unittest.TestCase):
         first = self._score()
         second = self._score()
 
-        self.assertEqual(first.scores[0].total_score, second.scores[0].total_score)
+        self.assertEqual(
+            first.scores[0].total_score,
+            second.scores[0].total_score,
+        )
 
         with database_session(self.db_path) as db:
             count = db.execute(
@@ -297,7 +418,13 @@ class ScoringTests(unittest.TestCase):
             )
 
     def test_nonfinite_values_are_rejected(self):
-        for value in (float("nan"), float("inf"), float("-inf"), True, -1):
+        for value in (
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            -1,
+        ):
             self.assertIsNone(_finite_number(value))
 
         self.assertEqual(_finite_number(12.5), 12.5)
