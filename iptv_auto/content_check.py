@@ -231,7 +231,7 @@ def _classify_text(text: str) -> set[str]:
 def _select_lines(
     rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Select at most five unique lines for each channel."""
+    """Select the highest-scoring unique eligible lines per channel."""
     grouped: dict[str, list[dict[str, Any]]] = {}
 
     for row in rows:
@@ -243,7 +243,10 @@ def _select_lines(
     for channel_id in sorted(grouped):
         items = sorted(
             grouped[channel_id],
-            key=lambda item: item["line_id"],
+            key=lambda item: (
+                -float(item.get("total_score") or 0.0),
+                item["line_id"],
+            ),
         )
 
         count = 0
@@ -619,10 +622,13 @@ def run_content_checks(
     tesseract_binary: str | Path | None = None,
     max_concurrency: int = MAX_CONCURRENCY,
 ) -> ContentCheckRunResult:
-    """Check content on deep-probe-passed lines.
+    """Check scored, deep-probe-passed lines from the current run.
 
     Results are merged into deep_probes.evidence_json under the
     'content_check' key. Existing FFprobe evidence is preserved.
+
+    Only lines explicitly admitted by this run's scoring stage are
+    considered. Active line and URL blacklists are excluded.
 
     Only explicit repeated OCR evidence can create a blacklist entry.
     Unknown results are not considered clean and are not blacklisted.
@@ -680,7 +686,9 @@ def run_content_checks(
                 lc.line_id,
                 l.url,
                 l.headers_json,
-                dp.evidence_json
+                dp.evidence_json,
+                ls.total_score,
+                ls.components_json
               FROM deep_probes AS dp
               JOIN lines AS l
                 ON l.line_id = dp.line_id
@@ -688,11 +696,14 @@ def run_content_checks(
                 ON lc.line_id = dp.line_id
               JOIN channels AS c
                 ON c.channel_id = lc.channel_id
+              JOIN line_scores AS ls
+                ON ls.line_id = dp.line_id
+               AND ls.run_id = dp.run_id
              WHERE dp.run_id = ?
                AND dp.runner_identity = ?
                AND dp.environment_type = ?
                AND dp.status = 'passed'
-             ORDER BY c.channel_id, lc.line_id
+             ORDER BY c.channel_id, ls.total_score DESC, lc.line_id
             """,
             (
                 run_id,
@@ -706,7 +717,38 @@ def run_content_checks(
         for row in rows:
             item = dict(row)
 
+            try:
+                score_components = json.loads(
+                    item.get("components_json") or "{}"
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+
+            if not isinstance(score_components, dict):
+                continue
+
+            # Only lines explicitly admitted to deep probing in this run.
+            if score_components.get("eligible_for_deep_probe") is not True:
+                continue
+
             if _already_checked(item["evidence_json"]):
+                continue
+
+            blacklist = db.execute(
+                """
+                SELECT 1
+                  FROM blacklists
+                 WHERE active = 1
+                   AND (
+                        (target_type = 'line' AND target_id = ?)
+                     OR (target_type = 'url' AND target_id = ?)
+                   )
+                 LIMIT 1
+                """,
+                (item["line_id"], item["url"]),
+            ).fetchone()
+
+            if blacklist is not None:
                 continue
 
             eligible.append(item)
