@@ -11,6 +11,8 @@ def _database(
     tmp_path,
     deep_status="passed",
     line_count=1,
+    scores=None,
+    eligible_line_ids=None,
 ):
     path = tmp_path / "content_check.sqlite3"
     initialize_database(path)
@@ -119,6 +121,38 @@ def _database(
                             "video_codec": "h264",
                             "audio_codec": "aac",
                         }
+                    }),
+                ),
+            )
+
+            score = (
+                scores.get(line_id, 80.0)
+                if isinstance(scores, dict)
+                else 80.0
+            )
+            eligible = (
+                eligible_line_ids is None
+                or line_id in eligible_line_ids
+            )
+
+            db.execute(
+                """
+                INSERT INTO line_scores
+                    (
+                        run_id,
+                        line_id,
+                        scored_at,
+                        total_score,
+                        components_json
+                    )
+                VALUES (?, ?, '2026-11-04T00:00:00Z', ?, ?)
+                """,
+                (
+                    run_id,
+                    line_id,
+                    score,
+                    json.dumps({
+                        "eligible_for_deep_probe": eligible,
                     }),
                 ),
             )
@@ -517,3 +551,186 @@ def test_missing_run_is_rejected(tmp_path):
             999,
             runner_identity="test-runner",
         )
+
+
+def test_content_checks_select_highest_scoring_lines_not_line_id_order(
+    tmp_path,
+    monkeypatch,
+):
+    scores = {
+        "line-1": 10,
+        "line-2": 90,
+        "line-3": 20,
+        "line-4": 80,
+        "line-5": 30,
+        "line-6": 70,
+    }
+    path, run_id = _database(
+        tmp_path,
+        line_count=6,
+        scores=scores,
+    )
+    _enable_fake_tools(monkeypatch)
+    _set_ocr_texts(monkeypatch, ["正常节目"] * 15)
+
+    result = content_check.run_content_checks(
+        path,
+        run_id,
+        runner_identity="test-runner",
+    )
+
+    assert result.selected_count == 5
+    with sqlite3.connect(path) as db:
+        checked = {
+            row[0]
+            for row in db.execute(
+                """
+                SELECT line_id
+                  FROM deep_probes
+                 WHERE run_id = ?
+                   AND evidence_json LIKE '%content_check%'
+                """,
+                (run_id,),
+            ).fetchall()
+        }
+
+    assert checked == {
+        "line-2",
+        "line-3",
+        "line-4",
+        "line-5",
+        "line-6",
+    }
+    assert "line-1" not in checked
+
+
+@pytest.mark.parametrize(
+    "target_type,target_id",
+    [
+        ("line", "line-1"),
+        ("url", "https://example.com/live-1.ts"),
+    ],
+)
+def test_active_blacklisted_line_or_url_is_not_selected(
+    tmp_path,
+    monkeypatch,
+    target_type,
+    target_id,
+):
+    path, run_id = _database(tmp_path, line_count=2)
+
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """
+            INSERT INTO blacklists
+                (
+                    target_type,
+                    target_id,
+                    reason,
+                    evidence_json,
+                    created_at,
+                    active
+                )
+            VALUES (?, ?, 'test_blacklist', '{}',
+                    '2026-11-04T00:00:00Z', 1)
+            """,
+            (target_type, target_id),
+        )
+
+    _enable_fake_tools(monkeypatch)
+    _set_ocr_texts(monkeypatch, ["正常节目"] * 3)
+
+    result = content_check.run_content_checks(
+        path,
+        run_id,
+        runner_identity="test-runner",
+    )
+
+    assert result.selected_count == 1
+    assert result.checked_count == 1
+    assert result.records[0].line_id == "line-2"
+
+
+def test_line_without_current_run_deep_probe_eligibility_is_not_checked(
+    tmp_path,
+    monkeypatch,
+):
+    path, run_id = _database(
+        tmp_path,
+        line_count=2,
+        eligible_line_ids={"line-2"},
+    )
+    _enable_fake_tools(monkeypatch)
+    _set_ocr_texts(monkeypatch, ["正常节目"] * 3)
+
+    result = content_check.run_content_checks(
+        path,
+        run_id,
+        runner_identity="test-runner",
+    )
+
+    assert result.selected_count == 1
+    assert result.checked_count == 1
+    assert result.records[0].line_id == "line-2"
+
+
+def test_score_join_is_scoped_to_current_run(
+    tmp_path,
+    monkeypatch,
+):
+    path, run_id = _database(tmp_path, line_count=1)
+
+    with sqlite3.connect(path) as db:
+        cursor = db.execute(
+            """
+            INSERT INTO runs
+                (started_at, status, runner_identity, environment_type)
+            VALUES (
+                '2026-11-04T01:00:00Z',
+                'running',
+                'test-runner',
+                'cloud'
+            )
+            """
+        )
+        other_run_id = cursor.lastrowid
+
+        # A score in another run must not be used as a substitute.
+        db.execute(
+            """
+            DELETE FROM line_scores
+             WHERE run_id = ? AND line_id = 'line-1'
+            """,
+            (run_id,),
+        )
+        db.execute(
+            """
+            INSERT INTO line_scores
+                (
+                    run_id,
+                    line_id,
+                    scored_at,
+                    total_score,
+                    components_json
+                )
+            VALUES (
+                ?,
+                'line-1',
+                '2026-11-04T01:00:00Z',
+                99,
+                '{"eligible_for_deep_probe": true}'
+            )
+            """,
+            (other_run_id,),
+        )
+
+    _enable_fake_tools(monkeypatch)
+
+    result = content_check.run_content_checks(
+        path,
+        run_id,
+        runner_identity="test-runner",
+    )
+
+    assert result.selected_count == 0
+    assert result.checked_count == 0
