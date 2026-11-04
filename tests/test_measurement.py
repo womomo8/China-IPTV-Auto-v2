@@ -1,3 +1,4 @@
+
 import json
 import tempfile
 import threading
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 from iptv_auto.database import database_session, initialize_database
 from iptv_auto.measurement import (
+    BASIC_ROUNDS_REQUIRED,
     MAX_READ_BYTES,
     ProbeResult,
     _finite_nonnegative,
@@ -21,7 +23,6 @@ class _TestHandler(BaseHTTPRequestHandler):
     body = b"x" * 12000
     response_status = 200
     delay_seconds = 0
-    bytes_sent = 0
 
     def do_GET(self):
         if self.delay_seconds:
@@ -34,7 +35,6 @@ class _TestHandler(BaseHTTPRequestHandler):
 
         try:
             self.wfile.write(self.body)
-            type(self).bytes_sent = len(self.body)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -52,7 +52,9 @@ class MeasurementTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def _create_run(self, run_id, runner="test-runner", environment="cloud"):
+    def _create_run(
+        self, run_id, runner="test-runner", environment="cloud"
+    ):
         with database_session(self.db_path) as db:
             db.execute(
                 """
@@ -78,7 +80,15 @@ class MeasurementTests(unittest.TestCase):
                 (line_id, url, json.dumps(headers or {})),
             )
 
-    def _add_pending_measurement(self, line_id, round_no=1, run_id=1):
+    def _add_measurement(
+        self,
+        line_id,
+        round_no,
+        *,
+        run_id=1,
+        status="pending",
+        stage="basic",
+    ):
         with database_session(self.db_path) as db:
             cursor = db.execute(
                 """
@@ -88,15 +98,16 @@ class MeasurementTests(unittest.TestCase):
                      latency_ms, throughput_kbps, error_class,
                      evidence_json)
                 VALUES (?, ?, ?, '2026-11-04T00:00:00Z',
-                        'test-runner', 'cloud', 'pending',
+                        'test-runner', 'cloud', ?,
                         NULL, NULL, '', ?)
                 """,
                 (
                     run_id,
                     line_id,
                     round_no,
+                    status,
                     json.dumps({
-                        "measurement_stage": "basic",
+                        "measurement_stage": stage,
                         "environment_type": "cloud",
                     }),
                 ),
@@ -104,8 +115,12 @@ class MeasurementTests(unittest.TestCase):
             return cursor.lastrowid
 
     def _server(self):
-        server = ThreadingHTTPServer(("127.0.0.1", 0), _TestHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), _TestHandler
+        )
+        thread = threading.Thread(
+            target=server.serve_forever, daemon=True
+        )
         thread.start()
         self.addCleanup(server.shutdown)
         self.addCleanup(server.server_close)
@@ -119,20 +134,35 @@ class MeasurementTests(unittest.TestCase):
             **kwargs,
         )
 
+    def _line_measurements(self, line_id, run_id=1):
+        with database_session(self.db_path) as db:
+            return db.execute(
+                """
+                SELECT measurement_id, round_no, status, evidence_json
+                  FROM measurements
+                 WHERE run_id = ? AND line_id = ?
+                 ORDER BY round_no
+                """,
+                (run_id, line_id),
+            ).fetchall()
+
     def test_http_body_read_is_success_and_limited(self):
-        server, url = self._server()
-        _TestHandler.bytes_sent = 0
+        _server, url = self._server()
 
         result = _probe_http(url, {}, 2)
 
         self.assertEqual(result.status, "success")
         self.assertEqual(result.evidence["bytes_read"], MAX_READ_BYTES)
         self.assertEqual(result.evidence["byte_limit"], MAX_READ_BYTES)
-        self.assertEqual(result.evidence["probe_kind"], "http_small_body_read")
-        self.assertGreaterEqual(result.throughput_kbps, 0)
+        self.assertEqual(
+            result.evidence["probe_kind"], "http_small_body_read"
+        )
+        self.assertFalse(
+            result.evidence["media_playback_confirmed"]
+        )
 
     def test_http_failure_is_not_success(self):
-        server, url = self._server()
+        _server, url = self._server()
         _TestHandler.response_status = 503
         self.addCleanup(setattr, _TestHandler, "response_status", 200)
 
@@ -142,7 +172,7 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(result.error_class, "http_status_error")
 
     def test_http_timeout_is_recorded_as_failure(self):
-        server, url = self._server()
+        _server, url = self._server()
         _TestHandler.delay_seconds = 0.3
         self.addCleanup(setattr, _TestHandler, "delay_seconds", 0)
 
@@ -151,46 +181,50 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.error_class, "timeout")
 
-    def test_measurement_is_saved_to_database(self):
-        server, url = self._server()
-        self._add_line("line-http", url)
+    def test_each_line_receives_three_basic_rounds(self):
+        _server, url = self._server()
+        self._add_line("line-three-rounds", url)
 
         result = self._run()
 
-        self.assertEqual(result.scheduled_count, 1)
-        self.assertEqual(result.success_count, 1)
+        self.assertEqual(BASIC_ROUNDS_REQUIRED, 3)
+        self.assertEqual(result.scheduled_count, 3)
+        self.assertEqual(result.success_count, 3)
+        self.assertEqual(result.failed_count, 0)
 
-        with database_session(self.db_path) as db:
-            row = db.execute(
-                "SELECT status, round_no, environment_type "
-                "FROM measurements WHERE line_id = 'line-http'"
-            ).fetchone()
+        rows = self._line_measurements("line-three-rounds")
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            [row["round_no"] for row in rows], [1, 2, 3]
+        )
+        self.assertEqual(
+            [row["status"] for row in rows],
+            ["success", "success", "success"],
+        )
 
-        self.assertEqual(row["status"], "success")
-        self.assertEqual(row["round_no"], 1)
-        self.assertEqual(row["environment_type"], "cloud")
+        for row in rows:
+            evidence = json.loads(row["evidence_json"])
+            self.assertEqual(
+                evidence["measurement_stage"], "basic"
+            )
+            self.assertEqual(evidence["environment_type"], "cloud")
 
-    def test_same_run_does_not_measure_same_line_twice(self):
-        server, url = self._server()
+    def test_same_run_does_not_measure_completed_line_twice(self):
+        _server, url = self._server()
         self._add_line("line-once", url)
 
         first = self._run()
         second = self._run()
 
-        self.assertEqual(first.scheduled_count, 1)
+        self.assertEqual(first.scheduled_count, 3)
         self.assertEqual(second.scheduled_count, 0)
         self.assertEqual(second.skipped_existing_count, 1)
 
-        with database_session(self.db_path) as db:
-            count = db.execute(
-                "SELECT COUNT(*) FROM measurements "
-                "WHERE run_id = 1 AND line_id = 'line-once'"
-            ).fetchone()[0]
-
-        self.assertEqual(count, 1)
+        rows = self._line_measurements("line-once")
+        self.assertEqual(len(rows), 3)
 
     def test_round_numbers_accumulate_across_runs(self):
-        server, url = self._server()
+        _server, url = self._server()
         self._add_line("line-rounds", url)
 
         self._run()
@@ -201,13 +235,17 @@ class MeasurementTests(unittest.TestCase):
 
         with database_session(self.db_path) as db:
             rounds = [
-                row[0] for row in db.execute(
-                    "SELECT round_no FROM measurements "
-                    "WHERE line_id = 'line-rounds' ORDER BY round_no"
+                row[0]
+                for row in db.execute(
+                    """
+                    SELECT round_no FROM measurements
+                     WHERE line_id = 'line-rounds'
+                     ORDER BY round_no
+                    """
                 )
             ]
 
-        self.assertEqual(rounds, [1, 2, 3])
+        self.assertEqual(rounds, list(range(1, 10)))
 
     def test_environment_must_match_run_and_cloud_only(self):
         with self.assertRaises(ValueError):
@@ -226,10 +264,13 @@ class MeasurementTests(unittest.TestCase):
 
         result = self._run()
 
-        self.assertEqual(result.scheduled_count, 1)
+        self.assertEqual(result.scheduled_count, 3)
         self.assertEqual(result.success_count, 0)
-        self.assertEqual(result.probe_limited_count, 1)
-        self.assertEqual(result.records[0].status, "probe_limited")
+        self.assertEqual(result.probe_limited_count, 3)
+        self.assertTrue(
+            all(record.status == "probe_limited"
+                for record in result.records)
+        )
 
     def test_tcp_reachability_is_not_counted_as_media_success(self):
         self._add_line("line-rtsp", "rtsp://127.0.0.1:554/live")
@@ -244,10 +285,13 @@ class MeasurementTests(unittest.TestCase):
             result = self._run()
 
         self.assertEqual(result.success_count, 0)
-        self.assertEqual(result.reachable_count, 1)
+        self.assertEqual(result.reachable_count, 3)
+        self.assertEqual(result.failed_count, 0)
 
     def test_blacklisted_line_is_not_measured(self):
-        self._add_line("line-blocked", "https://example.com/live.ts")
+        self._add_line(
+            "line-blocked", "https://example.com/live.ts"
+        )
 
         with database_session(self.db_path) as db:
             db.execute(
@@ -264,7 +308,9 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(result.scheduled_count, 0)
 
     def test_invalid_nonfinite_measurement_values_are_rejected(self):
-        for value in (float("nan"), float("inf"), float("-inf"), True, -1):
+        for value in (
+            float("nan"), float("inf"), float("-inf"), True, -1
+        ):
             self.assertIsNone(_finite_nonnegative(value))
 
         self.assertEqual(_finite_nonnegative(0), 0.0)
@@ -295,10 +341,13 @@ class MeasurementTests(unittest.TestCase):
                 },
             )
 
-        with patch("iptv_auto.measurement._probe_line", side_effect=fake_probe):
+        with patch(
+            "iptv_auto.measurement._probe_line",
+            side_effect=fake_probe,
+        ):
             result = self._run(max_concurrency=2)
 
-        self.assertEqual(result.scheduled_count, 3)
+        self.assertEqual(result.scheduled_count, 9)
         self.assertLessEqual(maximum_active, 2)
 
     def test_concurrency_and_timeout_cannot_exceed_limits(self):
@@ -308,207 +357,162 @@ class MeasurementTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._run(timeout_seconds=9)
 
-    def test_pending_measurement_is_resumed_without_new_round(self):
-        server, url = self._server()
+    def test_pending_measurement_is_resumed_and_missing_rounds_added(self):
+        _server, url = self._server()
         self._add_line("line-resume", url)
 
-        original_id = self._add_pending_measurement(
-            "line-resume", round_no=2
+        original_id = self._add_measurement(
+            "line-resume", 2
         )
 
         result = self._run()
 
-        self.assertEqual(result.scheduled_count, 1)
-        self.assertEqual(result.success_count, 1)
-        self.assertEqual(result.records[0].round_no, 2)
+        self.assertEqual(result.scheduled_count, 3)
+        self.assertEqual(result.success_count, 3)
 
-        with database_session(self.db_path) as db:
-            rows = db.execute(
-                """
-                SELECT measurement_id, round_no, status
-                  FROM measurements
-                 WHERE run_id = 1 AND line_id = 'line-resume'
-                """
-            ).fetchall()
+        rows = self._line_measurements("line-resume")
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            [row["round_no"] for row in rows], [1, 2, 3]
+        )
+        resumed = [
+            row for row in rows
+            if row["measurement_id"] == original_id
+        ]
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual(resumed[0]["status"], "success")
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["measurement_id"], original_id)
-        self.assertEqual(rows[0]["round_no"], 2)
-        self.assertEqual(rows[0]["status"], "success")
-
-    def test_multiple_pending_measurements_are_all_resumed(self):
-        server, url = self._server()
+    def test_multiple_pending_measurements_are_resumed(self):
+        _server, url = self._server()
         self._add_line("line-multiple-pending", url)
 
-        first_id = self._add_pending_measurement(
-            "line-multiple-pending", round_no=1
+        first_id = self._add_measurement(
+            "line-multiple-pending", 1
         )
-        second_id = self._add_pending_measurement(
-            "line-multiple-pending", round_no=2
+        second_id = self._add_measurement(
+            "line-multiple-pending", 2
         )
 
         result = self._run()
 
-        self.assertEqual(result.scheduled_count, 2)
-        self.assertEqual(result.success_count, 2)
-        self.assertEqual(
-            sorted(record.round_no for record in result.records),
-            [1, 2],
+        self.assertEqual(result.scheduled_count, 3)
+        self.assertEqual(result.success_count, 3)
+
+        rows = self._line_measurements(
+            "line-multiple-pending"
         )
-
-        with database_session(self.db_path) as db:
-            rows = db.execute(
-                """
-                SELECT measurement_id, round_no, status
-                  FROM measurements
-                 WHERE run_id = 1
-                   AND line_id = 'line-multiple-pending'
-                 ORDER BY round_no
-                """
-            ).fetchall()
-
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         self.assertEqual(
-            [row["measurement_id"] for row in rows],
-            [first_id, second_id],
+            [row["round_no"] for row in rows], [1, 2, 3]
         )
         self.assertEqual(
-            [row["status"] for row in rows],
-            ["success", "success"],
+            {row["measurement_id"] for row in rows}
+            & {first_id, second_id},
+            {first_id, second_id},
+        )
+
+    def test_failed_attempt_is_not_silently_retried(self):
+        _server, url = self._server()
+        self._add_line("line-failed", url)
+
+        with patch(
+            "iptv_auto.measurement._probe_line",
+            return_value=ProbeResult(
+                "failed", 10.0, None, "network_error", {}
+            ),
+        ):
+            first = self._run()
+
+        second = self._run()
+
+        self.assertEqual(first.scheduled_count, 3)
+        self.assertEqual(first.failed_count, 3)
+        self.assertEqual(second.scheduled_count, 0)
+
+        rows = self._line_measurements("line-failed")
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(
+            all(row["status"] == "failed" for row in rows)
         )
 
     def test_pending_and_completed_lines_are_handled_independently(self):
-        server, url = self._server()
+        _server, url = self._server()
         self._add_line("line-completed", url)
         self._add_line("line-pending", url)
 
-        completed = self._add_pending_measurement(
-            "line-completed", round_no=1
+        completed_id = self._add_measurement(
+            "line-completed", 1, status="success"
         )
-        pending = self._add_pending_measurement(
-            "line-pending", round_no=1
+        pending_id = self._add_measurement(
+            "line-pending", 1
         )
-
-        with database_session(self.db_path) as db:
-            db.execute(
-                """
-                UPDATE measurements
-                   SET status = 'success'
-                 WHERE measurement_id = ?
-                """,
-                (completed,),
-            )
 
         result = self._run()
 
-        self.assertEqual(result.scheduled_count, 1)
-        self.assertEqual(result.skipped_existing_count, 1)
-        self.assertEqual(result.success_count, 1)
+        # The completed line needs two more rounds; the pending
+        # line resumes its reservation and receives two more rounds.
+        self.assertEqual(result.scheduled_count, 5)
+        self.assertEqual(result.success_count, 5)
 
-        with database_session(self.db_path) as db:
-            completed_row = db.execute(
-                """
-                SELECT status FROM measurements
-                 WHERE measurement_id = ?
-                """,
-                (completed,),
-            ).fetchone()
-            pending_row = db.execute(
-                """
-                SELECT status FROM measurements
-                 WHERE measurement_id = ?
-                """,
-                (pending,),
-            ).fetchone()
+        completed_rows = self._line_measurements(
+            "line-completed"
+        )
+        pending_rows = self._line_measurements("line-pending")
 
-        self.assertEqual(completed_row["status"], "success")
-        self.assertEqual(pending_row["status"], "success")
+        self.assertEqual(len(completed_rows), 3)
+        self.assertEqual(len(pending_rows), 3)
+        self.assertEqual(
+            [row["round_no"] for row in completed_rows],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            [row["round_no"] for row in pending_rows],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            completed_rows[0]["measurement_id"], completed_id
+        )
+        self.assertEqual(
+            pending_rows[0]["measurement_id"], pending_id
+        )
 
     def test_stability_retest_does_not_consume_basic_round(self):
-        server, url = self._server()
+        _server, url = self._server()
         self._add_line("line-stability", url)
 
-        with database_session(self.db_path) as db:
-            db.execute(
-                """
-                INSERT INTO measurements
-                    (run_id, line_id, round_no, measured_at,
-                     runner_identity, environment_type, status,
-                     latency_ms, throughput_kbps, error_class,
-                     evidence_json)
-                VALUES (1, 'line-stability', 99,
-                        '2026-11-04T00:00:00Z',
-                        'test-runner', 'cloud', 'success',
-                        10, 100, '', ?)
-                """,
-                (json.dumps({
-                    "measurement_stage": "stability_retest",
-                    "environment_type": "cloud",
-                }),),
-            )
+        self._add_measurement(
+            "line-stability", 99, stage="stability_retest"
+        )
 
         result = self._run()
 
-        self.assertEqual(result.scheduled_count, 1)
-        self.assertEqual(result.records[0].round_no, 1)
-
-        with database_session(self.db_path) as db:
-            basic_row = db.execute(
-                """
-                SELECT round_no, status
-                  FROM measurements
-                 WHERE run_id = 1
-                   AND line_id = 'line-stability'
-                   AND round_no = 1
-                """
-            ).fetchone()
-
-        self.assertEqual(basic_row["round_no"], 1)
-        self.assertEqual(basic_row["status"], "success")
+        self.assertEqual(result.scheduled_count, 3)
+        self.assertEqual(
+            [record.round_no for record in result.records],
+            [1, 2, 3],
+        )
 
     def test_stability_retest_round_collision_is_avoided(self):
-        server, url = self._server()
+        _server, url = self._server()
         self._add_line("line-round-collision", url)
 
-        with database_session(self.db_path) as db:
-            db.execute(
-                """
-                INSERT INTO measurements
-                    (run_id, line_id, round_no, measured_at,
-                     runner_identity, environment_type, status,
-                     latency_ms, throughput_kbps, error_class,
-                     evidence_json)
-                VALUES (1, 'line-round-collision', 1,
-                        '2026-11-04T00:00:00Z',
-                        'test-runner', 'cloud', 'success',
-                        10, 100, '', ?)
-                """,
-                (json.dumps({
-                    "measurement_stage": "stability_retest",
-                    "environment_type": "cloud",
-                }),),
-            )
+        self._add_measurement(
+            "line-round-collision",
+            1,
+            stage="stability_retest",
+        )
 
         result = self._run()
 
-        self.assertEqual(result.scheduled_count, 1)
-        self.assertEqual(result.records[0].round_no, 2)
+        self.assertEqual(result.scheduled_count, 3)
+        self.assertEqual(
+            [record.round_no for record in result.records],
+            [2, 3, 4],
+        )
 
-        with database_session(self.db_path) as db:
-            rows = db.execute(
-                """
-                SELECT round_no, status, evidence_json
-                  FROM measurements
-                 WHERE run_id = 1
-                   AND line_id = 'line-round-collision'
-                 ORDER BY round_no
-                """
-            ).fetchall()
-
-        self.assertEqual(len(rows), 2)
+        rows = self._line_measurements("line-round-collision")
+        self.assertEqual(len(rows), 4)
         self.assertEqual(rows[0]["round_no"], 1)
-        self.assertEqual(rows[1]["round_no"], 2)
-        self.assertEqual(rows[1]["status"], "success")
         self.assertEqual(
             json.loads(rows[0]["evidence_json"])["measurement_stage"],
             "stability_retest",
