@@ -1,5 +1,7 @@
 import json
 import sqlite3
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -8,12 +10,17 @@ from iptv_auto import content_check
 
 
 def _database(
-    tmp_path,
+    tmp_path=None,
     deep_status="passed",
     line_count=1,
     scores=None,
     eligible_line_ids=None,
 ):
+    if tmp_path is None:
+        tmp_path = Path(
+            tempfile.mkdtemp(prefix="iptv-content-check-")
+        )
+
     path = tmp_path / "content_check.sqlite3"
     initialize_database(path)
 
@@ -320,6 +327,7 @@ def test_two_placeholder_frames_are_confirmed(
     assert result.records[0].category == "placeholder"
     assert result.blacklisted_count == 1
 
+
 @pytest.mark.parametrize(
     ("status", "expected"),
     [
@@ -339,6 +347,8 @@ def test_already_checked_only_skips_completed_results(
     })
 
     assert content_check._already_checked(evidence) is expected
+
+
 def test_ocr_failure_is_unknown_not_clean(
     tmp_path,
     monkeypatch,
@@ -752,6 +762,8 @@ def test_score_join_is_scoped_to_current_run(
 
     assert result.selected_count == 0
     assert result.checked_count == 0
+
+
 def test_normalized_url_blacklist_blocks_equivalent_url(
     tmp_path,
     monkeypatch,
