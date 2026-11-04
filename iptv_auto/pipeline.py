@@ -218,7 +218,7 @@ def _discover_and_ingest(
     config: dict[str, Any],
     database_path: Path,
     run_id: int,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Discover sources, synchronize the pool, fetch and register lines."""
     source_registry = SourceRegistry(
         database_path,
