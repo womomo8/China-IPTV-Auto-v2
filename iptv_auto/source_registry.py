@@ -186,12 +186,32 @@ class SourceRegistry:
                     continue
 
                 existing = db.execute(
-                    "SELECT source_id FROM sources WHERE source_id = ? OR url = ?",
+                    "SELECT source_id, active FROM sources WHERE source_id = ? OR url = ?",
                     (source_id, url),
                 ).fetchone()
 
                 if existing:
                     actual_id = str(existing["source_id"])
+                    if int(existing["active"]) == 0:
+                        while self._active_count(db) >= self.pool_capacity:
+                            removed = self._deactivate_weakest(db)
+                            if removed is None:
+                                add_unique(rejected_capacity, rejected_seen, source_id)
+                                break
+                            add_unique(evicted, evicted_seen, removed)
+                        else:
+                            db.execute(
+                                """
+                                UPDATE sources
+                                   SET name = ?, source_type = 'manual',
+                                       last_seen_at = ?, active = 1
+                                 WHERE source_id = ?
+                                """,
+                                (name, timestamp, actual_id),
+                            )
+                            add_unique(accepted, accepted_seen, actual_id)
+                        continue
+
                     db.execute(
                         """
                         UPDATE sources
