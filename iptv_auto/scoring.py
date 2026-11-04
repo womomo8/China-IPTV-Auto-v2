@@ -1,3 +1,4 @@
+
 """Evidence-based line scoring and bounded deep-probe candidate selection."""
 from __future__ import annotations
 
@@ -21,6 +22,8 @@ WEIGHTS = {
     "source_reliability": 5,
 }
 MAX_DEEP_CANDIDATES_PER_CHANNEL = 5
+REQUIRED_BASIC_ROUNDS = 3
+MINIMUM_SUCCESS_RATE = 90.0
 SUPPORTED_ENVIRONMENTS = {"cloud"}
 TERMINAL_HTTP_STATUSES = {"success", "failed"}
 CLEAN_CONTENT_CLASSES = {"clean", "normal", "live_program"}
@@ -196,7 +199,6 @@ def _load_content_evidence(evidence_json: object) -> dict[str, Any]:
 
     nested = evidence.get("content_check")
     if isinstance(nested, dict):
-        # The nested content-check record is authoritative when present.
         return nested
     return evidence
 
@@ -375,13 +377,14 @@ def _score_one_line(
     latest_success = bool(latest and latest["status"] == "success")
     not_blacklisted = not _is_blacklisted(db, line_id, url)
 
-    # A confirmed ad/no-signal/placeholder can never enter deep probing.
+    # Require all three completed basic rounds to have succeeded.
+    # A "reachable" result is not counted as a successful measurement.
     no_confirmed_bad_content = ad_score > 0.0
 
     eligible = (
-        completed_rounds >= 2
-        and successful_rounds >= 2
-        and success_score >= 90.0
+        completed_rounds >= REQUIRED_BASIC_ROUNDS
+        and successful_rounds >= REQUIRED_BASIC_ROUNDS
+        and success_score >= MINIMUM_SUCCESS_RATE
         and latest_success
         and total >= 70.0
         and not_blacklisted
