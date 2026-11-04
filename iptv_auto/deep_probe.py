@@ -387,7 +387,30 @@ def _probe_one(
                 "result_reason": "unsupported_or_invalid_url",
             },
         )
+    ipv4_options = ffmpeg_ipv4_input_options(url)
 
+    if ipv4_options is None:
+        scheme = urlsplit(url).scheme.lower()
+
+        return _unknown_record(
+            channel_id,
+            line_id,
+            "ipv4_transport_not_enforceable_for_protocol",
+            {
+                **evidence,
+                "ipv4_transport": {
+                    "status": "not_enforceable",
+                    "protocol": scheme,
+                },
+            },
+        )
+
+    evidence["ipv4_transport"] = {
+        "status": "configured",
+        "method": "tcp_local_addr",
+        "local_addr": "0.0.0.0",
+        "protocol": urlsplit(url).scheme.lower(),
+    }
     if not ffprobe_binary or not ffmpeg_binary:
         missing = []
 
