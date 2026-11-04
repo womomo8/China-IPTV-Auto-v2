@@ -1,3 +1,4 @@
+
 """Short stability retests for lines that passed deep probing and content checks."""
 from __future__ import annotations
 
@@ -65,16 +66,22 @@ def _finite_nonnegative(value: object) -> float | None:
     return number
 
 
+def _decode_evidence(value: object) -> dict[str, Any]:
+    try:
+        evidence = json.loads(value or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+    return evidence if isinstance(evidence, dict) else {}
+
+
+def _is_stability_retest(evidence: dict[str, Any]) -> bool:
+    return evidence.get("measurement_stage") == "stability_retest"
+
+
 def _content_check_passed(evidence_json: str) -> bool:
     """Only explicit no-flag content checks may enter stability retesting."""
-    try:
-        evidence = json.loads(evidence_json or "{}")
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return False
-
-    if not isinstance(evidence, dict):
-        return False
-
+    evidence = _decode_evidence(evidence_json)
     content = evidence.get("content_check")
 
     if not isinstance(content, dict):
@@ -132,20 +139,16 @@ def run_stability_retests(
     timeout_seconds: float = 8.0,
     max_concurrency: int = MAX_CONCURRENCY,
 ) -> StabilityRunResult:
-    """Run up to two short stability checks on content-cleared lines.
+    """Run or resume up to two stability checks on content-cleared lines.
 
-    Only lines that:
-    1. Passed FFprobe/deep probing.
-    2. Have an explicit successful content check.
-    3. Have no confirmed advertisement or placeholder evidence.
+    Only lines that passed deep probing and have an explicit clean content
+    check are eligible. Cloud probing is never represented as a home-network
+    or Fujian Mobile test.
 
-    Retests are stored in the existing measurements table. Their evidence
-    contains measurement_stage='stability_retest', so scoring excludes them
-    from the required basic measurement rounds.
-
-    Reservations are written before probing. Repeated calls do not schedule
-    the same retest twice for the same run and line.
+    Pending reservations are resumed using their original measurement IDs
+    and round numbers. Completed records are never repeated or overwritten.
     """
+
     if type(run_id) is not int or run_id <= 0:
         raise ValueError("run_id 必须是正整数")
 
@@ -163,9 +166,7 @@ def run_stability_retests(
     if type(max_concurrency) is not int or not (
         1 <= max_concurrency <= MAX_CONCURRENCY
     ):
-        raise ValueError(
-            "稳定性复测并发数必须是1至3之间的整数"
-        )
+        raise ValueError("稳定性复测并发数必须是1至3之间的整数")
 
     timeout, concurrency = _validate_runtime_options(
         timeout_seconds,
@@ -177,7 +178,10 @@ def run_stability_retests(
     reservations: list[dict[str, Any]] = []
     skipped_existing = 0
 
+    # Reserve or recover records under one SQLite write lock.
     with database_session(database_path) as db:
+        db.execute("BEGIN IMMEDIATE")
+
         run = db.execute(
             """
             SELECT runner_identity, environment_type
@@ -188,19 +192,13 @@ def run_stability_retests(
         ).fetchone()
 
         if run is None:
-            raise ValueError(
-                f"任务记录不存在：run_id={run_id}"
-            )
+            raise ValueError(f"任务记录不存在：run_id={run_id}")
 
         if run["runner_identity"] != runner_identity:
-            raise ValueError(
-                "runner_identity 与任务记录不一致"
-            )
+            raise ValueError("runner_identity 与任务记录不一致")
 
         if run["environment_type"] != environment_type:
-            raise ValueError(
-                "environment_type 与任务记录不一致"
-            )
+            raise ValueError("environment_type 与任务记录不一致")
 
         rows = db.execute(
             """
@@ -221,6 +219,17 @@ def run_stability_retests(
                AND dp.runner_identity = ?
                AND dp.environment_type = ?
                AND dp.status = 'passed'
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM blacklists b
+                     WHERE b.active = 1
+                       AND (
+                            (b.target_type = 'line'
+                             AND b.target_id = l.line_id)
+                         OR (b.target_type = 'url'
+                             AND b.target_id = l.url)
+                       )
+               )
              ORDER BY c.channel_id, lc.line_id
             """,
             (
@@ -230,7 +239,6 @@ def run_stability_retests(
             ),
         ).fetchall()
 
-        # 未完成内容检查、内容检查未知、确认异常的线路全部排除。
         eligible_rows = [
             dict(row)
             for row in rows
@@ -242,12 +250,13 @@ def run_stability_retests(
         for item in selected:
             existing_rows = db.execute(
                 """
-                SELECT round_no, status, evidence_json
+                SELECT measurement_id, round_no, status, evidence_json
                   FROM measurements
                  WHERE run_id = ?
                    AND line_id = ?
                    AND runner_identity = ?
                    AND environment_type = ?
+                ORDER BY round_no, measurement_id
                 """,
                 (
                     run_id,
@@ -257,32 +266,48 @@ def run_stability_retests(
                 ),
             ).fetchall()
 
-            existing_retests = 0
+            existing_retests = [
+                row
+                for row in existing_rows
+                if _is_stability_retest(
+                    _decode_evidence(row["evidence_json"])
+                )
+            ]
 
-            for row in existing_rows:
-                try:
-                    evidence = json.loads(
-                        row["evidence_json"] or "{}"
-                    )
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    evidence = {}
+            pending_retests = [
+                row
+                for row in existing_retests
+                if row["status"] == "pending"
+            ]
 
-                if (
-                    isinstance(evidence, dict)
-                    and evidence.get("measurement_stage")
-                    == "stability_retest"
-                ):
-                    # 包括 pending 记录在内，已经预约的复测不重复预约。
-                    existing_retests += 1
+            # Resume every pending reservation without changing its ID
+            # or round number.
+            try:
+                headers = json.loads(item["headers_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                headers = {}
 
-            remaining = max(0, retests - existing_retests)
+            if not isinstance(headers, dict):
+                headers = {}
+
+            for pending in pending_retests:
+                reservations.append({
+                    "measurement_id": int(pending["measurement_id"]),
+                    "line_id": item["line_id"],
+                    "round_no": int(pending["round_no"]),
+                    "url": item["url"],
+                    "headers": headers,
+                })
+
+            # Existing completed and pending retests both count toward
+            # the requested total. Never create duplicate reservations.
+            remaining = max(0, retests - len(existing_retests))
 
             if remaining == 0:
-                skipped_existing += 1
+                if not pending_retests:
+                    skipped_existing += 1
                 continue
 
-            # round_no 按当前任务、当前线路计算。
-            # 不把其他历史任务的轮次混入当前任务。
             max_round = db.execute(
                 """
                 SELECT COALESCE(MAX(round_no), 0)
@@ -300,18 +325,10 @@ def run_stability_retests(
                 ),
             ).fetchone()[0]
 
-            try:
-                headers = json.loads(
-                    item["headers_json"] or "{}"
-                )
-            except (TypeError, ValueError, json.JSONDecodeError):
-                headers = {}
+            next_round = int(max_round)
 
-            if not isinstance(headers, dict):
-                headers = {}
-
-            for offset in range(1, remaining + 1):
-                round_no = int(max_round) + offset
+            for _ in range(remaining):
+                next_round += 1
 
                 evidence = {
                     "measurement_stage": "stability_retest",
@@ -342,21 +359,18 @@ def run_stability_retests(
                     (
                         run_id,
                         item["line_id"],
-                        round_no,
+                        next_round,
                         timestamp,
                         runner_identity,
                         environment_type,
-                        json.dumps(
-                            evidence,
-                            ensure_ascii=False,
-                        ),
+                        json.dumps(evidence, ensure_ascii=False),
                     ),
                 )
 
                 reservations.append({
-                    "measurement_id": cursor.lastrowid,
+                    "measurement_id": int(cursor.lastrowid),
                     "line_id": item["line_id"],
-                    "round_no": round_no,
+                    "round_no": next_round,
                     "url": item["url"],
                     "headers": headers,
                 })
@@ -383,28 +397,18 @@ def run_stability_retests(
                 result = future.result()
 
                 status = str(result.status or "failed")
-
                 if status not in VALID_PROBE_STATUSES:
                     status = "failed"
 
-                latency = _finite_nonnegative(
-                    result.latency_ms
-                )
-                throughput = _finite_nonnegative(
-                    result.throughput_kbps
-                )
-                error_class = str(
-                    result.error_class or ""
-                )[:120]
+                latency = _finite_nonnegative(result.latency_ms)
+                throughput = _finite_nonnegative(result.throughput_kbps)
+                error_class = str(result.error_class or "")[:120]
 
                 raw_evidence = result.evidence or {}
-
                 if isinstance(raw_evidence, dict):
                     evidence = dict(raw_evidence)
                 else:
-                    evidence = {
-                        "invalid_probe_evidence": True
-                    }
+                    evidence = {"invalid_probe_evidence": True}
 
             except Exception as exc:
                 status = "failed"
@@ -412,9 +416,10 @@ def run_stability_retests(
                 throughput = None
                 error_class = "stability_probe_exception"
                 evidence = {
-                    "exception_type": type(exc).__name__
+                    "exception_type": type(exc).__name__,
                 }
 
+            # A short network probe never proves actual media playback.
             evidence.update({
                 "measurement_stage": "stability_retest",
                 "media_playback_confirmed": False,
@@ -423,7 +428,7 @@ def run_stability_retests(
             })
 
             with database_session(database_path) as db:
-                db.execute(
+                cursor = db.execute(
                     """
                     UPDATE measurements
                        SET measured_at = ?,
@@ -433,6 +438,7 @@ def run_stability_retests(
                            error_class = ?,
                            evidence_json = ?
                      WHERE measurement_id = ?
+                       AND status = 'pending'
                     """,
                     (
                         _now(),
@@ -440,13 +446,16 @@ def run_stability_retests(
                         latency,
                         throughput,
                         error_class,
-                        json.dumps(
-                            evidence,
-                            ensure_ascii=False,
-                        ),
+                        json.dumps(evidence, ensure_ascii=False),
                         reservation["measurement_id"],
                     ),
                 )
+
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "稳定性复测记录未能从 pending 状态完成更新："
+                        f"measurement_id={reservation['measurement_id']}"
+                    )
 
             records.append(
                 StabilityRecord(
@@ -459,6 +468,13 @@ def run_stability_retests(
                 )
             )
 
+    records.sort(
+        key=lambda record: (
+            record.line_id,
+            record.round_no,
+        )
+    )
+
     return StabilityRunResult(
         run_id=run_id,
         environment_type=environment_type,
@@ -466,28 +482,16 @@ def run_stability_retests(
         scheduled_count=len(reservations),
         skipped_existing_count=skipped_existing,
         success_count=sum(
-            record.status == "success"
-            for record in records
+            record.status == "success" for record in records
         ),
         reachable_count=sum(
-            record.status == "reachable"
-            for record in records
+            record.status == "reachable" for record in records
         ),
         probe_limited_count=sum(
-            record.status == "probe_limited"
-            for record in records
+            record.status == "probe_limited" for record in records
         ),
         failed_count=sum(
-            record.status == "failed"
-            for record in records
+            record.status == "failed" for record in records
         ),
-        records=tuple(
-            sorted(
-                records,
-                key=lambda record: (
-                    record.line_id,
-                    record.round_no,
-                ),
-            )
-        ),
+        records=tuple(records),
     )
