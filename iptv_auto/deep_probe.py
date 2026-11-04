@@ -16,6 +16,7 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from .database import database_session
+from .ffmpeg_ipv4 import ffmpeg_ipv4_input_options
 
 
 MAX_CANDIDATES_PER_CHANNEL = 5
