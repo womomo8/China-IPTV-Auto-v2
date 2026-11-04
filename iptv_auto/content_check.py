@@ -376,7 +376,7 @@ def _check_one(
             "placeholder_detected": None,
             "note": "有效OCR帧不足，不能判定线路内容正常或异常",
         })
-
+    evidence["status"] = status
     return ContentCheckRecord(
         channel_id=item["channel_id"],
         line_id=item["line_id"],
