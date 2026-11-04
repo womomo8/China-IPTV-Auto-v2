@@ -1,3 +1,4 @@
+
 """Bounded FFprobe and FFmpeg media decoding for selected IPTV lines."""
 from __future__ import annotations
 
@@ -387,6 +388,7 @@ def _probe_one(
                 "result_reason": "unsupported_or_invalid_url",
             },
         )
+
     ipv4_options = ffmpeg_ipv4_input_options(url)
 
     if ipv4_options is None:
@@ -411,6 +413,7 @@ def _probe_one(
         "local_addr": "0.0.0.0",
         "protocol": urlsplit(url).scheme.lower(),
     }
+
     if not ffprobe_binary or not ffmpeg_binary:
         missing = []
 
@@ -433,6 +436,7 @@ def _probe_one(
     header_args = _header_argument(headers)
 
     input_args = [
+        *ipv4_options,
         "-rw_timeout",
         str(int(timeout_seconds * 1_000_000)),
         *header_args,
@@ -580,6 +584,7 @@ def _probe_one(
         "-nostdin",
         "-v",
         "error",
+        *ipv4_options,
         "-rw_timeout",
         str(int(timeout_seconds * 1_000_000)),
         *header_args,
@@ -923,6 +928,7 @@ def run_deep_probes(
                 "url": row["url"],
                 "headers": headers,
             })
+
     records: list[DeepProbeRecord] = []
 
     def execute_probe(item: dict[str, Any]) -> DeepProbeRecord:
