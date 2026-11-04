@@ -1,4 +1,3 @@
-
 import socket
 import tempfile
 import unittest
@@ -19,6 +18,7 @@ def make_entry(
     headers=None,
 ):
     headers = headers or {}
+
     return PlaylistEntry(
         name=name,
         url=url,
@@ -43,6 +43,7 @@ class LineRegistryTests(unittest.TestCase):
                 VALUES ('2026-11-04T00:00:00Z', 'running', 'test', 'cloud')
                 """
             )
+
             db.execute(
                 """
                 INSERT INTO sources
@@ -103,10 +104,44 @@ class LineRegistryTests(unittest.TestCase):
             "missing_host",
         )
 
-    def test_rejects_private_ip(self):
+    def test_private_ipv4_is_rejected_by_admission_gate(self):
+        entry = make_entry(
+            url="http://192.168.1.10/live"
+        )
+
+        self.assertIsNone(validate_entry(entry))
+
+        result = self.registry.ingest(
+            run_id=1,
+            source_id="source-test",
+            entries=[entry],
+        )
+
+        self.assertEqual(result.accepted_count, 0)
+        self.assertEqual(result.ipv4_excluded_count, 1)
         self.assertEqual(
-            validate_entry(make_entry(url="http://192.168.1.10/live")),
-            "non_public_ip_address",
+            result.rejected[0].reason,
+            "ipv4_non_public_ipv4_address",
+        )
+
+    def test_ipv6_literal_is_rejected_and_counted(self):
+        entry = make_entry(
+            url="https://[2001:4860:4860::8888]/live.m3u8"
+        )
+
+        self.assertIsNone(validate_entry(entry))
+
+        result = self.registry.ingest(
+            run_id=1,
+            source_id="source-test",
+            entries=[entry],
+        )
+
+        self.assertEqual(result.accepted_count, 0)
+        self.assertEqual(result.ipv4_excluded_count, 1)
+        self.assertEqual(
+            result.rejected[0].reason,
+            "ipv4_ipv6_literal",
         )
 
     def test_inactive_source_cannot_register_lines(self):
@@ -125,6 +160,7 @@ class LineRegistryTests(unittest.TestCase):
 
     def test_registers_entry_and_relationships(self):
         entry = make_entry()
+
         result = self.registry.ingest(
             run_id=1,
             source_id="source-test",
@@ -140,10 +176,12 @@ class LineRegistryTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM lines WHERE line_id = ?",
                 (entry.line_id,),
             ).fetchone()[0]
+
             source_link_count = db.execute(
                 "SELECT COUNT(*) FROM source_lines WHERE source_id = ?",
                 ("source-test",),
             ).fetchone()[0]
+
             channel_link_count = db.execute(
                 "SELECT COUNT(*) FROM line_channels WHERE line_id = ?",
                 (entry.line_id,),
@@ -155,6 +193,7 @@ class LineRegistryTests(unittest.TestCase):
 
     def test_duplicate_entry_is_not_registered_twice(self):
         entry = make_entry()
+
         result = self.registry.ingest(
             run_id=1,
             source_id="source-test",
@@ -217,6 +256,7 @@ class LineRegistryTests(unittest.TestCase):
 
     def test_transient_failures_are_not_added_to_blacklist(self):
         entry = make_entry()
+
         result = self.registry.ingest(
             run_id=1,
             source_id="source-test",
