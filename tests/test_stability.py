@@ -1,3 +1,4 @@
+
 import json
 import sqlite3
 
@@ -165,6 +166,55 @@ def _successful_probe(*_args):
             "media_playback_confirmed": False,
         },
     )
+
+
+def _insert_stability_measurement(
+    path,
+    run_id,
+    line_id,
+    round_no,
+    status,
+    latency_ms=123.0,
+):
+    evidence = {
+        "measurement_stage": "stability_retest",
+        "environment_type": "cloud",
+        "media_playback_confirmed": False,
+    }
+
+    with sqlite3.connect(path) as db:
+        cursor = db.execute(
+            """
+            INSERT INTO measurements
+                (
+                    run_id,
+                    line_id,
+                    round_no,
+                    measured_at,
+                    runner_identity,
+                    environment_type,
+                    status,
+                    latency_ms,
+                    throughput_kbps,
+                    error_class,
+                    evidence_json
+                )
+            VALUES (
+                ?, ?, ?, '2026-11-04T00:00:00Z',
+                'test-runner', 'cloud', ?, ?,
+                NULL, '', ?
+            )
+            """,
+            (
+                run_id,
+                line_id,
+                round_no,
+                status,
+                latency_ms,
+                json.dumps(evidence),
+            ),
+        )
+        return int(cursor.lastrowid)
 
 
 def test_only_deep_and_content_passed_lines_are_selected(
@@ -481,3 +531,150 @@ def test_timeout_cannot_exceed_eight_seconds(tmp_path):
             runner_identity="test-runner",
             timeout_seconds=9,
         )
+
+
+def test_pending_stability_retest_is_resumed_without_duplicate(
+    tmp_path,
+    monkeypatch,
+):
+    path, run_id = _database(tmp_path)
+
+    original_id = _insert_stability_measurement(
+        path,
+        run_id,
+        "line-1",
+        20,
+        "pending",
+        latency_ms=None,
+    )
+
+    monkeypatch.setattr(
+        stability,
+        "_probe_line",
+        _successful_probe,
+    )
+
+    result = stability.run_stability_retests(
+        path,
+        run_id,
+        runner_identity="test-runner",
+    )
+
+    assert result.scheduled_count == 11
+
+    with sqlite3.connect(path) as db:
+        rows = db.execute(
+            """
+            SELECT measurement_id, round_no, status
+              FROM measurements
+             WHERE run_id = ?
+               AND line_id = 'line-1'
+             ORDER BY round_no
+            """,
+            (run_id,),
+        ).fetchall()
+
+    assert len(rows) == 2
+    assert rows[0][0] == original_id
+    assert rows[0][1] == 20
+    assert rows[0][2] == "success"
+
+
+def test_completed_stability_retest_is_not_overwritten(
+    tmp_path,
+    monkeypatch,
+):
+    path, run_id = _database(tmp_path)
+
+    original_id = _insert_stability_measurement(
+        path,
+        run_id,
+        "line-1",
+        20,
+        "success",
+        latency_ms=123.0,
+    )
+
+    monkeypatch.setattr(
+        stability,
+        "_probe_line",
+        _successful_probe,
+    )
+
+    result = stability.run_stability_retests(
+        path,
+        run_id,
+        runner_identity="test-runner",
+    )
+
+    assert result.scheduled_count == 9
+
+    with sqlite3.connect(path) as db:
+        row = db.execute(
+            """
+            SELECT status, latency_ms, round_no
+              FROM measurements
+             WHERE measurement_id = ?
+            """,
+            (original_id,),
+        ).fetchone()
+
+    assert row == ("success", 123.0, 20)
+
+
+def test_blacklisted_line_is_excluded_from_stability_retests(
+    tmp_path,
+    monkeypatch,
+):
+    path, run_id = _database(tmp_path)
+
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """
+            INSERT INTO blacklists
+                (
+                    target_type,
+                    target_id,
+                    reason,
+                    evidence_json,
+                    created_at,
+                    active
+                )
+            VALUES (
+                'line',
+                'line-1',
+                'test blacklist',
+                '{}',
+                '2026-11-04T00:00:00Z',
+                1
+            )
+            """
+        )
+
+    monkeypatch.setattr(
+        stability,
+        "_probe_line",
+        _successful_probe,
+    )
+
+    result = stability.run_stability_retests(
+        path,
+        run_id,
+        runner_identity="test-runner",
+    )
+
+    assert result.selected_count == 5
+    assert result.scheduled_count == 10
+
+    with sqlite3.connect(path) as db:
+        count = db.execute(
+            """
+            SELECT COUNT(*)
+              FROM measurements
+             WHERE run_id = ?
+               AND line_id = 'line-1'
+            """,
+            (run_id,),
+        ).fetchone()[0]
+
+    assert count == 0
