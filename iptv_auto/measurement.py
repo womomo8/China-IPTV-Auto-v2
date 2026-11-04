@@ -1,4 +1,3 @@
-
 """Bounded IPv4-first basic stream measurements with persistent history."""
 from __future__ import annotations
 
@@ -24,7 +23,6 @@ MAX_ALLOWED_CONCURRENCY = 12
 MAX_ALLOWED_TIMEOUT_SECONDS = 8.0
 SUPPORTED_ENVIRONMENTS = {"cloud"}
 VALID_STATUSES = {"success", "reachable", "probe_limited", "failed"}
-TERMINAL_STATUSES = VALID_STATUSES
 
 
 @dataclass(frozen=True)
@@ -356,7 +354,7 @@ def _load_candidates_and_reserve_rounds(
     environment_type: str,
 ) -> tuple[list[dict[str, Any]], int]:
     """
-    Reserve new basic rounds or resume pending records.
+    Reserve new basic rounds or resume all pending records.
 
     A write lock is acquired before checking existing reservations. This
     prevents concurrent invocations from allocating duplicate rounds.
@@ -417,7 +415,7 @@ def _load_candidates_and_reserve_rounds(
                    AND line_id = ?
                    AND runner_identity = ?
                    AND environment_type = ?
-                 ORDER BY round_no
+                 ORDER BY round_no, measurement_id
                 """,
                 (
                     run_id,
@@ -434,82 +432,95 @@ def _load_candidates_and_reserve_rounds(
                 )
             ]
 
-            # Resume the original pending record. Do not allocate a new
-            # measurement ID or round number for an interrupted task.
-            pending = next(
-                (
-                    item for item in basic_existing
-                    if item["status"] == "pending"
-                ),
-                None,
-            )
-
-            if pending is not None:
-                measurement_id = int(pending["measurement_id"])
-                round_no = int(pending["round_no"])
-
-            elif basic_existing:
-                # A terminal record already exists for this run and line.
-                # Unknown statuses are also skipped to avoid duplicating
-                # potentially valid historical records.
-                skipped += 1
-                continue
-
-            else:
-                history = db.execute(
-                    """
-                    SELECT round_no, evidence_json
-                      FROM measurements
-                     WHERE line_id = ?
-                       AND runner_identity = ?
-                       AND environment_type = ?
-                    """,
-                    (line_id, runner_identity, environment_type),
-                ).fetchall()
-
-                basic_rounds = []
-                for item in history:
-                    evidence = _decode_evidence(
-                        item["evidence_json"]
-                    )
-                    if not _is_stability_retest(evidence):
-                        basic_rounds.append(int(item["round_no"]))
-
-                round_no = max(basic_rounds, default=0) + 1
-
-                cursor = db.execute(
-                    """
-                    INSERT INTO measurements
-                        (run_id, line_id, round_no, measured_at,
-                         runner_identity, environment_type, status,
-                         latency_ms, throughput_kbps, error_class,
-                         evidence_json)
-                    VALUES (?, ?, ?, ?, ?, ?, 'pending',
-                            NULL, NULL, '', ?)
-                    """,
-                    (
-                        run_id,
-                        line_id,
-                        round_no,
-                        timestamp,
-                        runner_identity,
-                        environment_type,
-                        json.dumps({
-                            "measurement_stage": "basic",
-                            "reserved_at": timestamp,
-                            "environment_type": environment_type,
-                            "media_playback_confirmed": False,
-                        }),
-                    ),
-                )
-                measurement_id = int(cursor.lastrowid)
-
             try:
                 headers = json.loads(row["headers_json"] or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
                 headers = {}
             if not isinstance(headers, dict):
                 headers = {}
+
+            # Resume every existing pending reservation for this line.
+            # Preserve original IDs and round numbers; do not silently
+            # leave interrupted duplicate reservations behind.
+            pending_records = [
+                item for item in basic_existing
+                if item["status"] == "pending"
+            ]
+
+            if pending_records:
+                for pending in pending_records:
+                    candidates.append({
+                        "measurement_id": int(pending["measurement_id"]),
+                        "line_id": line_id,
+                        "round_no": int(pending["round_no"]),
+                        "url": row["url"],
+                        "headers": headers,
+                    })
+                continue
+
+            if basic_existing:
+                # A terminal or unknown record already exists for this run
+                # and line. Do not create another basic round in this run.
+                skipped += 1
+                continue
+
+            history = db.execute(
+                """
+                SELECT round_no, evidence_json
+                  FROM measurements
+                 WHERE line_id = ?
+                   AND runner_identity = ?
+                   AND environment_type = ?
+                """,
+                (line_id, runner_identity, environment_type),
+            ).fetchall()
+
+            basic_rounds = []
+            occupied_rounds = set()
+
+            for item in history:
+                historical_round = int(item["round_no"])
+                occupied_rounds.add(historical_round)
+
+                evidence = _decode_evidence(item["evidence_json"])
+                if not _is_stability_retest(evidence):
+                    basic_rounds.append(historical_round)
+
+            # Stability retests do not advance the basic-round history.
+            # Their numbers are nevertheless occupied because the database
+            # UNIQUE constraint applies across measurement stages.
+            round_no = max(basic_rounds, default=0) + 1
+
+            while round_no in occupied_rounds:
+                round_no += 1
+
+            cursor = db.execute(
+                """
+                INSERT INTO measurements
+                    (run_id, line_id, round_no, measured_at,
+                     runner_identity, environment_type, status,
+                     latency_ms, throughput_kbps, error_class,
+                     evidence_json)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending',
+                        NULL, NULL, '', ?)
+                """,
+                (
+                    run_id,
+                    line_id,
+                    round_no,
+                    timestamp,
+                    runner_identity,
+                    environment_type,
+                    json.dumps({
+                        "measurement_stage": "basic",
+                        "reserved_at": timestamp,
+                        "environment_type": environment_type,
+                        "media_playback_confirmed": False,
+                    }),
+                ),
+            )
+
+            measurement_id = int(cursor.lastrowid)
 
             candidates.append({
                 "measurement_id": measurement_id,
@@ -561,6 +572,7 @@ def run_basic_measurements(
 
         for future in as_completed(futures):
             item = futures[future]
+
             try:
                 result = future.result()
             except Exception as exc:
@@ -577,9 +589,11 @@ def run_basic_measurements(
                 if result.status in VALID_STATUSES
                 else "failed"
             )
+
             latency = _finite_nonnegative(result.latency_ms)
             throughput = _finite_nonnegative(result.throughput_kbps)
             error_class = str(result.error_class or "")[:120]
+
             evidence = (
                 result.evidence
                 if isinstance(result.evidence, dict)
@@ -625,7 +639,6 @@ def run_basic_measurements(
                 )
 
                 if cursor.rowcount != 1:
-                    # Do not report an update that did not actually occur.
                     raise RuntimeError(
                         "测速记录未能从 pending 状态完成更新："
                         f"measurement_id={item['measurement_id']}"
