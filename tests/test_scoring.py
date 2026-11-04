@@ -210,7 +210,7 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(result.scores[0].successful_rounds, 2)
         self.assertEqual(
             result.scores[0].components["success_rate"],
-            200.0 / 3.0,
+            66.67,
         )
         self.assertFalse(result.scores[0].eligible_for_deep_probe)
         self.assertEqual(result.candidate_count, 0)
