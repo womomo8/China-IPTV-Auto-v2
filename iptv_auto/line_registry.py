@@ -202,11 +202,13 @@ class LineRegistry:
                 raise ValueError(f"任务记录不存在：run_id={run_id}")
 
             source = db.execute(
-                "SELECT source_id FROM sources WHERE source_id = ?",
+                "SELECT source_id, active FROM sources WHERE source_id = ?",
                 (source_id,),
             ).fetchone()
             if source is None:
                 raise ValueError(f"来源尚未登记：source_id={source_id}")
+            if int(source["active"]) != 1:
+                raise ValueError(f"来源已停用，不能登记线路：source_id={source_id}")
 
             for entry in entries:
                 line_id = str(getattr(entry, "line_id", "") or "")
