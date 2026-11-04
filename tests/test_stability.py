@@ -560,7 +560,7 @@ def test_pending_stability_retest_is_resumed_without_duplicate(
         runner_identity="test-runner",
     )
 
-assert result.scheduled_count == 10
+    assert result.scheduled_count == 10
 
     with sqlite3.connect(path) as db:
         rows = db.execute(
