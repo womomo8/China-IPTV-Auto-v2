@@ -36,9 +36,27 @@ class PlaylistEntry:
 
 
 def _parse_extinf(line: str) -> tuple[str, str]:
-    category_match = re.search(r'group-title="([^"]*)"', line, re.IGNORECASE)
+    in_quotes = False
+    separator = -1
+
+    for index, char in enumerate(line):
+        if char == '"':
+            in_quotes = not in_quotes
+        elif char == "," and not in_quotes:
+            separator = index
+            break
+
+    if separator < 0:
+        return "", ""
+
+    metadata = line[:separator]
+    name = line[separator + 1:].strip()
+    category_match = re.search(
+        r'group-title="([^"]*)"',
+        metadata,
+        re.IGNORECASE,
+    )
     category = category_match.group(1).strip() if category_match else ""
-    name = line.rsplit(",", 1)[-1].strip() if "," in line else ""
     return category, name
 
 
