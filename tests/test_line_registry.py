@@ -1,9 +1,13 @@
+
+import socket
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from iptv_auto.database import database_session, initialize_database
 from iptv_auto.identity import stable_channel_id, stable_result_id
+from iptv_auto.ipv4 import IPv4Admission
 from iptv_auto.line_registry import LineRegistry, validate_entry
 from iptv_auto.playlist import PlaylistEntry
 
@@ -53,7 +57,23 @@ class LineRegistryTests(unittest.TestCase):
 
         self.registry = LineRegistry(self.db_path)
 
+        # Keep existing registry tests independent of external DNS.
+        self.dns_patcher = patch(
+            "iptv_auto.ipv4.socket.getaddrinfo",
+            return_value=[
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    ("8.8.8.8", 443),
+                )
+            ],
+        )
+        self.dns_patcher.start()
+
     def tearDown(self):
+        self.dns_patcher.stop()
         self.temp.cleanup()
 
     def test_valid_entry(self):
@@ -88,6 +108,7 @@ class LineRegistryTests(unittest.TestCase):
             validate_entry(make_entry(url="http://192.168.1.10/live")),
             "non_public_ip_address",
         )
+
     def test_inactive_source_cannot_register_lines(self):
         with database_session(self.db_path) as db:
             db.execute(
@@ -101,6 +122,7 @@ class LineRegistryTests(unittest.TestCase):
                 source_id="source-test",
                 entries=[make_entry()],
             )
+
     def test_registers_entry_and_relationships(self):
         entry = make_entry()
         result = self.registry.ingest(
@@ -111,6 +133,7 @@ class LineRegistryTests(unittest.TestCase):
 
         self.assertEqual(result.accepted_count, 1)
         self.assertEqual(result.accepted_line_ids, (entry.line_id,))
+        self.assertEqual(result.ipv4_passed_count, 1)
 
         with database_session(self.db_path) as db:
             line_count = db.execute(
@@ -163,6 +186,7 @@ class LineRegistryTests(unittest.TestCase):
 
         self.assertEqual(result.accepted_count, 0)
         self.assertEqual(result.rejected[0].reason, "blacklisted")
+
     def test_blacklisted_normalized_url_is_rejected(self):
         entry = make_entry(
             url="https://EXAMPLE.com:443/live.m3u8"
@@ -190,6 +214,7 @@ class LineRegistryTests(unittest.TestCase):
 
         self.assertEqual(result.accepted_count, 0)
         self.assertEqual(result.rejected[0].reason, "blacklisted")
+
     def test_transient_failures_are_not_added_to_blacklist(self):
         entry = make_entry()
         result = self.registry.ingest(
@@ -199,6 +224,65 @@ class LineRegistryTests(unittest.TestCase):
         )
 
         self.assertEqual(result.accepted_count, 1)
+
+        with database_session(self.db_path) as db:
+            blacklist_count = db.execute(
+                "SELECT COUNT(*) FROM blacklists WHERE target_id = ?",
+                (entry.line_id,),
+            ).fetchone()[0]
+
+        self.assertEqual(blacklist_count, 0)
+
+    def test_ipv4_rejected_entry_is_not_registered(self):
+        entry = make_entry()
+
+        with patch(
+            "iptv_auto.line_registry.check_ipv4_url",
+            return_value=IPv4Admission(
+                False, "no_ipv4_address"
+            ),
+        ):
+            result = self.registry.ingest(
+                run_id=1,
+                source_id="source-test",
+                entries=[entry],
+            )
+
+        self.assertEqual(result.accepted_count, 0)
+        self.assertEqual(result.ipv4_passed_count, 0)
+        self.assertEqual(result.ipv4_excluded_count, 1)
+        self.assertEqual(
+            result.rejected[0].reason,
+            "ipv4_no_ipv4_address",
+        )
+
+        with database_session(self.db_path) as db:
+            count = db.execute(
+                "SELECT COUNT(*) FROM lines WHERE line_id = ?",
+                (entry.line_id,),
+            ).fetchone()[0]
+
+        self.assertEqual(count, 0)
+
+    def test_temporary_dns_failure_is_not_blacklisted(self):
+        entry = make_entry()
+
+        with patch(
+            "iptv_auto.line_registry.check_ipv4_url",
+            return_value=IPv4Admission(
+                False, "dns_temporary_failure"
+            ),
+        ):
+            result = self.registry.ingest(
+                run_id=1,
+                source_id="source-test",
+                entries=[entry],
+            )
+
+        self.assertEqual(result.accepted_count, 0)
+        self.assertEqual(
+            result.ipv4_temporary_failure_count, 1
+        )
 
         with database_session(self.db_path) as db:
             blacklist_count = db.execute(
