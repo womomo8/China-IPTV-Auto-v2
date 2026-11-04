@@ -1,7 +1,8 @@
+
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from iptv_auto.database import database_session, initialize_database
@@ -113,6 +114,14 @@ class ScoringTests(unittest.TestCase):
                 ),
             )
 
+    def _add_three_successful_rounds(self, line_id, *, run_id=1):
+        for round_no in (1, 2, 3):
+            self._add_measurement(
+                line_id,
+                round_no,
+                run_id=run_id,
+            )
+
     def _add_deep_probe(
         self,
         line_id,
@@ -151,14 +160,30 @@ class ScoringTests(unittest.TestCase):
             now=datetime.fromisoformat(now),
         )
 
-    def test_two_successful_rounds_can_become_deep_candidate(self):
-        self._add_line("line-good")
-        self._add_measurement("line-good", 1)
-        self._add_measurement("line-good", 2)
+    def test_two_successful_rounds_are_not_enough_for_deep_candidate(self):
+        self._add_line("line-two")
+        self._add_measurement("line-two", 1)
+        self._add_measurement("line-two", 2)
 
         result = self._score()
 
         self.assertEqual(result.scored_count, 1)
+        self.assertEqual(result.scores[0].measurement_rounds, 2)
+        self.assertEqual(result.scores[0].successful_rounds, 2)
+        self.assertFalse(result.scores[0].eligible_for_deep_probe)
+        self.assertEqual(result.eligible_line_count, 0)
+        self.assertEqual(result.candidate_count, 0)
+
+    def test_three_successful_rounds_can_become_deep_candidate(self):
+        self._add_line("line-good")
+        self._add_three_successful_rounds("line-good")
+
+        result = self._score()
+
+        self.assertEqual(result.scored_count, 1)
+        self.assertEqual(result.scores[0].measurement_rounds, 3)
+        self.assertEqual(result.scores[0].successful_rounds, 3)
+        self.assertTrue(result.scores[0].eligible_for_deep_probe)
         self.assertEqual(result.eligible_line_count, 1)
         self.assertEqual(result.candidate_count, 1)
         self.assertEqual(result.candidates[0].line_id, "line-good")
@@ -173,23 +198,28 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(result.eligible_line_count, 0)
         self.assertEqual(result.candidate_count, 0)
 
-    def test_failure_reduces_success_rate_and_blocks_candidate(self):
+    def test_failure_in_three_rounds_blocks_candidate(self):
         self._add_line("line-mixed")
         self._add_measurement("line-mixed", 1, status="success")
         self._add_measurement("line-mixed", 2, status="failed")
+        self._add_measurement("line-mixed", 3, status="success")
 
         result = self._score()
 
-        self.assertEqual(result.eligible_line_count, 0)
+        self.assertEqual(result.scores[0].measurement_rounds, 3)
+        self.assertEqual(result.scores[0].successful_rounds, 2)
         self.assertEqual(
             result.scores[0].components["success_rate"],
-            50.0,
+            200.0 / 3.0,
         )
+        self.assertFalse(result.scores[0].eligible_for_deep_probe)
+        self.assertEqual(result.candidate_count, 0)
 
     def test_reachable_is_not_counted_as_media_success(self):
         self._add_line("line-reachable")
         self._add_measurement("line-reachable", 1, status="reachable")
         self._add_measurement("line-reachable", 2, status="reachable")
+        self._add_measurement("line-reachable", 3, status="reachable")
 
         result = self._score()
 
@@ -202,8 +232,7 @@ class ScoringTests(unittest.TestCase):
 
     def test_blacklisted_line_cannot_be_candidate(self):
         self._add_line("line-blocked")
-        self._add_measurement("line-blocked", 1)
-        self._add_measurement("line-blocked", 2)
+        self._add_three_successful_rounds("line-blocked")
 
         with database_session(self.db_path) as db:
             db.execute(
@@ -222,8 +251,7 @@ class ScoringTests(unittest.TestCase):
 
     def test_confirmed_ad_evidence_reduces_ad_component(self):
         self._add_line("line-ad")
-        self._add_measurement("line-ad", 1)
-        self._add_measurement("line-ad", 2)
+        self._add_three_successful_rounds("line-ad")
 
         self._add_deep_probe(
             "line-ad",
@@ -241,8 +269,7 @@ class ScoringTests(unittest.TestCase):
 
     def test_complete_clean_content_evidence_improves_ad_component(self):
         self._add_line("line-clean")
-        self._add_measurement("line-clean", 1)
-        self._add_measurement("line-clean", 2)
+        self._add_three_successful_rounds("line-clean")
 
         self._add_deep_probe(
             "line-clean",
@@ -263,8 +290,7 @@ class ScoringTests(unittest.TestCase):
 
     def test_incomplete_clean_evidence_is_unknown(self):
         self._add_line("line-incomplete")
-        self._add_measurement("line-incomplete", 1)
-        self._add_measurement("line-incomplete", 2)
+        self._add_three_successful_rounds("line-incomplete")
 
         self._add_deep_probe(
             "line-incomplete",
@@ -290,13 +316,19 @@ class ScoringTests(unittest.TestCase):
 
         self._add_measurement(
             "line-run-isolated",
-            3,
+            1,
             run_id=2,
             status="failed",
         )
         self._add_measurement(
             "line-run-isolated",
-            4,
+            2,
+            run_id=2,
+            status="failed",
+        )
+        self._add_measurement(
+            "line-run-isolated",
+            3,
             run_id=2,
             status="failed",
         )
@@ -309,13 +341,12 @@ class ScoringTests(unittest.TestCase):
             result.scores[0].components["success_rate"],
             100.0,
         )
-        self.assertEqual(result.eligible_line_count, 1)
+        self.assertEqual(result.eligible_line_count, 0)
 
     def test_deep_probe_evidence_from_other_run_is_not_mixed(self):
         self._add_run(2)
         self._add_line("line-deep-isolated")
-        self._add_measurement("line-deep-isolated", 1)
-        self._add_measurement("line-deep-isolated", 2)
+        self._add_three_successful_rounds("line-deep-isolated")
 
         self._add_deep_probe(
             "line-deep-isolated",
@@ -356,8 +387,7 @@ class ScoringTests(unittest.TestCase):
         for index in range(7):
             line_id = f"line-{index}"
             self._add_line(line_id)
-            self._add_measurement(line_id, 1)
-            self._add_measurement(line_id, 2)
+            self._add_three_successful_rounds(line_id)
 
         result = self._score()
 
@@ -373,8 +403,7 @@ class ScoringTests(unittest.TestCase):
 
     def test_scores_are_persisted_and_repeatable_for_same_run(self):
         self._add_line("line-repeat")
-        self._add_measurement("line-repeat", 1)
-        self._add_measurement("line-repeat", 2)
+        self._add_three_successful_rounds("line-repeat")
 
         first = self._score()
         second = self._score()
