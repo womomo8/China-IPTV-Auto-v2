@@ -23,7 +23,6 @@ WEIGHTS = {
 
 MAX_DEEP_CANDIDATES_PER_CHANNEL = 5
 SUPPORTED_ENVIRONMENTS = {"cloud"}
-SUCCESS_STATUSES = {"success"}
 TERMINAL_HTTP_STATUSES = {"success", "failed"}
 
 
@@ -101,22 +100,28 @@ def _grade(score: float) -> str:
     return "D"
 
 
-def _success_rate_score(measurements: list[dict[str, Any]]) -> tuple[float, int, int]:
-    """Only actual HTTP body-read success/failure records enter this ratio."""
+def _success_rate_score(
+    measurements: list[dict[str, Any]],
+) -> tuple[float, int, int]:
     completed = [
         item for item in measurements
         if item["status"] in TERMINAL_HTTP_STATUSES
     ]
-    successes = sum(item["status"] in SUCCESS_STATUSES for item in completed)
+    successes = sum(
+        item["status"] == "success" for item in completed
+    )
 
     if not completed:
         return 0.0, 0, 0
 
-    return _clamp_score(successes / len(completed) * 100), len(completed), successes
+    return (
+        _clamp_score(successes / len(completed) * 100),
+        len(completed),
+        successes,
+    )
 
 
 def _stability_score(measurements: list[dict[str, Any]]) -> float:
-    """Use successful samples only; insufficient evidence receives zero."""
     successful = [
         item for item in measurements
         if item["status"] == "success"
@@ -135,7 +140,6 @@ def _stability_score(measurements: list[dict[str, Any]]) -> float:
         and value > 0
     ]
 
-    # A missing metric is not interpreted as perfect stability.
     if len(latencies) < 2 or len(throughputs) < 2:
         return 0.0
 
@@ -150,8 +154,9 @@ def _stability_score(measurements: list[dict[str, Any]]) -> float:
         if throughput_mean > 0 else 1.0
     )
 
-    # Latency variation has a smaller influence than throughput variation.
-    return _clamp_score(100.0 - 50.0 * throughput_cv - 30.0 * latency_cv)
+    return _clamp_score(
+        100.0 - 50.0 * throughput_cv - 30.0 * latency_cv
+    )
 
 
 def _throughput_score(measurements: list[dict[str, Any]]) -> float:
@@ -161,10 +166,10 @@ def _throughput_score(measurements: list[dict[str, Any]]) -> float:
         and (value := _finite_number(item["throughput_kbps"])) is not None
         and value > 0
     ]
+
     if not values:
         return 0.0
 
-    # 3000 kbps reaches the component's full score.
     return _clamp_score(mean(values) / 3000.0 * 100.0)
 
 
@@ -177,19 +182,26 @@ def _freshness_score(
         for item in measurements
         if (parsed := _parse_time(item["measured_at"])) is not None
     ]
+
     if not times:
         return 0.0
 
-    age_hours = max(0.0, (now - max(times)).total_seconds() / 3600.0)
-    # Full points for the latest 6 hours, then a linear decay to zero at 72h.
+    age_hours = max(
+        0.0,
+        (now - max(times)).total_seconds() / 3600.0,
+    )
+
     if age_hours <= 6:
         return 100.0
     if age_hours >= 72:
         return 0.0
+
     return _clamp_score(100.0 * (72.0 - age_hours) / 66.0)
 
 
-def _ad_placeholder_score(deep_rows: list[dict[str, Any]]) -> float:
+def _ad_placeholder_score(
+    deep_rows: list[dict[str, Any]],
+) -> float:
     """Only explicit content evidence changes the neutral unknown score."""
     if not deep_rows:
         return 50.0
@@ -206,24 +218,31 @@ def _ad_placeholder_score(deep_rows: list[dict[str, Any]]) -> float:
         if evidence.get("ad_detected") is True:
             return 0.0
 
-        content_class = str(evidence.get("content_class", "")).strip().lower()
-        if evidence.get("ad_detected") is False and content_class in {
-            "clean", "normal", "live_program"
-        }:
-            return 100.0
-
         if evidence.get("placeholder_detected") is True:
             return 0.0
 
-        if evidence.get("placeholder_detected") is False and content_class in {
-            "clean", "normal", "live_program"
-        }:
+        content_class = str(
+            evidence.get("content_class", "")
+        ).strip().lower()
+
+        if (
+            evidence.get("ad_detected") is False
+            and content_class in {"clean", "normal", "live_program"}
+        ):
+            return 100.0
+
+        if (
+            evidence.get("placeholder_detected") is False
+            and content_class in {"clean", "normal", "live_program"}
+        ):
             return 100.0
 
     return 50.0
 
 
-def _source_reliability_score(source_scores: list[float]) -> float:
+def _source_reliability_score(
+    source_scores: list[float],
+) -> float:
     if not source_scores:
         return 50.0
     return _clamp_score(mean(source_scores))
@@ -257,7 +276,8 @@ def _is_blacklisted(db, line_id: str, url: str) -> bool:
 def _load_source_scores(db, line_id: str) -> list[float]:
     rows = db.execute(
         """
-        SELECT ss.total_score
+        SELECT ss.source_id, ss.total_score, ss.scored_at,
+               ss.source_score_id
           FROM source_lines AS sl
           JOIN source_scores AS ss
             ON ss.source_id = sl.source_id
@@ -267,12 +287,13 @@ def _load_source_scores(db, line_id: str) -> list[float]:
         (line_id,),
     ).fetchall()
 
-    # Use each associated source's latest recorded score only.
     latest: dict[str, float] = {}
+
     for row in rows:
-        source_id = str(row["source_id"]) if "source_id" in row.keys() else ""
+        source_id = str(row["source_id"])
         score = _finite_number(row["total_score"])
-        if source_id and score is not None and source_id not in latest:
+
+        if score is not None and source_id not in latest:
             latest[source_id] = score
 
     return list(latest.values())
@@ -283,7 +304,6 @@ def _score_one_line(
     *,
     line_id: str,
     url: str,
-    run_id: int,
     runner_identity: str,
     environment_type: str,
     now: datetime,
@@ -335,11 +355,18 @@ def _score_one_line(
     total = _weighted_total(components)
 
     latest = measurements[0] if measurements else None
-    latest_success = bool(latest and latest["status"] == "success")
+    latest_success = bool(
+        latest and latest["status"] == "success"
+    )
     not_blacklisted = not _is_blacklisted(db, line_id, url)
 
-    # Deep-probe candidates need at least two independent HTTP rounds and
-    # >=90% actual body-read success. Three rounds remain mandatory for release.
+    # A confirmed advertisement or placeholder cannot enter deep probing.
+    no_confirmed_ad_or_placeholder = (
+        components["ad_placeholder_risk"] > 0.0
+    )
+
+    # Two independent successful HTTP rounds are required before deep probing.
+    # Three rounds remain mandatory for formal publication.
     eligible = (
         completed_rounds >= 2
         and successful_rounds >= 2
@@ -347,6 +374,7 @@ def _score_one_line(
         and latest_success
         and total >= 70.0
         and not_blacklisted
+        and no_confirmed_ad_or_placeholder
     )
 
     return LineScore(
@@ -381,8 +409,10 @@ def score_lines(
         )
 
     current_time = now or _now()
+
     if current_time.tzinfo is None:
         current_time = current_time.replace(tzinfo=timezone.utc)
+
     current_time = current_time.astimezone(timezone.utc)
 
     score_results: list[LineScore] = []
@@ -420,17 +450,18 @@ def score_lines(
                 db,
                 line_id=line["line_id"],
                 url=line["url"],
-                run_id=run_id,
                 runner_identity=runner_identity,
                 environment_type=environment_type,
                 now=current_time,
             )
+
             score_results.append(result)
 
             db.execute(
                 """
                 INSERT INTO line_scores
-                    (run_id, line_id, scored_at, total_score, components_json)
+                    (run_id, line_id, scored_at,
+                     total_score, components_json)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, line_id) DO UPDATE SET
                     scored_at = excluded.scored_at,
@@ -458,7 +489,6 @@ def score_lines(
                 ),
             )
 
-        # Select candidates separately for every channel.
         eligible_by_line = {
             item.line_id: item
             for item in score_results
@@ -494,7 +524,7 @@ def score_lines(
                 )
             )
 
-        for channel_id, items in grouped.items():
+        for items in grouped.values():
             items.sort(
                 key=lambda item: (
                     -item.total_score,
@@ -508,7 +538,11 @@ def score_lines(
         key=lambda item: (-item.total_score, item.line_id)
     )
     candidates.sort(
-        key=lambda item: (item.channel_id, -item.total_score, item.line_id)
+        key=lambda item: (
+            item.channel_id,
+            -item.total_score,
+            item.line_id,
+        )
     )
 
     return ScoringRunResult(
