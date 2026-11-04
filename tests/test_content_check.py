@@ -734,3 +734,49 @@ def test_score_join_is_scoped_to_current_run(
 
     assert result.selected_count == 0
     assert result.checked_count == 0
+def test_normalized_url_blacklist_blocks_equivalent_url(
+    tmp_path,
+    monkeypatch,
+):
+    path, run_id = _database()
+
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """
+            UPDATE lines
+               SET url = 'https://EXAMPLE.com:443/live-1.ts'
+             WHERE line_id = 'line-1'
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO blacklists
+                (
+                    target_type,
+                    target_id,
+                    reason,
+                    evidence_json,
+                    created_at,
+                    active
+                )
+            VALUES (
+                'url',
+                'https://example.com/live-1.ts',
+                'test_normalized_blacklist',
+                '{}',
+                '2026-11-04T00:00:00Z',
+                1
+            )
+            """
+        )
+
+    _enable_fake_tools(monkeypatch)
+
+    result = content_check.run_content_checks(
+        path,
+        run_id,
+        runner_identity="test-runner",
+    )
+
+    assert result.selected_count == 0
+    assert result.checked_count == 0
