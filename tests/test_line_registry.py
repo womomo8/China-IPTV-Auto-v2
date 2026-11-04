@@ -88,7 +88,19 @@ class LineRegistryTests(unittest.TestCase):
             validate_entry(make_entry(url="http://192.168.1.10/live")),
             "non_public_ip_address",
         )
+    def test_inactive_source_cannot_register_lines(self):
+        with database_session(self.db_path) as db:
+            db.execute(
+                "UPDATE sources SET active = 0 WHERE source_id = ?",
+                ("source-test",),
+            )
 
+        with self.assertRaisesRegex(ValueError, "来源已停用"):
+            self.registry.ingest(
+                run_id=1,
+                source_id="source-test",
+                entries=[make_entry()],
+            )
     def test_registers_entry_and_relationships(self):
         entry = make_entry()
         result = self.registry.ingest(
