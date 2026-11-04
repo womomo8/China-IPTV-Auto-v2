@@ -117,25 +117,15 @@ def _extract_frame(
         "-nostdin",
         "-loglevel", "error",
         "-rw_timeout", "8000000",
+        *_header_args(headers),
         "-i", url,
         "-ss", str(second),
         "-frames:v", "1",
         "-vf", "scale=640:-2",
         "-f", "image2pipe",
         "-vcodec", "png",
-        *_header_args(headers),
         "pipe:1",
     ]
-
-    # FFmpeg expects input headers before the input URL.
-    header_args = _header_args(headers)
-    if header_args:
-        command.remove("-i")
-        command.remove(url)
-        insert_at = command.index("-rw_timeout") + 2
-        command[insert_at:insert_at] = header_args
-        insert_at = command.index("-rw_timeout") + 2 + len(header_args)
-        command[insert_at:insert_at] = ["-i", url]
 
     try:
         result = subprocess.run(
