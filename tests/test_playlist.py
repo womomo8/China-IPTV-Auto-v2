@@ -166,7 +166,7 @@ https://example.com/cctv4.m3u8
 
     def test_unknown_channel_is_rejected_and_counted(self):
         playlist = """#EXTM3U
-#EXTINF:-1 group-title="体育",未知测试频道
+#EXTINF:-1 group-title="体育",未知频道甲
 https://example.com/unknown.m3u8
 #EXTINF:-1 group-title="体育",另一个未知频道
 https://example.com/unknown2.m3u8
@@ -182,7 +182,7 @@ https://example.com/unknown2.m3u8
         self.assertEqual(
             rejected,
             {
-                "未知测试频道": 1,
+                "未知频道甲": 1,
                 "另一个未知频道": 1,
             },
         )
