@@ -1,3 +1,4 @@
+
 """Bounded IPv4-first basic stream measurements with persistent history."""
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .database import database_session
+from .ipv4 import check_ipv4_url
 
 
 MAX_READ_BYTES = 4096
@@ -358,12 +360,47 @@ def _load_candidates_and_reserve_rounds(
     """
     Reserve missing basic rounds or resume pending records.
 
-    A write lock is acquired before checking existing reservations. This
-    prevents concurrent invocations from allocating duplicate rounds.
+    IPv4 admission is checked before the SQLite write transaction.
+    Only URLs that pass admission and remain unchanged are reserved.
     """
     candidates: list[dict[str, Any]] = []
     skipped = 0
     timestamp = _now()
+
+    # Read candidate URLs before acquiring the SQLite write lock.
+    with database_session(database_path) as db:
+        admission_rows = db.execute(
+            """
+            SELECT l.line_id, l.url
+              FROM lines AS l
+             WHERE NOT EXISTS (
+                   SELECT 1 FROM blacklists b
+                    WHERE b.active = 1
+                      AND (
+                           (b.target_type = 'line'
+                            AND b.target_id = l.line_id)
+                        OR (b.target_type = 'url'
+                            AND b.target_id = l.url)
+                      )
+             )
+             ORDER BY l.line_id
+            """
+        ).fetchall()
+
+    admitted_urls: dict[str, str] = {}
+
+    for admission_row in admission_rows:
+        line_id = str(admission_row["line_id"])
+        url = str(admission_row["url"] or "")
+
+        try:
+            admission = check_ipv4_url(url)
+        except Exception:
+            # Fail closed: unchecked URLs are never admitted.
+            continue
+
+        if admission.allowed:
+            admitted_urls[line_id] = url
 
     with database_session(database_path) as db:
         db.execute("BEGIN IMMEDIATE")
@@ -408,6 +445,11 @@ def _load_candidates_and_reserve_rounds(
 
         for row in rows:
             line_id = str(row["line_id"])
+            current_url = str(row["url"] or "")
+
+            # Reject old IPv6/private lines and URLs changed after admission.
+            if admitted_urls.get(line_id) != current_url:
+                continue
 
             existing_rows = db.execute(
                 """
