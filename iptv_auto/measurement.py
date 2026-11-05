@@ -1,4 +1,3 @@
-
 """Bounded IPv4-first basic stream measurements with persistent history."""
 from __future__ import annotations
 
@@ -95,6 +94,38 @@ def _is_stability_retest(evidence: dict[str, Any]) -> bool:
     return evidence.get("measurement_stage") == "stability_retest"
 
 
+def _is_html_response(content_type: str, body: bytes) -> bool:
+    """Reject webpage and common API error bodies, even with a false media MIME."""
+    media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    sample = bytes(body or b"").lstrip()
+    if sample.startswith(b"\xef\xbb\xbf"):
+        sample = sample[3:].lstrip()
+    if media_type in {"text/html", "application/xhtml+xml"}:
+        return True
+    sample = sample[:1024].lower()
+    return sample.startswith((
+        b"<!doctype html", b"<html", b"<head", b"<body",
+        b"<script", b"<error", b"{", b"[",
+    ))
+
+
+def _is_valid_basic_http_body(content_type: str, body: bytes) -> bool:
+    """Basic media-response check; this does not confirm actual playback."""
+    if not body or _is_html_response(content_type, body):
+        return False
+    sample = bytes(body).lstrip()
+    if sample.startswith(b"\xef\xbb\xbf"):
+        sample = sample[3:].lstrip()
+    if sample.startswith(b"#EXTM3U"):
+        return True
+    media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    if media_type == "application/dash+xml":
+        return b"<mpd" in sample[:1024].lower()
+    if media_type.startswith(("video/", "audio/")):
+        return True
+    return False
+
+
 def _connect_ipv4(
     host: str, port: int, timeout: float
 ) -> tuple[socket.socket, str]:
@@ -186,10 +217,13 @@ def _probe_http(
 
         connection.request("GET", target, headers=request_headers)
         response = connection.getresponse()
-        peer_ip = getattr(connection, "peer_ipv4", None)
+                peer_ip = getattr(connection, "peer_ipv4", None)
         body = response.read(MAX_READ_BYTES)
         status_code = int(response.status)
         content_type = response.getheader("Content-Type", "")
+        media_response_confirmed = _is_valid_basic_http_body(
+            content_type, body
+        )
 
         elapsed = max(time.monotonic() - started, 0.000001)
         latency = _finite_nonnegative(elapsed * 1000.0)
@@ -203,6 +237,7 @@ def _probe_http(
             "range_requested": True,
             "ip_version": 4,
             "connected_ipv4": peer_ip,
+            "media_response_confirmed": media_response_confirmed,
             "media_playback_confirmed": False,
         }
 
@@ -214,6 +249,11 @@ def _probe_http(
         if not body:
             return ProbeResult(
                 "failed", latency, None, "empty_response", evidence
+            )
+
+        if not media_response_confirmed:
+            return ProbeResult(
+                "failed", latency, None, "non_media_response", evidence
             )
 
         throughput = _finite_nonnegative(
@@ -348,9 +388,7 @@ def _validate_runtime_options(
     ):
         raise ValueError("基础测速并发数必须是1至12之间的整数")
     return timeout, max_concurrency
-
-
-def _load_candidates_and_reserve_rounds(
+    def _load_candidates_and_reserve_rounds(
     database_path: Path,
     run_id: int,
     runner_identity: str,
@@ -568,9 +606,7 @@ def _load_candidates_and_reserve_rounds(
                 next_round += 1
 
     return candidates, skipped
-
-
-def run_basic_measurements(
+    def run_basic_measurements(
     database_path: str | Path,
     run_id: int,
     *,
