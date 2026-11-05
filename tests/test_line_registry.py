@@ -150,7 +150,7 @@ class LineRegistryTests(unittest.TestCase):
     def test_catalog_rejects_unknown_channel(self):
         entry = make_catalog_entry(
             self.catalog,
-            name="不存在的测试频道",
+            name="目录外频道乙",
         )
         self.assertEqual(
             validate_entry(entry, channel_catalog=self.catalog),
