@@ -1,4 +1,4 @@
-"""Versioned SQLite schema for the single v2 processing pipeline."""
+"""Versioned SQLite schema and safe migrations for the IPTV pipeline."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -7,8 +7,9 @@ import sqlite3
 from typing import Iterator
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
+# Fresh databases are created directly at the current schema version.
 SCHEMA = r"""
 BEGIN IMMEDIATE;
 
@@ -156,6 +157,52 @@ CREATE TABLE IF NOT EXISTS publications (
     reason TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS run_candidates (
+    run_id INTEGER NOT NULL REFERENCES runs(run_id),
+    line_id TEXT NOT NULL REFERENCES lines(line_id),
+    channel_id TEXT NOT NULL REFERENCES channels(channel_id),
+    candidate_order INTEGER NOT NULL CHECK (candidate_order > 0),
+    url_snapshot TEXT NOT NULL,
+    headers_json_snapshot TEXT NOT NULL DEFAULT '{}',
+    channel_name_snapshot TEXT NOT NULL,
+    category_snapshot TEXT NOT NULL DEFAULT '',
+    ipv4_admission_status TEXT NOT NULL DEFAULT 'passed',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, line_id, channel_id),
+    UNIQUE (run_id, candidate_order)
+);
+
+CREATE TABLE IF NOT EXISTS run_candidate_sources (
+    run_id INTEGER NOT NULL,
+    line_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, line_id, channel_id, source_id),
+    FOREIGN KEY (run_id, line_id, channel_id)
+        REFERENCES run_candidates(run_id, line_id, channel_id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS run_stages (
+    run_id INTEGER NOT NULL REFERENCES runs(run_id),
+    stage_name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN (
+            'pending', 'running', 'completed',
+            'completed_no_candidates', 'failed', 'timeout', 'skipped'
+        )
+    ),
+    runner_identity TEXT NOT NULL DEFAULT '',
+    environment_type TEXT NOT NULL DEFAULT '',
+    started_at TEXT,
+    finished_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    error_class TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (run_id, stage_name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_source_checks_source_time
     ON source_checks(source_id, checked_at);
 CREATE INDEX IF NOT EXISTS idx_source_checks_run
@@ -178,10 +225,83 @@ CREATE INDEX IF NOT EXISTS idx_blacklists_target_active
     ON blacklists(target_type, target_id, active);
 CREATE INDEX IF NOT EXISTS idx_publications_run_time
     ON publications(run_id, published_at);
+CREATE INDEX IF NOT EXISTS idx_run_candidates_line_channel
+    ON run_candidates(line_id, channel_id);
+CREATE INDEX IF NOT EXISTS idx_run_candidate_sources_source
+    ON run_candidate_sources(source_id);
+CREATE INDEX IF NOT EXISTS idx_run_stages_status
+    ON run_stages(status);
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 COMMIT;
 """
+
+# Each item is a single SQL statement so the migration remains inside the
+# explicit transaction (sqlite3.Connection.executescript can commit implicitly).
+_V1_TO_V2_STATEMENTS = (
+    """CREATE TABLE run_candidates (
+        run_id INTEGER NOT NULL REFERENCES runs(run_id),
+        line_id TEXT NOT NULL REFERENCES lines(line_id),
+        channel_id TEXT NOT NULL REFERENCES channels(channel_id),
+        candidate_order INTEGER NOT NULL CHECK (candidate_order > 0),
+        url_snapshot TEXT NOT NULL,
+        headers_json_snapshot TEXT NOT NULL DEFAULT '{}',
+        channel_name_snapshot TEXT NOT NULL,
+        category_snapshot TEXT NOT NULL DEFAULT '',
+        ipv4_admission_status TEXT NOT NULL DEFAULT 'passed',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, line_id, channel_id),
+        UNIQUE (run_id, candidate_order)
+    )""",
+    """CREATE TABLE run_candidate_sources (
+        run_id INTEGER NOT NULL,
+        line_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        source_id TEXT NOT NULL REFERENCES sources(source_id),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, line_id, channel_id, source_id),
+        FOREIGN KEY (run_id, line_id, channel_id)
+            REFERENCES run_candidates(run_id, line_id, channel_id)
+            ON DELETE CASCADE
+    )""",
+    """CREATE TABLE run_stages (
+        run_id INTEGER NOT NULL REFERENCES runs(run_id),
+        stage_name TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (
+            status IN (
+                'pending', 'running', 'completed',
+                'completed_no_candidates', 'failed', 'timeout', 'skipped'
+            )
+        ),
+        runner_identity TEXT NOT NULL DEFAULT '',
+        environment_type TEXT NOT NULL DEFAULT '',
+        started_at TEXT,
+        finished_at TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        summary_json TEXT NOT NULL DEFAULT '{}',
+        error_class TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (run_id, stage_name)
+    )""",
+    "CREATE INDEX idx_run_candidates_line_channel ON run_candidates(line_id, channel_id)",
+    "CREATE INDEX idx_run_candidate_sources_source ON run_candidate_sources(source_id)",
+    "CREATE INDEX idx_run_stages_status ON run_stages(status)",
+)
+
+_V1_REQUIRED_COLUMNS = {
+    "runs": {"run_id", "started_at", "status", "runner_identity"},
+    "sources": {"source_id", "url", "first_seen_at", "last_seen_at"},
+    "source_checks": {"source_check_id", "run_id", "source_id", "checked_at"},
+    "lines": {"line_id", "url", "first_seen_at", "last_seen_at"},
+    "channels": {"channel_id", "name", "category"},
+    "source_lines": {"source_id", "line_id"},
+    "line_channels": {"line_id", "channel_id"},
+    "measurements": {"measurement_id", "run_id", "line_id", "round_no"},
+    "deep_probes": {"probe_id", "run_id", "line_id"},
+    "line_scores": {"score_id", "run_id", "line_id"},
+    "source_scores": {"source_score_id", "run_id", "source_id"},
+    "blacklists": {"blacklist_id", "target_type", "target_id"},
+    "publications": {"publication_id", "run_id", "published_at"},
+}
 
 
 class DatabaseSchemaError(RuntimeError):
@@ -214,8 +334,66 @@ def database_session(path: str | Path) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+def _validate_v1_schema(connection: sqlite3.Connection) -> None:
+    tables = {
+        row["name"] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    missing_tables = set(_V1_REQUIRED_COLUMNS) - tables
+    if missing_tables:
+        raise DatabaseSchemaError(
+            "检测到 user_version=1，但缺少必要的数据表，拒绝自动迁移："
+            + ", ".join(sorted(missing_tables))
+        )
+
+    for table, required in _V1_REQUIRED_COLUMNS.items():
+        columns = {
+            row["name"] for row in connection.execute(
+                f'PRAGMA table_info("{table}")'
+            )
+        }
+        missing = required - columns
+        if missing:
+            raise DatabaseSchemaError(
+                f"检测到 V1 数据库表 {table} 结构不完整，缺少字段："
+                + ", ".join(sorted(missing))
+            )
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    _validate_v1_schema(connection)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        # Re-check the version after obtaining the write lock.
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version == SCHEMA_VERSION:
+            connection.commit()
+            return
+        if version != 1:
+            raise DatabaseSchemaError(
+                f"迁移期间数据库版本发生变化：{version}"
+            )
+
+        for statement in _V1_TO_V2_STATEMENTS:
+            connection.execute(statement)
+
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise DatabaseSchemaError(
+                f"V1 数据库存在外键异常，拒绝迁移（{len(violations)} 项）"
+            )
+
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
 def initialize_database(path: str | Path) -> None:
-    """Create a fresh v2 database; never silently migrate an unknown schema."""
+    """Create a fresh V2 database or safely migrate a recognized V1 database."""
     connection = connect_database(path)
     try:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -224,7 +402,19 @@ def initialize_database(path: str | Path) -> None:
         ).fetchall()
 
         if version == SCHEMA_VERSION:
-            connection.executescript(SCHEMA)
+            # Idempotent validation/creation for the current version only.
+            required = set(_V1_REQUIRED_COLUMNS) | {
+                "run_candidates", "run_candidate_sources", "run_stages"
+            }
+            table_names = {row["name"] for row in existing_tables}
+            if not required.issubset(table_names):
+                raise DatabaseSchemaError(
+                    "数据库标记为 V2，但缺少必要数据表；为保护历史数据，拒绝自动修补。"
+                )
+            return
+
+        if version == 1:
+            _migrate_v1_to_v2(connection)
             return
 
         if version != 0 or existing_tables:
