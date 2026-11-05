@@ -1,32 +1,97 @@
-# China-IPTV-Auto-v2（第一批：基础层）
+China-IPTV-Auto-v2
 
-本批次建立新系统的基础，不导入旧仓库任何数据、订阅源、线路、黑名单或工作流。
+自动发现、筛选、检测和发布 IPTV 直播线路的统一自动化项目。
 
-## 本批次包含
-- `config.yaml`：统一参数入口
-- `requirements.txt`：基础依赖
-- `iptv_auto/__init__.py`
-- `iptv_auto/config.py`：配置读取与校验
-- `iptv_auto/identity.py`：稳定线路/频道/来源身份
-- `iptv_auto/playlist.py`：M3U/M3U8 解析、基础规范化和明显占位过滤
-- `iptv_auto/database.py`：全新 SQLite 数据库结构、WAL、安全写入
-- `tests/`：基础测试
+📺 正式订阅地址
 
-## 重要说明
-这只是第一批基础文件，**不是可直接运行的完整自动筛选系统**。自动发现、网络测速、FFmpeg/FFprobe 深度探测、评分、发布保护和 GitHub Actions 将在后续批次接入同一条管道。
+<badge>待发布流程接通后启用</badge>
 
-首次完整运行必须等全部模块完成并审查后再进行。当前不会生成或覆盖正式 `output/result.m3u`。
+主订阅地址：
 
-## 环境
-Python 3.11 或更新版本。
+https://raw.githubusercontent.com/womomo8/China-IPTV-Auto-v2/main/output/result.m3u
 
-```bash
-pip install -r requirements.txt
-python -m unittest discover -s tests -v
-```
+说明：
 
-## 数据库
-默认数据库位置：`data/iptv_auto.sqlite3`。第一次运行会创建全新数据库。不要把旧仓库数据库复制过来。
+- 这是计划使用的固定正式订阅地址。
+- 当前尚未确认正式订阅文件已经生成。
+- 发布流程完成并成功生成文件后，此地址才能正式使用。
+- 请勿将尚未验证的地址当作可用订阅。
 
-## 配置
-人工来源地址放在 `config.yaml` 的 `sources.manual` 中。此处默认留空，不预装任何旧仓库订阅源。
+📋 项目状态
+
+项目| 目标
+正式频道总数| 38个
+央视频道| 10个
+卫视频道| 12个
+港澳台频道| 5个
+体育频道| 11个
+主流程入口| "iptv_auto/pipeline.py"
+统一数据库| "data/iptv_auto.sqlite3"
+正式频道目录| "config/channels.yaml"
+正式订阅出口| "output/result.m3u"
+
+🏗️ 一体化架构
+
+本项目坚持：
+
+1. 一个主仓库。
+2. 一条自动化主流程。
+3. 一个主程序入口。
+4. 一套统一数据库。
+5. 一份38个正式频道目录。
+6. 一份统一运行配置。
+7. 一套统一检测和评分标准。
+8. 一个正式订阅发布出口。
+
+所有功能最终统一接入 "iptv_auto/pipeline.py"，不得形成互相独立的业务流程。
+
+🔄 自动化处理流程
+
+公开来源发现
+→ 线路采集
+→ 频道匹配
+→ IPv4筛选
+→ 无效线路过滤
+→ 基础测速三轮
+→ 质量评分
+→ 深度检测
+→ 稳定性复测
+→ 网络出口验证
+→ 发布资格审核
+→ 正式订阅生成
+→ 原子更新
+
+📂 核心文件
+
+文件| 用途
+"config.yaml"| 统一运行配置
+"config/channels.yaml"| 唯一正式频道目录
+"iptv_auto/pipeline.py"| 唯一主流程
+"data/iptv_auto.sqlite3"| 统一数据库
+"output/result.m3u"| 正式订阅文件
+"output/backups/"| 订阅备份
+"docs/CORE_FLOW.md"| 仓库总流程和整改标准
+".github/workflows/iptv-auto.yml"| 自动化启动器
+
+🛡️ 发布保护
+
+- 检测不合格的线路不得进入正式订阅。
+- 发布前必须检查订阅文件。
+- 新版本发布失败时保留上一版有效订阅。
+- 正式订阅采用安全更新方式。
+- 不得将未经验证的线路标记为可用。
+
+⚙️ 当前说明
+
+本仓库仍在逐步整改和集成阶段。
+
+在完整流程、测试和发布验收通过前：
+
+- 不宣称自动筛选系统已经完整运行。
+- 不宣称正式订阅地址已经可用。
+- 定时自动任务保持暂停。
+- 不覆盖已有有效订阅。
+
+📌 项目最终目标
+
+建设一个真正统一、自动运行、能够持续更新的 IPTV 线路筛选与发布系统。
