@@ -1,14 +1,19 @@
+
 import socket
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from iptv_auto.channel_catalog import load_channel_catalog
 from iptv_auto.database import database_session, initialize_database
 from iptv_auto.identity import stable_channel_id, stable_result_id
 from iptv_auto.ipv4 import IPv4Admission
 from iptv_auto.line_registry import LineRegistry, validate_entry
 from iptv_auto.playlist import PlaylistEntry
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def make_entry(
@@ -29,11 +34,44 @@ def make_entry(
     )
 
 
+def make_catalog_entry(
+    catalog,
+    name="CCTV-5",
+    category=None,
+    url="https://stream.example.com/live.m3u8",
+    channel_id=None,
+):
+    official = catalog.resolve(name)
+    if official is None:
+        official_name = name
+        official_category = category or "体育"
+        official_channel_id = stable_channel_id(
+            official_category, official_name
+        )
+    else:
+        official_name = official.name
+        official_category = category or official.category
+        official_channel_id = channel_id or official.channel_id
+
+    return PlaylistEntry(
+        name=official_name,
+        url=url,
+        category=official_category,
+        headers={},
+        line_id=stable_result_id(url, {}),
+        channel_id=official_channel_id,
+    )
+
+
 class LineRegistryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp.name) / "test.sqlite3"
         initialize_database(self.db_path)
+
+        self.catalog = load_channel_catalog(
+            ROOT / "config" / "channels.yaml"
+        )
 
         with database_session(self.db_path) as db:
             db.execute(
@@ -58,7 +96,6 @@ class LineRegistryTests(unittest.TestCase):
 
         self.registry = LineRegistry(self.db_path)
 
-        # Keep existing registry tests independent of external DNS.
         self.dns_patcher = patch(
             "iptv_auto.ipv4.socket.getaddrinfo",
             return_value=[
@@ -102,6 +139,44 @@ class LineRegistryTests(unittest.TestCase):
         self.assertEqual(
             validate_entry(make_entry(url="http://")),
             "missing_host",
+        )
+
+    def test_catalog_accepts_official_channel(self):
+        entry = make_catalog_entry(self.catalog)
+        self.assertIsNone(
+            validate_entry(entry, channel_catalog=self.catalog)
+        )
+
+    def test_catalog_rejects_unknown_channel(self):
+        entry = make_catalog_entry(
+            self.catalog,
+            name="不存在的测试频道",
+        )
+        self.assertEqual(
+            validate_entry(entry, channel_catalog=self.catalog),
+            "channel_not_in_catalog",
+        )
+
+    def test_catalog_rejects_wrong_category(self):
+        entry = make_catalog_entry(
+            self.catalog,
+            name="CCTV-5",
+            category="央视频道",
+        )
+        self.assertEqual(
+            validate_entry(entry, channel_catalog=self.catalog),
+            "noncanonical_channel_identity",
+        )
+
+    def test_catalog_rejects_wrong_channel_id(self):
+        entry = make_catalog_entry(
+            self.catalog,
+            name="CCTV-5",
+            channel_id="wrong-channel-id",
+        )
+        self.assertEqual(
+            validate_entry(entry, channel_catalog=self.catalog),
+            "channel_identity_mismatch",
         )
 
     def test_private_ipv4_is_rejected_by_admission_gate(self):
