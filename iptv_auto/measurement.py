@@ -388,7 +388,7 @@ def _validate_runtime_options(
     ):
         raise ValueError("基础测速并发数必须是1至12之间的整数")
     return timeout, max_concurrency
-        def _load_candidates_and_reserve_rounds(
+ def _load_candidates_and_reserve_rounds(
     database_path: Path,
     run_id: int,
     runner_identity: str,
@@ -606,7 +606,7 @@ def _validate_runtime_options(
                 next_round += 1
 
     return candidates, skipped
-        def run_basic_measurements(
+def run_basic_measurements(
     database_path: str | Path,
     run_id: int,
     *,
