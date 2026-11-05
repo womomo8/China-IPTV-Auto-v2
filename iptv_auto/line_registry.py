@@ -1,3 +1,4 @@
+
 """Strict first-stage line validation, IPv4 admission and database registration."""
 from __future__ import annotations
 
@@ -5,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Any
 from urllib.parse import urlsplit
 
 from .database import database_session
@@ -64,18 +65,23 @@ def _validate_headers(headers: object) -> str | None:
         if not isinstance(value, str):
             return "invalid_header_value"
 
-        if "\r" in key or "\n" in key or "\r" in value or "\n" in value:
+        if (
+            "\r" in key or "\n" in key
+            or "\r" in value or "\n" in value
+        ):
             return "invalid_header_characters"
 
     return None
 
 
-def validate_entry(entry: PlaylistEntry) -> str | None:
-    """Validate playlist structure without performing IP admission.
+def validate_entry(
+    entry: PlaylistEntry,
+    channel_catalog: Any | None = None,
+) -> str | None:
+    """Validate playlist structure and, when supplied, official channel identity.
 
-    All IP address family and public-address checks are delegated to
-    check_ipv4_url(), so every structurally valid URL is accounted for
-    by the same IPv4 admission gate.
+    IP address family and public-address checks are delegated to
+    check_ipv4_url().
     """
     if not isinstance(entry, PlaylistEntry):
         return "invalid_entry_type"
@@ -118,13 +124,31 @@ def validate_entry(entry: PlaylistEntry) -> str | None:
         return header_error
 
     expected_line_id = stable_result_id(url, entry.headers or {})
-    expected_channel_id = stable_channel_id(category, name)
 
     if entry.line_id != expected_line_id:
         return "line_identity_mismatch"
 
-    if entry.channel_id != expected_channel_id:
-        return "channel_identity_mismatch"
+    if channel_catalog is not None:
+        official = channel_catalog.resolve(name)
+
+        if official is None:
+            return "channel_not_in_catalog"
+
+        if (
+            name != official.name
+            or category != official.category
+        ):
+            return "noncanonical_channel_identity"
+
+        if entry.channel_id != official.channel_id:
+            return "channel_identity_mismatch"
+
+    else:
+        # Compatibility for legacy callers and existing unit tests.
+        expected_channel_id = stable_channel_id(category, name)
+
+        if entry.channel_id != expected_channel_id:
+            return "channel_identity_mismatch"
 
     return None
 
@@ -132,8 +156,13 @@ def validate_entry(entry: PlaylistEntry) -> str | None:
 class LineRegistry:
     """Persist structurally valid and IPv4-eligible playlist entries."""
 
-    def __init__(self, database_path: str | Path):
+    def __init__(
+        self,
+        database_path: str | Path,
+        channel_catalog: Any | None = None,
+    ):
         self.database_path = Path(database_path)
+        self.channel_catalog = channel_catalog
 
     @staticmethod
     def _is_blacklisted(db, line_id: str, url: str) -> bool:
@@ -192,7 +221,10 @@ class LineRegistry:
             line_id = str(getattr(entry, "line_id", "") or "")
             channel_id = str(getattr(entry, "channel_id", "") or "")
 
-            reason = validate_entry(entry)
+            reason = validate_entry(
+                entry,
+                channel_catalog=self.channel_catalog,
+            )
 
             if reason:
                 rejected.append(
