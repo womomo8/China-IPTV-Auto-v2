@@ -1,19 +1,23 @@
+
 """M3U parser with explicit HTTP-header handling.
 
-Malformed header directives invalidate only their associated entry. This avoids
-silently treating a header-dependent stream as if it required no headers.
+Malformed header directives invalidate only their associated entry. When an
+official channel catalog is supplied, only catalog channels are accepted and
+their official names, categories, and IDs are used.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 import json
 import re
-from typing import Iterable
+from typing import Iterable, MutableMapping, Any
 
 from .identity import stable_result_id, stable_channel_id
 
 
-SUPPORTED_SCHEMES = ("http://", "https://", "rtsp://", "rtmp://", "rtp://", "udp://")
+SUPPORTED_SCHEMES = (
+    "http://", "https://", "rtsp://", "rtmp://", "rtp://", "udp://"
+)
 PLACEHOLDER_WORDS = (
     "广告", "测试频道", "无信号", "暂无信号", "信号中断", "占位",
     "advertisement", "no signal", "test channel",
@@ -77,17 +81,22 @@ def _safe_header(name: object, value: object) -> tuple[str, str]:
 
 def _merge_header(headers: dict[str, str], name: str, value: str) -> None:
     # Header names are case-insensitive; preserve the first spelling.
-    existing = next((key for key in headers if key.lower() == name.lower()), None)
+    existing = next(
+        (key for key in headers if key.lower() == name.lower()),
+        None,
+    )
     headers[existing or name] = value
 
 
 def _apply_directive(line: str, headers: dict[str, str]) -> str | None:
     """Apply a supported header directive; return a warning on malformed input."""
     upper = line.upper()
+
     if upper.startswith("#EXTVLCOPT:"):
         option = line.split(":", 1)[1].strip()
         if "=" not in option:
             return None
+
         key, value = option.split("=", 1)
         key = key.strip().lower()
         mapped = {
@@ -95,14 +104,16 @@ def _apply_directive(line: str, headers: dict[str, str]) -> str | None:
             "http-referrer": "Referer",
             "http-referer": "Referer",
         }.get(key)
+
         if mapped is None:
-            # Other VLC options (network-caching, program, etc.) are not HTTP headers.
             return None
+
         try:
             name, val = _safe_header(mapped, value)
             _merge_header(headers, name, val)
         except ValueError as exc:
             return str(exc)
+
         return None
 
     if upper.startswith("#EXTHTTP:"):
@@ -111,20 +122,37 @@ def _apply_directive(line: str, headers: dict[str, str]) -> str | None:
             data = json.loads(raw_json)
             if not isinstance(data, dict):
                 raise ValueError("EXTHTTP 内容必须是 JSON 对象")
+
             for name, value in data.items():
                 if isinstance(value, (dict, list)) or value is None:
-                    raise ValueError(f"请求头 {name!r} 的值必须是字符串或数字")
+                    raise ValueError(
+                        f"请求头 {name!r} 的值必须是字符串或数字"
+                    )
                 safe_name, safe_value = _safe_header(name, value)
                 _merge_header(headers, safe_name, safe_value)
+
         except (json.JSONDecodeError, ValueError) as exc:
             return f"无法解析 EXTHTTP 请求头：{exc}"
+
         return None
 
     return None
 
 
-def parse_m3u(text: str) -> list[PlaylistEntry]:
-    """Parse EXTINF records, including supported HTTP headers and safe failures."""
+def parse_m3u(
+    text: str,
+    catalog: Any | None = None,
+    rejected_channels: MutableMapping[str, int] | None = None,
+) -> list[PlaylistEntry]:
+    """Parse M3U records.
+
+    Without a catalog, retain the legacy parsing behavior for compatibility
+    with existing callers and tests.
+
+    With a catalog, reject names outside the official catalog and replace
+    accepted channel identity with the catalog's official identity.
+    rejected_channels, when supplied, counts rejected names.
+    """
     entries: list[PlaylistEntry] = []
     pending: tuple[str, str] | None = None
     headers: dict[str, str] = {}
@@ -134,30 +162,36 @@ def parse_m3u(text: str) -> list[PlaylistEntry]:
         line = raw.strip()
         if not line:
             continue
+
         if line.upper().startswith("#EXTINF"):
-            # A new EXTINF starts a new record; discard stale metadata.
             pending = _parse_extinf(line)
             headers = {}
             warnings = []
             continue
+
         if line.startswith("#"):
             warning = _apply_directive(line, headers)
             if warning:
                 warnings.append(warning)
             continue
+
         if not line.lower().startswith(SUPPORTED_SCHEMES):
             pending = None
             headers = {}
             warnings = []
             continue
+
         if pending is None:
             headers = {}
             warnings = []
             continue
 
-        category, name = pending
+        source_category, source_name = pending
         pending = None
-        if not name or _looks_like_placeholder(name, category):
+
+        if not source_name or _looks_like_placeholder(
+            source_name, source_category
+        ):
             headers = {}
             warnings = []
             continue
@@ -168,31 +202,67 @@ def parse_m3u(text: str) -> list[PlaylistEntry]:
             warnings = []
             continue
 
+        official_channel = None
+
+        if catalog is not None:
+            official_channel = catalog.resolve(source_name)
+
+            if official_channel is None:
+                if rejected_channels is not None:
+                    rejected_channels[source_name] = (
+                        rejected_channels.get(source_name, 0) + 1
+                    )
+                headers = {}
+                warnings = []
+                continue
+
+            # The official catalog overrides source group-title metadata.
+            final_name = official_channel.name
+            final_category = official_channel.category
+            channel_id = official_channel.channel_id
+
+        else:
+            # Compatibility mode for existing tests and legacy callers.
+            final_name = source_name
+            final_category = source_category
+            channel_id = stable_channel_id(
+                final_category,
+                final_name,
+            )
+
         clean_headers = dict(headers)
         line_id = stable_result_id(line, clean_headers)
-        channel_id = stable_channel_id(category, name)
-        entries.append(PlaylistEntry(
-            name=name,
-            url=line,
-            category=category,
-            headers=clean_headers,
-            line_id=line_id,
-            channel_id=channel_id,
-            parse_warnings=(),
-        ))
+
+        entries.append(
+            PlaylistEntry(
+                name=final_name,
+                url=line,
+                category=final_category,
+                headers=clean_headers,
+                line_id=line_id,
+                channel_id=channel_id,
+                parse_warnings=(),
+            )
+        )
+
         headers = {}
         warnings = []
+
     return entries
 
 
-def deduplicate_entries(entries: Iterable[PlaylistEntry]) -> list[PlaylistEntry]:
-    """Deduplicate by stable line + channel identity while preserving first-seen order."""
+def deduplicate_entries(
+    entries: Iterable[PlaylistEntry],
+) -> list[PlaylistEntry]:
+    """Deduplicate by stable line + channel identity while preserving order."""
     seen: set[tuple[str, str]] = set()
     result: list[PlaylistEntry] = []
+
     for entry in entries:
         key = (entry.line_id, entry.channel_id)
         if key in seen:
             continue
         seen.add(key)
         result.append(entry)
+
     return result
