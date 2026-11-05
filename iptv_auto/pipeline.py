@@ -1,4 +1,3 @@
-
 """Unified orchestration for the China-IPTV-Auto-v2 pipeline.
 
 Connect all existing processing stages into one cloud pipeline.
@@ -12,6 +11,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .channel_catalog import load_channel_catalog
 from .config import load_config
 from .content_check import run_content_checks
 from .database import database_session, initialize_database
@@ -218,8 +218,13 @@ def _discover_and_ingest(
     config: dict[str, Any],
     database_path: Path,
     run_id: int,
+    channel_catalog: Any | None = None,
 ) -> dict[str, Any]:
-    """Discover sources, synchronize the pool, fetch and register lines."""
+    """Discover sources, synchronize the pool, fetch and register lines.
+
+    channel_catalog is optional only for compatibility with existing
+    direct callers and tests. The production pipeline always supplies it.
+    """
     source_registry = SourceRegistry(
         database_path,
         pool_capacity=int(config["sources"]["pool_capacity"]),
@@ -228,13 +233,19 @@ def _discover_and_ingest(
 
     candidates = collect_source_candidates(config)
     sync_result = source_registry.sync_candidates(candidates)
-    line_registry = LineRegistry(database_path)
+
+    line_registry = LineRegistry(
+        database_path,
+        channel_catalog=channel_catalog,
+    )
 
     fetched_count = 0
     fetch_failed_count = 0
     parsed_count = 0
     accepted_count = 0
     rejected_count = 0
+    catalog_rejected_count = 0
+    catalog_rejected_names: dict[str, int] = {}
 
     ipv4_passed_count = 0
     ipv4_excluded_count = 0
@@ -267,7 +278,15 @@ def _discover_and_ingest(
             continue
 
         fetched_count += 1
-        entries = parse_m3u(result.text)
+
+        source_catalog_rejections: dict[str, int] = {}
+
+        entries = parse_m3u(
+            result.text,
+            catalog=channel_catalog,
+            rejected_channels=source_catalog_rejections,
+        )
+
         unique_entries = deduplicate_entries(entries)
 
         ingest_result = line_registry.ingest(
@@ -279,6 +298,16 @@ def _discover_and_ingest(
         parsed_count += len(entries)
         accepted_count += ingest_result.accepted_count
         rejected_count += len(ingest_result.rejected)
+
+        source_catalog_rejected = sum(
+            source_catalog_rejections.values()
+        )
+        catalog_rejected_count += source_catalog_rejected
+
+        for rejected_name, count in source_catalog_rejections.items():
+            catalog_rejected_names[rejected_name] = (
+                catalog_rejected_names.get(rejected_name, 0) + count
+            )
 
         ipv4_passed_count += ingest_result.ipv4_passed_count
         ipv4_excluded_count += ingest_result.ipv4_excluded_count
@@ -299,6 +328,8 @@ def _discover_and_ingest(
                 "source_type": source["source_type"],
                 "duplicate_count": ingest_result.duplicate_count,
                 "rejected_count": len(ingest_result.rejected),
+                "catalog_rejected_count": source_catalog_rejected,
+                "catalog_rejected_names": source_catalog_rejections,
                 "ipv4_admission": {
                     "passed": ingest_result.ipv4_passed_count,
                     "excluded": ingest_result.ipv4_excluded_count,
@@ -319,6 +350,11 @@ def _discover_and_ingest(
             source_scores += 1
 
     return {
+        "official_channel_count": (
+            channel_catalog.total_channels
+            if channel_catalog is not None
+            else None
+        ),
         "discovered_candidates": len(candidates),
         "accepted_sources": len(sync_result.accepted),
         "blacklisted_sources": len(sync_result.rejected_blacklist),
@@ -330,6 +366,8 @@ def _discover_and_ingest(
         "parsed_entries": parsed_count,
         "accepted_entries": accepted_count,
         "rejected_entries": rejected_count,
+        "catalog_rejected_entries": catalog_rejected_count,
+        "catalog_rejected_names": catalog_rejected_names,
         "ipv4_admission": {
             "passed": ipv4_passed_count,
             "excluded": ipv4_excluded_count,
@@ -347,17 +385,37 @@ def run_pipeline(
     """Run the complete pre-publication processing pipeline.
 
     Stages:
-      1. discover and synchronize public/manual sources;
-      2. fetch playlists, parse and register lines;
-      3. perform three basic measurement rounds;
-      4. score lines and select deep-probe candidates;
-      5. perform bounded FFprobe/FFmpeg checks;
-      6. perform conservative OCR content checks;
-      7. perform up to two stability retests.
+      1. validate the official channel catalog;
+      2. discover and synchronize public/manual sources;
+      3. fetch playlists, parse and register official-channel lines;
+      4. perform three basic measurement rounds;
+      5. score lines and select deep-probe candidates;
+      6. perform bounded FFprobe/FFmpeg checks;
+      7. perform conservative OCR content checks;
+      8. perform up to two stability retests.
 
     Formal publication is not performed here.
     """
     config = load_config(config_path)
+
+    # The official catalog must pass validation before the database is
+    # initialized or a new run is created.
+    resolved_config_path = Path(config_path).expanduser().resolve()
+    catalog_path = (
+        resolved_config_path.parent / "config" / "channels.yaml"
+    )
+
+    try:
+        channel_catalog = load_channel_catalog(catalog_path)
+    except (OSError, ValueError) as exc:
+        raise PipelineError(
+            f"正式38频道目录加载或校验失败，程序已停止：{exc}"
+        ) from exc
+
+    if channel_catalog.total_channels != 38:
+        raise PipelineError(
+            "正式频道目录数量不是38，程序已停止。"
+        )
 
     database_path = Path(config["paths"]["database"])
     database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -374,6 +432,11 @@ def run_pipeline(
     summary: dict[str, Any] = {
         "environment_type": ENVIRONMENT_TYPE,
         "runner_identity": runner_identity,
+        "official_channel_catalog": {
+            "path": str(catalog_path),
+            "total_channels": channel_catalog.total_channels,
+            "status": "validated",
+        },
         "current_stage": "source_discovery_and_ingest",
     }
 
@@ -384,6 +447,7 @@ def run_pipeline(
             config,
             database_path,
             run_id,
+            channel_catalog=channel_catalog,
         )
         summary["source_stage"] = source_summary
 
