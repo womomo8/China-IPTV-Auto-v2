@@ -1153,7 +1153,7 @@ FFmpeg 容器访问网关时使用 Compose 内部服务 DNS：
 
 ## 7.5 网络隔离和端口级防火墙
 
-Docker 网络隔离与端口级访问控制是两个不同层次，必须同时实现。
+Docker 网络隔离与容器内部端口级访问控制是两个不同层次，必须同时实现，不能互相替代。
 
 ### A. Docker 网络层
 
@@ -1165,6 +1165,9 @@ Docker 网络隔离与端口级访问控制是两个不同层次，必须同时�
 - media-gateway 在 validator_net 使用固定地址 172.30.10.2。
 - 网关只提供内部 TCP 8080 服务。
 - 不发布网关端口到宿主机公网接口。
+- gateway_egress 禁用 IPv6。
+- 不得使用 host 网络模式。
+- 不得使用 privileged。
 
 ### B. validator 容器内部 nftables 规则
 
@@ -1172,8 +1175,8 @@ validator 容器启动时必须在自己的网络命名空间内建立 nftables 
 
 规则采用默认拒绝策略：
 
-- OUTPUT 默认 DROP。
 - INPUT 默认 DROP。
+- OUTPUT 默认 DROP。
 - 允许 loopback。
 - 允许已经建立或关联的返回流量。
 - 允许访问 Docker 内部 DNS 127.0.0.11 的 UDP 53。
@@ -1192,7 +1195,7 @@ validator 容器启动时必须在自己的网络命名空间内建立 nftables 
 
 ### C. 防火墙初始化与权限降级
 
-Dockerfile.validator 只提供 FFmpeg/FFprobe 验证运行环境和必要的启动安全工具，不承担 Python 业务逻辑。
+Dockerfile.validator 只提供 FFmpeg/FFprobe 验证运行环境和必要的防火墙启动工具，不承担 Python 业务逻辑。
 
 其中必须提供：
 
@@ -1200,24 +1203,41 @@ Dockerfile.validator 只提供 FFmpeg/FFprobe 验证运行环境和必要的启�
 - FFprobe。
 - nftables。
 - setpriv 所需工具。
-- 非 root 验证用户。
+- 固定 UID/GID 的非 root 验证用户。
 
-compose.yaml 固定：
+compose.yaml 必须明确控制 validator 容器的启动能力：
 
-1. validator 容器启动阶段以 root 身份加载 nftables 规则。
-2. 仅为加载规则临时授予 NET_ADMIN。
-3. 加载规则后，立即通过 setpriv 移除 NET_ADMIN 能力。
-4. 降权到固定非 root 用户。
-5. 使用非 root 身份运行容器常驻进程。
-6. validator.py 执行 docker compose exec 时必须显式指定该非 root 用户。
-7. 不得让 FFmpeg/FFprobe 以 root 身份运行。
-8. 不得向 validator 容器挂载 Docker Socket。
-9. 不得使用 privileged。
-10. 不得使用 host 网络模式。
+1. validator 容器启动阶段以 root 身份运行初始化入口。
+2. 必须先移除容器全部默认 Linux capabilities。
+3. 仅明确添加以下三项启动阶段必需能力：
+   - NET_ADMIN：仅用于加载本容器网络命名空间内的 nftables 规则。
+   - SETUID：仅用于通过 setpriv 切换到固定非 root 用户。
+   - SETGID：仅用于通过 setpriv 切换到固定非 root 用户组并清除附加组。
+4. nftables 规则加载后，必须检查规则确实存在。
+5. 检查通过后，立即通过 setpriv 切换到固定 UID/GID 的非 root 用户。
+6. setpriv 必须启用 no-new-privileges。
+7. 权限切换后，常驻进程及其启动的 FFmpeg/FFprobe 进程必须以非 root 身份运行。
+8. 权限切换后，常驻进程及 FFmpeg/FFprobe 的 CapEff 和 CapPrm 必须不包含 NET_ADMIN、SETUID、SETGID。
+9. 不得让 FFmpeg/FFprobe 以 root 身份运行。
+10. validator.py 执行 docker compose exec 时必须显式指定该非 root 用户。
+11. 不得向 validator 容器挂载 Docker Socket。
+12. 不得使用 privileged。
+13. 不得使用 host 网络模式。
 
-NET_ADMIN 不能作为 FFmpeg 的运行权限长期保留。
+NET_ADMIN、SETUID 和 SETGID 只允许用于启动阶段的防火墙初始化及身份切换，不得作为 FFmpeg/FFprobe 的运行权限长期保留。
 
-不得把容器启动时短暂加载防火墙的权限误写成 FFmpeg 运行时拥有网络管理能力。
+必须通过实际容器测试检查：
+
+- 运行进程的 UID 和 GID。
+- /proc/self/status 中的 CapEff。
+- /proc/self/status 中的 CapPrm。
+- /proc/self/status 中的 NoNewPrivs。
+
+必须确认进程以固定非 root 用户运行，CapEff 和 CapPrm 不包含启动阶段的临时能力，NoNewPrivs 为启用状态。
+
+防火墙加载失败、规则检查失败、权限降级失败或容器启动检查失败，均不得继续深度验证。
+
+不得仅凭 Compose 配置文本认定权限隔离已经成功。
 
 ### D. 安全关卡
 
@@ -1232,9 +1252,11 @@ NET_ADMIN 不能作为 FFmpeg 的运行权限长期保留。
 7. FFmpeg 容器不能通过 DNS、重定向或其他方式绕过网关。
 8. 网关故障时，FFmpeg 不得自动退回直接联网。
 9. nftables 规则缺失或加载失败时，validator 不得运行。
-10. 降权后的 FFmpeg 进程不具备 NET_ADMIN。
-11. 网络隔离测试失败时，不得继续正式深度验证。
-12. 网络隔离测试未通过时，不得发布依赖该隔离方案的验证结果。
+10. 降权后的 FFmpeg/FFprobe 进程不具备 NET_ADMIN、SETUID、SETGID 有效及允许能力。
+11. FFmpeg/FFprobe 必须以非 root 身份运行。
+12. NoNewPrivs 必须处于启用状态。
+13. 网络隔离测试失败时，不得继续正式深度验证。
+14. 网络隔离测试未通过时，不得发布依赖该隔离方案的验证结果。
 
 隔离测试必须验证真实网络行为，而不只是检查 compose.yaml 中的配置文本。
 
@@ -1250,16 +1272,20 @@ FFmpeg 验证容器必须遵守最小权限原则。
 - 不使用 host 网络模式。
 - 不挂载 Docker Socket。
 - 不挂载不必要的宿主机目录。
-- 不授予不必要的 Linux capabilities。
-- 只在启动阶段短暂使用 NET_ADMIN 加载防火墙。
-- 防火墙加载后立即移除 NET_ADMIN。
+- 移除全部默认 Linux capabilities。
+- 只在启动阶段明确授予 NET_ADMIN、SETUID、SETGID 三项必要能力。
+- NET_ADMIN 仅用于加载 nftables 规则。
+- SETUID 和 SETGID 仅用于启动阶段的身份切换。
+- 权限切换后，常驻进程和 FFmpeg/FFprobe 的 CapEff、CapPrm 不得保留上述启动能力。
 - 启用 no-new-privileges。
-- 使用非 root 用户运行 FFmpeg/FFprobe。
+- 使用固定非 root 用户运行 FFmpeg/FFprobe。
 - 设置 CPU 资源限制。
 - 设置内存资源限制。
 - 设置进程数量限制。
 - 限制临时文件和缓存占用。
 - 只允许完成验证所需的内部通信。
+
+必须通过实际容器测试检查 UID、GID、CapEff、CapPrm 和 NoNewPrivs，不得只根据配置文件推断权限已经降级。
 
 验证容器不能拥有管理宿主机 Docker 或访问其他无关容器的权限。
 
