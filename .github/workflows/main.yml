@@ -1,0 +1,178 @@
+name: M0-A Runner Environment Precheck
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m0-a-runner-precheck
+  cancel-in-progress: false
+
+jobs:
+  runner-check:
+    name: Check Runner and Docker Environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check Ubuntu Runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f /etc/os-release
+          . /etc/os-release
+          test "$ID" = "ubuntu"
+          echo "Ubuntu: ${PRETTY_NAME}"
+          echo "Kernel: $(uname -r)"
+          echo "Architecture: $(uname -m)"
+
+      - name: Check Docker Engine
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker --version
+          docker info >/dev/null
+          echo "Docker Engine is available."
+
+      - name: Check Docker Compose
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker compose version
+
+      - name: Prepare Test Base Image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker pull alpine:3.20
+
+      - name: Build Probe Images and Test Internal Network
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          TEST_DIR="$(mktemp -d)"
+          PROJECT="m0a-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          NETWORK_NAME="${PROJECT}_validator_net"
+          GATEWAY_IMAGE="${PROJECT}-gateway-probe:local"
+          VALIDATOR_IMAGE="${PROJECT}-validator-probe:local"
+          GATEWAY_ID=""
+          VALIDATOR_ID=""
+
+          cleanup() {
+            docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" down --remove-orphans --volumes >/dev/null 2>&1 || true
+            docker image rm -f "$GATEWAY_IMAGE" "$VALIDATOR_IMAGE" >/dev/null 2>&1 || true
+            rm -rf "$TEST_DIR"
+          }
+
+          trap cleanup EXIT
+
+          cat > "$TEST_DIR/Dockerfile.gateway" <<'DOCKER'
+          FROM alpine:3.20
+          LABEL org.opencontainers.image.title="M0-A gateway build probe"
+          CMD ["sh", "-c", "sleep 300"]
+          DOCKER
+
+          cat > "$TEST_DIR/Dockerfile.validator" <<'DOCKER'
+          FROM alpine:3.20
+          LABEL org.opencontainers.image.title="M0-A validator build probe"
+          CMD ["sh", "-c", "sleep 300"]
+          DOCKER
+
+          echo "=== Build gateway probe image ==="
+          docker build --pull=false -t "$GATEWAY_IMAGE" -f "$TEST_DIR/Dockerfile.gateway" "$TEST_DIR"
+
+          echo "=== Build validator probe image ==="
+          docker build --pull=false -t "$VALIDATOR_IMAGE" -f "$TEST_DIR/Dockerfile.validator" "$TEST_DIR"
+
+          cat > "$TEST_DIR/compose.yaml" <<YAML
+          services:
+            gateway-probe:
+              image: ${GATEWAY_IMAGE}
+              command: ["sh", "-c", "sleep 300"]
+              networks:
+                validator_net:
+                  ipv4_address: 172.30.10.2
+
+            validator-probe:
+              image: ${VALIDATOR_IMAGE}
+              command: ["sh", "-c", "sleep 300"]
+              networks:
+                validator_net:
+                  ipv4_address: 172.30.10.3
+
+          networks:
+            validator_net:
+              name: ${NETWORK_NAME}
+              driver: bridge
+              internal: true
+              enable_ipv6: false
+              ipam:
+                config:
+                  - subnet: 172.30.10.0/24
+                    gateway: 172.30.10.1
+          YAML
+
+          echo "=== Validate Compose configuration ==="
+          docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" config >/dev/null
+
+          echo "=== Start probe containers ==="
+          docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" up -d
+
+          GATEWAY_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q gateway-probe)"
+          VALIDATOR_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q validator-probe)"
+          test -n "$GATEWAY_ID"
+          test -n "$VALIDATOR_ID"
+
+          GATEWAY_RUNNING="$(docker inspect -f '{{.State.Running}}' "$GATEWAY_ID")"
+          VALIDATOR_RUNNING="$(docker inspect -f '{{.State.Running}}' "$VALIDATOR_ID")"
+          test "$GATEWAY_RUNNING" = "true"
+          test "$VALIDATOR_RUNNING" = "true"
+
+          GATEWAY_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$GATEWAY_ID")"
+          VALIDATOR_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$VALIDATOR_ID")"
+          test "$GATEWAY_IP" = "172.30.10.2"
+          test "$VALIDATOR_IP" = "172.30.10.3"
+
+          NETWORK_INTERNAL="$(docker network inspect -f '{{.Internal}}' "$NETWORK_NAME")"
+          NETWORK_IPV6="$(docker network inspect -f '{{.EnableIPv6}}' "$NETWORK_NAME")"
+          test "$NETWORK_INTERNAL" = "true"
+          test "$NETWORK_IPV6" = "false"
+
+          echo "Gateway probe IPv4: $GATEWAY_IP"
+          echo "Validator probe IPv4: $VALIDATOR_IP"
+          echo "Internal network: $NETWORK_INTERNAL"
+          echo "IPv6 enabled: $NETWORK_IPV6"
+
+          echo "=== Stop and remove probe containers ==="
+          docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" stop
+          docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" down --remove-orphans --volumes
+
+          if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+            echo "ERROR: Probe network was not removed."
+            exit 1
+          fi
+
+          if docker inspect "$GATEWAY_ID" >/dev/null 2>&1; then
+            echo "ERROR: Gateway probe container was not removed."
+            exit 1
+          fi
+
+          if docker inspect "$VALIDATOR_ID" >/dev/null 2>&1; then
+            echo "ERROR: Validator probe container was not removed."
+            exit 1
+          fi
+
+          echo "Probe containers and network were removed successfully."
+          cleanup
+          trap - EXIT
+
+      - name: Final Runner Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "M0-A Runner Environment Precheck finished."
+          docker ps -a || true
+          docker network ls || true
