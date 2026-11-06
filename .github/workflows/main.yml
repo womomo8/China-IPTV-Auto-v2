@@ -1,0 +1,105 @@
+name: M0-A Runner Environment Check
+
+on:
+workflow_dispatch:
+
+permissions:
+contents: read
+
+jobs:
+runner-check:
+name: Check Runner and Docker Environment
+runs-on: ubuntu-24.04
+timeout-minutes: 10
+
+steps:
+  - name: Check Ubuntu Runner
+    run: |
+      set -e
+      echo "=== Operating System ==="
+      cat /etc/os-release
+      echo "=== Kernel ==="
+      uname -a
+
+  - name: Check Docker Engine
+    run: |
+      set -e
+      docker --version
+      docker info
+
+  - name: Check Docker Compose
+    run: |
+      set -e
+      docker compose version
+
+  - name: Prepare Test Image
+    run: |
+      set -e
+      docker pull alpine:3.20
+
+  - name: Test Internal Network and Fixed IPv4
+    run: |
+      set -e
+
+      TEST_DIR="$(mktemp -d)"
+      PROJECT="m0a-${GITHUB_RUN_ID}"
+
+      cleanup() {
+        docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" down --remove-orphans --volumes || true
+        rm -rf "$TEST_DIR"
+      }
+
+      trap cleanup EXIT
+
+      cat > "$TEST_DIR/compose.yaml" <<'YAML'
+      services:
+        probe:
+          image: alpine:3.20
+          command: ["sh", "-c", "sleep 300"]
+          networks:
+            probe_net:
+              ipv4_address: 172.30.10.10
+
+      networks:
+        probe_net:
+          driver: bridge
+          internal: true
+          ipam:
+            config:
+              - subnet: 172.30.10.0/24
+                gateway: 172.30.10.1
+      YAML
+
+      docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" config
+      docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" up -d
+
+      CONTAINER_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q probe)"
+
+      test -n "$CONTAINER_ID"
+
+      RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER_ID")"
+      test "$RUNNING" = "true"
+
+      ACTUAL_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER_ID")"
+      test "$ACTUAL_IP" = "172.30.10.10"
+
+      NETWORK_NAME="${PROJECT}_probe_net"
+      INTERNAL="$(docker network inspect -f '{{.Internal}}' "$NETWORK_NAME")"
+      test "$INTERNAL" = "true"
+
+      echo "Container started successfully."
+      echo "Fixed IPv4: $ACTUAL_IP"
+      echo "Internal network: $INTERNAL"
+
+      docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" stop
+      docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" down --remove-orphans --volumes
+
+      trap - EXIT
+      rm -rf "$TEST_DIR"
+
+  - name: Final Docker Environment Summary
+    if: always()
+    run: |
+      echo "M0-A runner capability check finished."
+      docker ps -a || true
+      docker network ls || true
