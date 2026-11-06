@@ -1396,7 +1396,7 @@ Docker internal 网络只是隔离基础，必须结合 validator 容器内部 n
 
 HLS 必须形成完整的网关解析和改写闭环。
 
-至少处理：
+首批必须处理：
 
 - Master Playlist。
 - Media Playlist。
@@ -1410,7 +1410,6 @@ HLS 必须形成完整的网关解析和改写闭环。
 - EXT-X-MEDIA URI。
 - EXT-X-I-FRAME-STREAM-INF URI。
 - EXT-X-KEY URI。
-- EXT-X-SESSION-KEY URI。
 - EXT-X-MAP URI。
 - 普通 URI 行。
 - 相对 URL。
@@ -1418,6 +1417,20 @@ HLS 必须形成完整的网关解析和改写闭环。
 - 查询参数。
 - HTTP Range。
 - EXT-X-BYTERANGE。
+
+首批加密密钥只支持能够由当前 FFmpeg 环境安全处理的 AES-128 方式。
+
+首批不支持：
+
+- EXT-X-SESSION-KEY URI 属性。
+- DRM。
+- SAMPLE-AES。
+- Low-Latency HLS 的 PART、PRELOAD-HINT 等资源引用。
+- Content Steering。
+- 尚未实现的其他 URI 扩展标签。
+- 无法安全处理的特殊密钥格式。
+
+对于上述不支持的资源，必须拒绝请求或标记 UNKNOWN，不得静默忽略，不得原样交给 FFmpeg 访问。
 
 处理顺序：
 
