@@ -358,7 +358,10 @@ jobs:
             test "$(read_status CapPrm)" = "0000000000000000"
             test "$(read_status CapInh)" = "0000000000000000"
             test "$(read_status CapAmb)" = "0000000000000000"
-            test "$(read_status CapBnd)" = "0000000000000000"
+
+            # CapBnd intentionally retains only the three startup capabilities.
+            test "$(read_status CapBnd)" = "00000000000010c0"
+
             test "$(read_status NoNewPrivs)" = "1"
 
             echo "Running process UID/GID and capability state verified."
