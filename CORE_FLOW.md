@@ -1791,51 +1791,127 @@ MPEG-TS 和 MP4 是媒体封装或资源格式，不是独立的网络传输协�
 
 所有网关和 HLS 参数必须由 settings.py 统一管理。
 
+网关和 HLS 的限制必须同时生效，不允许某个模块只执行其中一套限制。
+
+### A. 网关映射预算
+
 至少包括：
 
-### 网关映射
-
 - gateway_mapping_ttl_seconds：任务映射有效期。
-- gateway_max_mappings_per_task：单任务最大映射数量。
-- gateway_resource_id_bytes：资源标识随机强度。
-- gateway_request_timeout：单次网关请求超时。
-- gateway_max_response_bytes：单个普通响应最大字节数。
-- gateway_max_redirect_hops：最大重定向跳数。
+- gateway_max_mappings_per_task：单任务全部资源映射的最大数量。
+- gateway_resource_id_bytes：资源标识随机字节数。
+- gateway_request_timeout：普通网关请求超时。
+- gateway_max_response_bytes：普通网关响应最大字节数。
+- gateway_max_redirect_hops：普通网关请求最大重定向跳数。
 - gateway_max_header_count：允许的最大请求头数量。
 - gateway_max_header_value_bytes：单个请求头最大字节数。
 - gateway_max_header_total_bytes：请求头总字节数上限。
 
-### HLS
+gateway_max_mappings_per_task 统计当前任务全部有效映射，包括：
 
-- hls_max_resources：单任务最大 HLS 子资源数量。
+1. 原始媒体入口映射。
+2. HLS 子播放列表映射。
+3. HLS 媒体分片映射。
+4. HLS 初始化分片映射。
+5. HLS 密钥映射。
+6. 其他已经明确支持的 HLS 子资源映射。
+
+所有映射共用同一个任务级总数量上限。
+
+### B. HLS 专用预算
+
+至少包括：
+
+- hls_max_resources：单个播放列表允许解析的最大子资源 URI 条目数。
 - hls_max_depth：最大嵌套播放列表深度。
-- hls_max_playlist_bytes：单个播放列表最大字节数。
+- hls_max_playlist_bytes：单个 HLS 播放列表最大读取字节数。
 - hls_max_resource_bytes：单个 HLS 子资源最大响应字节数。
-- hls_max_total_bytes：单个 HLS 验证任务所有资源的总读取字节数上限。
-- hls_max_total_requests：单个 HLS 任务最大请求次数。
-- hls_max_concurrent_requests：单任务最大并发子资源请求数。
+- hls_max_total_bytes：单个 HLS 验证任务所有 HLS 资源的总读取字节数上限。
+- hls_max_total_requests：单个 HLS 验证任务最大请求次数。
+- hls_max_concurrent_requests：单个 HLS 验证任务最大并发子资源请求数。
 - hls_max_request_timeout：单个 HLS 子资源请求超时。
-- hls_max_mapping_count：单个 HLS 任务最大映射数量。
-- hls_max_redirect_hops：HLS 子资源最大重定向跳数。
+- hls_max_mapping_count：单个 HLS 验证任务累计创建的 HLS 子资源映射最大数量。
+- hls_max_redirect_hops：HLS 子资源请求最大重定向跳数。
 - hls_max_header_total_bytes：HLS 请求头总字节数上限。
 
-资源预算必须在整个验证任务范围内累计。
+两个数量限制必须明确区分：
 
-不能只限制单个分片大小，却允许大量分片使整个任务无限下载。
+- hls_max_resources：限制单个播放列表中解析的子资源 URI 条目数量。
+- hls_max_mapping_count：限制整个验证任务累计创建的 HLS 子资源映射数量。
+- gateway_max_mappings_per_task：限制整个验证任务全部资源映射数量，包括原始媒体入口映射和 HLS 子资源映射。
 
-达到总资源预算后，必须停止当前任务并根据证据标记 UNKNOWN。
+重复 URI 可以按规范化后的资源身份复用已有映射，但不得因此绕过请求次数、读取字节数和播放列表 URI 条目数限制。
 
-不得因为达到资源上限就影响其他独立线路继续验证。
+HLS 子资源映射必须同时满足：
 
-### 映射生命周期
+1. 不超过 hls_max_mapping_count。
+2. 不超过 gateway_max_mappings_per_task。
+3. 不超过其他适用的单任务资源预算。
 
-- 映射创建时记录创建时间和过期时间。
+任何一项达到上限，都必须停止当前任务继续创建相应映射。
+
+### C. 通用限制与 HLS 专用限制的关系
+
+通用网关限制和 HLS 专用限制必须同时生效。
+
+同一项资源使用多个上限时，实际生效值采用其中更严格的限制。
+
+具体规则：
+
+| 限制项目 | 实际生效规则 |
+|---|---|
+| HLS 请求超时 | min(gateway_request_timeout, hls_max_request_timeout) |
+| HLS 重定向跳数 | min(gateway_max_redirect_hops, hls_max_redirect_hops) |
+| HLS 请求头总字节数 | min(gateway_max_header_total_bytes, hls_max_header_total_bytes) |
+| HLS 子资源响应字节数 | min(gateway_max_response_bytes, hls_max_resource_bytes) |
+| HLS 播放列表字节数 | min(gateway_max_response_bytes, hls_max_resource_bytes, hls_max_playlist_bytes) |
+| HLS 全部映射数量 | 同时受 hls_max_mapping_count 和 gateway_max_mappings_per_task 限制 |
+
+这里的 min 表示取所有适用限制中的最小值。
+
+普通媒体资源不适用 HLS 专用限制，但仍必须遵守通用网关和单线路预算。
+
+如果其他通用单线路预算比 HLS 专用预算更严格，也必须优先执行更严格的限制。
+
+不得因为 HLS 有单独配置，就绕过通用资源上限。
+
+### D. 任务级累计预算
+
+所有任务级资源预算必须在整个验证任务范围内累计。
+
+至少包括：
+
+- 外部请求次数。
+- 重定向请求次数。
+- 实际读取字节数。
+- HLS 子资源数量。
+- HLS 映射数量。
+- 当前并发请求数量。
+- 当前任务创建的全部映射数量。
+
+重定向产生的每一次实际外部请求都必须计入请求次数。
+
+同一个任务内的并发请求必须共享同一份预算。
+
+预算检查和累计必须具备并发安全性，不能因多个请求同时执行而突破上限。
+
+不得只限制单个分片大小，却允许大量分片使整个任务无限下载。
+
+达到总资源预算后，必须停止当前任务的进一步资源请求，并根据故障证据标记 UNKNOWN。
+
+不得因为一条线路达到资源上限而影响其他独立线路继续验证。
+
+### E. 映射生命周期
+
+- 映射创建时记录创建时间和固定过期时间。
 - 映射不得超过 settings.py 规定的有效期。
-- 任务结束后立即清理。
+- 映射有效期不得因后续请求自动无限延长。
+- 任务正常结束后立即清理。
 - 任务异常退出时执行清理。
-- 网关定期清理已经过期的映射。
-- 清理失败的映射不得重新授权。
-- 不得因为请求仍在进行就无限延长映射有效期。
+- 网关必须定期清理已经过期的映射。
+- 清理失败的映射必须立即禁止继续授权。
+- 不得因为清理失败而让其他任务继续使用当前任务映射。
+- 不得让已过期或已结束任务的资源标识重新生效。
 
 ## 7.12 FFprobe 与 FFmpeg 验证规则
 
@@ -1892,6 +1968,8 @@ FFmpeg：
 
 ## 7.14 统一资源控制
 
+所有模块的资源限制必须统一管理。
+
 深度验证必须统一限制：
 
 - 来源请求超时。
@@ -1911,16 +1989,20 @@ FFmpeg：
 - 本轮最大验证线路数量。
 - 网关请求超时。
 - 网关最大响应字节数。
-- 最大重定向次数。
-- HLS 最大子资源数量。
-- HLS 最大嵌套深度。
-- HLS 单播放列表最大字节数。
-- HLS 单任务总读取字节数。
-- HLS 单任务最大请求次数。
-- HLS 最大并发请求数。
+- 网关最大重定向次数。
 - 网关映射有效期。
 - 网关映射最大数量。
 - 请求头数量和总字节数。
+- HLS 最大子资源 URI 条目数。
+- HLS 最大嵌套深度。
+- HLS 单播放列表最大字节数。
+- HLS 单子资源最大响应字节数。
+- HLS 单任务总读取字节数。
+- HLS 单任务最大请求次数。
+- HLS 最大并发请求数。
+- HLS 最大映射数量。
+- HLS 最大重定向次数。
+- HLS 请求头总字节数。
 - 容器 CPU 资源限制。
 - 容器内存资源限制。
 - 容器进程数量限制。
@@ -1941,7 +2023,7 @@ settings.py 至少应集中管理以下配置类别：
 | 媒体网关 | gateway_request_timeout、gateway_max_response_bytes、gateway_max_redirect_hops |
 | 网关映射 | gateway_mapping_ttl_seconds、gateway_max_mappings_per_task、gateway_resource_id_bytes |
 | 请求头 | gateway_max_header_count、gateway_max_header_value_bytes、gateway_max_header_total_bytes |
-| HLS | hls_max_resources、hls_max_depth、hls_max_playlist_bytes、hls_max_resource_bytes、hls_max_total_bytes、hls_max_total_requests、hls_max_concurrent_requests、hls_max_request_timeout、hls_max_mapping_count |
+| HLS | hls_max_resources、hls_max_depth、hls_max_playlist_bytes、hls_max_resource_bytes、hls_max_total_bytes、hls_max_total_requests、hls_max_concurrent_requests、hls_max_request_timeout、hls_max_mapping_count、hls_max_redirect_hops、hls_max_header_total_bytes |
 | Docker | validator_cpu_limit、validator_memory_limit、validator_pids_limit、gateway_cpu_limit、gateway_memory_limit |
 | 网络安全 | allowed_schemes、allowed_ports、IPv4 强制策略、禁止访问的地址范围、validator_net 子网和网关内部地址 |
 | 运行控制 | run_mode、运行级总超时、任务清理超时 |
