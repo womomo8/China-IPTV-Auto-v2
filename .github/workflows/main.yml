@@ -1,3 +1,4 @@
+
 name: M0-A, M0-B and M0-C Validator Security Precheck
 
 on:
@@ -337,10 +338,13 @@ jobs:
             exit 1
           fi
 
-          docker logs "$CONTAINER"
+          echo "=== Capture validator startup logs ==="
 
-          docker logs "$CONTAINER" | grep -Fq "Firewall loaded and verified."
-          docker logs "$CONTAINER" | grep -Fq "Validator privilege verification passed."
+          CONTAINER_LOGS="$(docker logs "$CONTAINER" 2>&1)"
+          printf '%s\n' "$CONTAINER_LOGS"
+
+          grep -Fq "Firewall loaded and verified." <<< "$CONTAINER_LOGS"
+          grep -Fq "Validator privilege verification passed." <<< "$CONTAINER_LOGS"
 
           echo "=== Verify actual running process privileges ==="
 
@@ -390,9 +394,12 @@ jobs:
             exit 1
           fi
 
-          docker logs "$NEGATIVE_CONTAINER" || true
+          echo "=== Capture negative-test logs ==="
 
-          docker logs "$NEGATIVE_CONTAINER" 2>&1 | grep -Fq "CapEff mismatch"
+          NEGATIVE_LOGS="$(docker logs "$NEGATIVE_CONTAINER" 2>&1 || true)"
+          printf '%s\n' "$NEGATIVE_LOGS"
+
+          grep -Fq "CapEff mismatch" <<< "$NEGATIVE_LOGS"
 
           echo "PASS: validator rejects startup without required capabilities."
           echo "M0-C actual validator image and privilege checks passed."
