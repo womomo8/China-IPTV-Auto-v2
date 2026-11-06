@@ -4,7 +4,7 @@ China-IPTV-Auto V3
 
 本项目以线路质量为第一目标，不追求线路数量。收集 1000 条，最终只有 20 条通过检测，就只发布这 20 条；不使用未经验证的线路凑数。
 
-«项目状态说明： 本仓库目前以 V3 设计规范和施工计划为依据逐步建设。文档描述的是目标架构，不代表所有程序已经实现，也不代表 Docker 网络隔离、媒体网关或线路检测已经通过实际测试。具体完成情况以代码、测试记录和 GitHub Actions 运行结果为准。»
+«项目状态说明：本仓库目前以 V3 设计规范和施工计划为依据逐步建设。文档描述的是目标架构，不代表所有程序已经实现，也不代表 Docker 网络隔离、媒体网关或线路检测已经通过实际测试。具体完成情况以代码、测试记录和 GitHub Actions 运行结果为准。»
 
 ---
 
@@ -18,11 +18,11 @@ China-IPTV-Auto V3
 2. 实际网络连接使用 IPv4。
 3. FFprobe 能够探测媒体流。
 4. FFmpeg 能够实际读取和解码媒体流。
-5. 用户所在网络能够正常播放。
+5. 用户实际使用环境能够正常播放。
 
 前四项云端检测通过，不等于第五项一定成立。
 
-本项目目前不具备中国大陆移动、联通、电信等运营商真实网络环境的实测条件。 因此，云端检测结果不能宣传为国内运营商播放保证，也不提供未经实际验证的运营商可用标签。
+本项目以 GitHub Actions Runner 所在网络环境的检测结果作为本轮判断依据。云端检测通过，仅表示线路在本轮 Runner 所处网络环境和规定检测条件下通过，不能保证其他网络环境或用户设备一定能够正常播放。
 
 ---
 
@@ -31,20 +31,20 @@ China-IPTV-Auto V3
 V3 固定采用五个业务阶段：
 
 第一阶段：广泛发现
-        |
-        v
+|
+v
 第二阶段：数据整理
-        |
-        v
+|
+v
 第三阶段：快速筛选
-        |
-        v
+|
+v
 第四阶段：深度验证
-        |
-        v
+|
+v
 第五阶段：安全发布
-        |
-        v
+|
+v
 output/iptv.m3u
 
 各阶段职责：
@@ -57,7 +57,7 @@ output/iptv.m3u
 
 Docker 网络隔离的可行性验证属于正式业务流程开始前的工程准备，不属于第六个业务阶段。必须先通过安全隔离测试，才能开展正式深度验证。
 
-详细流程以 ""CORE_FLOW.md"" (CORE_FLOW.md) 为准。
+详细流程以 "CORE_FLOW.md" 为准。
 
 ---
 
@@ -80,28 +80,28 @@ Docker 网络隔离的可行性验证属于正式业务流程开始前的工程�
 目标结构：
 
 GitHub Actions
-      |
-      v
-  pipeline.py
-      |
-      v
-  validator.py
-      |
-      v
- Docker Compose
-      |
-      +----------------------+
-      |                      |
-      v                      v
- FFmpeg 验证容器          媒体网关
-      |                      |
-      |                      v
-      |                network_guard.py
-      |                      |
-      +----受控请求----------+
-                             |
-                             v
-                         外部媒体源
+|
+v
+pipeline.py
+|
+v
+validator.py
+|
+v
+Docker Compose
+|
++----------------------+
+|                      |
+v                      v
+FFmpeg 验证容器          媒体网关
+|                      |
+|                      v
+|                network_guard.py
+|                      |
++----受控请求----------+
+|
+v
+外部媒体源
 
 核心要求：
 
@@ -113,7 +113,7 @@ GitHub Actions
 - HLS 主播放列表及受支持的子资源请求必须经过网关。
 - 不支持或无法安全处理的媒体请求必须拒绝，不能绕过网关直接访问。
 
-重要： Docker "internal: true" 是网络隔离的基础，不是隔离成功的证明。必须通过 GitHub Actions 实际安全测试，确认 IPv4、IPv6 和其他网络绕行方式均受到限制。未通过安全关卡，不得让 FFmpeg 直接联网作为替代方案。
+重要：Docker "internal: true" 是网络隔离的基础，不是隔离成功的证明。必须通过 GitHub Actions 实际安全测试，确认 IPv4、IPv6 和其他网络绕行方式均受到限制。未通过安全关卡，不得让 FFmpeg 直接联网作为替代方案。
 
 ---
 
@@ -124,8 +124,7 @@ GitHub Actions
 China-IPTV-Auto-v3/
 |
 |-- .github/
-|   `-- workflows/
-|       `-- main.yml
+|   "-- workflows/ |       "-- main.yml
 |
 |-- tests/
 |   |-- test_network_guard.py
@@ -135,26 +134,7 @@ China-IPTV-Auto-v3/
 |   |-- test_network_isolation.py
 |   |-- test_validator.py
 |   |-- test_publisher.py
-|   `-- test_pipeline.py
-|
-|-- settings.py
-|-- sources.txt
-|-- network_guard.py
-|-- discovery.py
-|-- normalize.py
-|-- media_gateway.py
-|-- validator.py
-|-- publisher.py
-|-- pipeline.py
-|
-|-- Dockerfile.gateway
-|-- Dockerfile.validator
-|-- compose.yaml
-|
-|-- requirements.txt
-|
-|-- output/
-|   `-- iptv.m3u
+|   "-- test_pipeline.py | |-- settings.py |-- sources.txt |-- network_guard.py |-- discovery.py |-- normalize.py |-- media_gateway.py |-- validator.py |-- publisher.py |-- pipeline.py | |-- Dockerfile.gateway |-- Dockerfile.validator |-- compose.yaml | |-- requirements.txt | |-- output/ |   "-- iptv.m3u
 |
 |-- README.md
 |-- MASTER_PLAN.md
@@ -222,7 +202,7 @@ China-IPTV-Auto-v3/
 
 唯一正式订阅文件：
 
-output/iptv.m3u
+"output/iptv.m3u"
 
 预期订阅地址：
 
@@ -251,7 +231,7 @@ https://raw.githubusercontent.com/womomo8/China-IPTV-Auto-v3/main/output/iptv.m3
 1. 质量优先，不以线路数量为目标。
 2. 只发布通过全部必要检查的线路。
 3. 不用未经验证的线路凑数。
-4. 不把云端检测冒充国内运营商真实网络实测。
+4. 如实说明云端检测结果的适用范围，不将其视为所有用户网络的播放保证。
 5. 不建设不必要的复杂评分、数据库和历史关系系统。
 6. 保持一个业务入口、一套配置、一条业务流程和一个正式订阅。
 7. 不允许 FFmpeg 绕过媒体网关直接联网。
@@ -260,4 +240,4 @@ https://raw.githubusercontent.com/womomo8/China-IPTV-Auto-v3/main/output/iptv.m3
 10. 全局环境故障时保护上一份正式订阅。
 11. 未经实际测试和验收，不宣称功能已经完成。
 
-最终原则： 先验证工程和网络安全方案，再按照固定五阶段逐步建设。每个里程碑都必须有实际测试证据；只有必要检查全部通过，才允许正式发布。
+最终原则：先验证工程和网络安全方案，再按照固定五阶段逐步建设。每个里程碑都必须有实际测试证据；只有必要检查全部通过，才允许正式发布。
