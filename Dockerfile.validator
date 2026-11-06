@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 FROM debian:bookworm-slim
 
 LABEL org.opencontainers.image.title="China-IPTV-Auto V3 Validator"
@@ -24,8 +26,8 @@ RUN apt-get update \
         validator \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cat > /usr/local/sbin/validator-entrypoint <<'ENTRYPOINT' \
-    && chmod 0755 /usr/local/sbin/validator-entrypoint
+RUN <<'DOCKERFILE_RUN'
+cat > /usr/local/sbin/validator-entrypoint <<'ENTRYPOINT'
 #!/bin/sh
 set -eu
 
@@ -97,6 +99,9 @@ exec setpriv \
     --clear-groups \
     "$@"
 ENTRYPOINT
+
+chmod 0755 /usr/local/sbin/validator-entrypoint
+DOCKERFILE_RUN
 
 WORKDIR /tmp
 
