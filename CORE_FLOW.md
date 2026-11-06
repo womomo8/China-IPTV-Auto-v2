@@ -1393,6 +1393,211 @@ FFmpeg 只能访问由 validator.py 为当前验证任务创建的内部网关�
 
 必须在网关内部验证当前请求对应的有效任务映射。
 
+### 控制面与媒体面分离
+
+网关任务控制和 FFmpeg 媒体访问必须使用两条不同的接口路径。
+
+控制面只负责创建和清理验证任务。
+
+媒体面只负责访问当前任务已经授权的媒体资源。
+
+不得把任务管理接口开放成 HTTP 公网接口。
+
+#### A. 控制接口
+
+控制接口固定采用 Docker Compose exec + Unix Domain Socket。
+
+执行关系：
+
+    GitHub Actions Runner
+            |
+            v
+        pipeline.py
+            |
+            v
+        validator.py
+            |
+            v
+    docker compose exec -T
+            |
+            v
+    media-gateway 容器
+            |
+            v
+    media_gateway.py --control
+            |
+            v
+    Unix Domain Socket
+            |
+            v
+    当前运行的 media_gateway.py 服务进程
+
+固定要求：
+
+1. validator.py 在 Runner 上运行，负责调用 Docker Compose 控制命令。
+2. validator.py 通过 docker compose exec -T 在 media-gateway 容器内启动控制客户端。
+3. 控制客户端与网关服务端使用 Unix Domain Socket 通信。
+4. 控制客户端和网关服务端必须使用同一个 media_gateway.py 文件。
+5. --control 只是 media_gateway.py 的内部控制执行模式，不是第二个业务入口。
+6. 控制客户端不得启动第二个网关服务进程。
+7. 控制接口只允许创建任务和清理任务两种操作。
+8. 不增加 gateway_client.py、worker_server.py 或其他重复控制模块。
+9. 不向 validator 容器挂载 Docker Socket。
+10. 不向 media-gateway 容器挂载 Docker Socket。
+11. 不将 Unix Domain Socket 挂载给 validator 容器。
+12. 不通过宿主机端口映射暴露控制接口。
+13. 不新增网关管理 TCP 端口。
+
+Unix Domain Socket 固定要求：
+
+- 使用 settings.py 管理的固定 Socket 路径。
+- Socket 所在目录权限为 0700。
+- Socket 文件权限为 0600。
+- 网关使用固定非 root UID/GID 运行。
+- 控制客户端使用与网关服务进程相同的非 root UID/GID。
+- 服务端检查本地连接进程的 UID。
+- 不接受其他 UID 的控制请求。
+- 不允许 FFmpeg 容器访问该 Socket。
+- 服务重启时必须安全检查并清理本进程遗留的 Socket。
+- 不得跟随或覆盖不属于当前网关用户的符号链接或普通文件。
+
+media-gateway 容器必须使用固定非 root 用户运行。
+
+控制接口通过 Unix Domain Socket 的文件权限和进程身份进行授权，不额外引入控制 Token。
+
+#### B. 控制请求格式
+
+控制请求通过 docker compose exec -T 的标准输入传递。
+
+不得通过命令行参数、环境变量或临时公开文件传递原始媒体 URL 和必要请求头。
+
+创建任务请求至少包含：
+
+- operation：create_task。
+- run_id：本轮运行标识。
+- task_id：当前验证任务标识。
+- url：原始媒体 URL。
+- headers：必要请求头。
+
+创建任务成功返回：
+
+- status：操作结果。
+- run_id：本轮运行标识。
+- task_id：验证任务标识。
+- resource_url：当前任务专用的内部网关媒体资源地址。
+
+resource_url 只能用于当前验证任务。
+
+网关生成资源标识，不允许 validator.py 自行指定资源标识。
+
+清理任务请求至少包含：
+
+- operation：delete_task。
+- run_id：本轮运行标识。
+- task_id：验证任务标识。
+
+清理任务成功返回：
+
+- status：清理结果。
+- run_id：本轮运行标识。
+- task_id：验证任务标识。
+- bytes_read：当前任务累计读取字节数。
+- request_count：当前任务累计请求次数。
+- terminal_error_code：任务结束时存在的终止错误代码；没有则为空。
+
+控制请求和响应必须使用明确的结构化格式。
+
+必须验证字段类型、字段数量、字段长度和请求大小。
+
+只允许已经定义的控制操作。
+
+不得接受任意命令、任意文件路径或任意外部 URL 访问指令。
+
+不得记录完整控制请求、原始 URL、敏感请求头或资源授权标识。
+
+#### C. 控制数据传递安全
+
+1. validator.py 通过标准输入向控制客户端传递 JSON 请求。
+2. 控制客户端通过 Unix Domain Socket 将请求转交给正在运行的网关进程。
+3. 控制请求不得出现在命令行参数中。
+4. 控制请求不得通过环境变量传递。
+5. 不得将控制请求写入 Artifact、Manifest 或公开运行报告。
+6. 不得把原始 URL 和敏感请求头写入普通日志。
+7. 控制响应中的 resource_url 不得写入普通日志。
+8. FFmpeg 只能获得当前任务的 resource_url。
+9. FFmpeg 不得获得控制接口、控制请求或任务管理权限。
+10. FFmpeg 不得获得原始外部媒体 URL。
+
+resource_url 中的资源标识属于授权凭证。
+
+validator.py 必须防止其进入普通日志和公开运行报告。
+
+FFmpeg 执行错误和网关错误必须在输出给日志之前进行敏感信息清理。
+
+#### D. 媒体访问接口
+
+媒体接口固定为：
+
+    GET  /v1/resources/{resource_id}
+    HEAD /v1/resources/{resource_id}
+
+只允许访问当前有效任务映射对应的资源。
+
+媒体网关必须：
+
+1. 验证资源标识。
+2. 验证资源所属任务。
+3. 验证本轮运行和任务状态。
+4. 验证映射有效期。
+5. 验证资源访问类型。
+6. 检查请求头和 Range 请求。
+7. 通过 network_guard.py 访问外部资源。
+8. 统一累计任务资源预算。
+9. 记录必要的任务级错误和资源消耗。
+10. 拒绝任何不属于当前任务的资源访问。
+
+媒体网关 HTTP 服务只绑定：
+
+    172.30.10.2:8080
+
+健康检查只用于确认网关服务是否正常。
+
+健康检查不得提供任务列表、原始 URL、敏感请求头或资源授权信息。
+
+不得通过 HTTP 接口创建任意任务。
+
+不得通过 HTTP 接口删除其他任务。
+
+不得将 Unix Domain Socket 控制接口转换成额外的 HTTP 管理接口。
+
+#### E. 调用顺序
+
+每条线路的深度验证固定执行：
+
+1. validator.py 创建唯一 task_id。
+2. validator.py 通过 Docker Compose exec 调用网关控制客户端。
+3. 控制客户端通过 Unix Domain Socket 请求创建任务。
+4. media_gateway.py 验证请求并创建任务级资源映射。
+5. 网关返回当前任务专用 resource_url。
+6. validator.py 将 resource_url 交给 FFprobe。
+7. 根据 FFprobe 结果执行 FFmpeg 实际读取或解码验证。
+8. validator.py 收集检测结果和资源消耗。
+9. validator.py 通过控制接口请求清理任务。
+10. 网关立即使当前任务全部资源映射失效。
+11. validator.py 输出统一验证结果。
+
+任何情况下都不得将原始外部媒体 URL 交给 FFmpeg。
+
+任务清理必须放在异常安全的清理路径中。
+
+任务正常结束、超时、FFprobe 失败、FFmpeg 失败或验证进程异常时，都必须尽力执行任务清理。
+
+如果控制 Socket 不可用、任务创建失败或清理失败，必须根据影响范围判定 NODE_ERROR。
+
+清理失败时必须阻止该任务映射重新授权，并由网关映射 TTL 机制进行兜底清理。
+
+不得因为清理失败而让其他任务继续使用当前任务的映射。
+
 ### 请求头处理
 
 必要请求头由 validator.py 创建任务时交给网关。
