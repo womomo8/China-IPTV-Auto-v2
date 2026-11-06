@@ -8,6 +8,7 @@ LABEL org.opencontainers.image.description="Isolated FFmpeg and FFprobe validati
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HOME=/tmp
 ENV TMPDIR=/tmp
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -31,34 +32,59 @@ cat > /usr/local/sbin/validator-entrypoint <<'ENTRYPOINT'
 #!/bin/sh
 set -eu
 
-if [ "$(id -u)" -ne 0 ]; then
-    echo "ERROR: validator entrypoint must start as root." >&2
+fail() {
+    echo "ERROR: $*" >&2
     exit 1
-fi
+}
 
-if ! command -v nft >/dev/null 2>&1; then
-    echo "ERROR: nftables is not installed." >&2
-    exit 1
-fi
+read_status() {
+    awk -v key="$1" '$1 == key ":" {print $2}' /proc/self/status
+}
 
-if ! command -v setpriv >/dev/null 2>&1; then
-    echo "ERROR: setpriv is not installed." >&2
-    exit 1
-fi
+check_status() {
+    field="$1"
+    expected="$2"
+    actual="$(read_status "$field")"
 
-if ! command -v ffmpeg >/dev/null 2>&1; then
-    echo "ERROR: FFmpeg is not installed." >&2
-    exit 1
-fi
+    [ -n "$actual" ] || fail "Cannot read $field from /proc/self/status."
 
-if ! command -v ffprobe >/dev/null 2>&1; then
-    echo "ERROR: FFprobe is not installed." >&2
-    exit 1
-fi
+    [ "$actual" = "$expected" ] || fail \
+        "$field mismatch: expected $expected, got $actual."
+}
+
+[ "$(id -u)" = "0" ] || fail \
+    "Validator initialization must start as root."
+
+command -v nft >/dev/null 2>&1 || fail \
+    "nftables is not installed."
+
+command -v setpriv >/dev/null 2>&1 || fail \
+    "setpriv is not installed."
+
+command -v ffmpeg >/dev/null 2>&1 || fail \
+    "FFmpeg is not installed."
+
+command -v ffprobe >/dev/null 2>&1 || fail \
+    "FFprobe is not installed."
+
+# Docker Compose must remove every default capability
+# and add only NET_ADMIN, SETUID and SETGID.
+# Their capability bitmask is 0x10c0.
+
+EXPECTED_START_CAPS="00000000000010c0"
+EXPECTED_EMPTY_CAPS="0000000000000000"
+
+check_status CapEff "$EXPECTED_START_CAPS"
+check_status CapPrm "$EXPECTED_START_CAPS"
+check_status CapBnd "$EXPECTED_START_CAPS"
+check_status CapInh "$EXPECTED_EMPTY_CAPS"
+check_status CapAmb "$EXPECTED_EMPTY_CAPS"
 
 if [ "$#" -eq 0 ]; then
     set -- sleep infinity
 fi
+
+echo "Validator startup capability check passed."
 
 echo "Loading validator network firewall..."
 
@@ -87,20 +113,79 @@ table inet validator_filter {
 }
 NFT
 
-nft list table inet validator_filter >/dev/null
+nft list table inet validator_filter >/dev/null \
+    || fail "Firewall table verification failed."
 
-echo "Firewall loaded successfully."
-echo "Dropping privileges to validator UID 10001..."
+echo "Firewall loaded and verified."
+
+echo "Dropping all remaining capabilities and switching to validator UID/GID..."
 
 exec setpriv \
-    --no-new-privs \
     --reuid=10001 \
     --regid=10001 \
     --clear-groups \
-    "$@"
+    --inh-caps=-all \
+    --ambient-caps=-all \
+    --bounding-set=-all \
+    --no-new-privs \
+    /usr/local/sbin/validator-user-entrypoint "$@"
+
+fail "Privilege dropping unexpectedly returned."
 ENTRYPOINT
 
-chmod 0755 /usr/local/sbin/validator-entrypoint
+cat > /usr/local/sbin/validator-user-entrypoint <<'USER_ENTRYPOINT'
+#!/bin/sh
+set -eu
+
+fail() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+read_status() {
+    awk -v key="$1" '$1 == key ":" {print $2}' /proc/self/status
+}
+
+check_status() {
+    field="$1"
+    expected="$2"
+    actual="$(read_status "$field")"
+
+    [ -n "$actual" ] || fail "Cannot read $field from /proc/self/status."
+
+    [ "$actual" = "$expected" ] || fail \
+        "$field mismatch: expected $expected, got $actual."
+}
+
+EXPECTED_EMPTY_CAPS="0000000000000000"
+
+[ "$(id -u)" = "10001" ] || fail \
+    "Process is not running as UID 10001."
+
+[ "$(id -g)" = "10001" ] || fail \
+    "Process is not running as GID 10001."
+
+check_status CapEff "$EXPECTED_EMPTY_CAPS"
+check_status CapPrm "$EXPECTED_EMPTY_CAPS"
+check_status CapInh "$EXPECTED_EMPTY_CAPS"
+check_status CapAmb "$EXPECTED_EMPTY_CAPS"
+check_status CapBnd "$EXPECTED_EMPTY_CAPS"
+check_status NoNewPrivs "1"
+
+echo "Validator privilege verification passed."
+echo "UID: $(id -u)"
+echo "GID: $(id -g)"
+echo "CapEff: $(read_status CapEff)"
+echo "CapPrm: $(read_status CapPrm)"
+echo "CapBnd: $(read_status CapBnd)"
+echo "NoNewPrivs: $(read_status NoNewPrivs)"
+
+exec "$@"
+USER_ENTRYPOINT
+
+chmod 0755 \
+    /usr/local/sbin/validator-entrypoint \
+    /usr/local/sbin/validator-user-entrypoint
 DOCKERFILE_RUN
 
 WORKDIR /tmp
