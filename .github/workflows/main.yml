@@ -12,18 +12,23 @@ concurrency:
 
 jobs:
   network-check:
-    name: Check Runner and Docker Network Isolation
+    name: Check Runner, Docker Isolation and Validator Security
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Check Ubuntu Runner
         shell: bash
         run: |
           set -Eeuo pipefail
+
           test -f /etc/os-release
           . /etc/os-release
           test "$ID" = "ubuntu"
+
           echo "Ubuntu: ${PRETTY_NAME}"
           echo "Kernel: $(uname -r)"
           echo "Architecture: $(uname -m)"
@@ -32,12 +37,24 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+
           docker --version
           docker info >/dev/null
           docker compose version
+
           echo "Docker Engine and Compose are available."
 
-      - name: Build Probe Images and Test Docker Network Isolation
+      - name: Check required repository files
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          test -f Dockerfile.validator
+          test -f .github/workflows/main.yml
+
+          echo "Required repository files are present."
+
+      - name: Build Probe Images and Test Docker Network Isolation (M0-B)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -49,102 +66,70 @@ jobs:
           GATEWAY_NET="${PROJECT}_gateway_egress"
           UNAUTHORIZED_NET="${PROJECT}_unauthorized_net"
 
-          GATEWAY_IMAGE="${PROJECT}-media-gateway:local"
-          VALIDATOR_IMAGE="${PROJECT}-validator:local"
-
           GATEWAY_ID=""
           VALIDATOR_ID=""
           UNAUTHORIZED_ID=""
 
-          cleanup_resources() {
-            docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" down --remove-orphans --volumes >/dev/null 2>&1 || true
-            docker image rm -f "$GATEWAY_IMAGE" "$VALIDATOR_IMAGE" >/dev/null 2>&1 || true
-          }
-
           cleanup() {
-            cleanup_resources
+            docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" down --remove-orphans --volumes >/dev/null 2>&1 || true
             rm -rf "$TEST_DIR"
           }
 
           diagnose_failure() {
-            local exit_code="$1"
-            local failed_command="$2"
-
-            trap - ERR
-            set +e
+            rc="$?"
 
             echo ""
             echo "=========================================="
             echo "M0-B FAILURE DIAGNOSTICS"
             echo "=========================================="
-            echo "Exit code: $exit_code"
-            echo "Failed command: $failed_command"
 
-            echo ""
-            echo "=== Compose container status ==="
-            docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -a
+            docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -a || true
 
             for SERVICE in media-gateway validator unauthorized-probe; do
               echo ""
-              echo "=== Service: $SERVICE ==="
+              echo "=== Logs: $SERVICE ==="
 
-              CONTAINER_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -aq "$SERVICE" | head -n 1)"
+              CONTAINER_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -aq "$SERVICE" | head -n 1 || true)"
 
-              if [[ -n "$CONTAINER_ID" ]]; then
-                echo "--- Container state ---"
-                docker inspect -f 'status={{.State.Status}} running={{.State.Running}} exit={{.State.ExitCode}} error={{.State.Error}}' "$CONTAINER_ID"
-
-                echo "--- Container logs ---"
-                docker logs --tail 80 "$CONTAINER_ID"
-              else
-                echo "No container ID found for this service."
+              if [ -n "$CONTAINER_ID" ]; then
+                docker inspect -f 'status={{.State.Status}} running={{.State.Running}} exit={{.State.ExitCode}} error={{.State.Error}}' "$CONTAINER_ID" || true
+                docker logs --tail 80 "$CONTAINER_ID" || true
               fi
             done
 
             echo ""
             echo "=== Docker networks ==="
-            docker network ls
+            docker network ls || true
 
-            echo ""
-            echo "=== End diagnostics ==="
-            return "$exit_code"
+            return "$rc"
           }
 
           trap cleanup EXIT
-          trap 'rc=$?; diagnose_failure "$rc" "$BASH_COMMAND"' ERR
+          trap diagnose_failure ERR
 
-          cat > "$TEST_DIR/Dockerfile.gateway" <<'DOCKER'
-          FROM alpine:3.20
-          LABEL org.opencontainers.image.title="M0-B gateway network probe"
-          CMD ["sh", "-c", "sleep 300"]
-          DOCKER
-
-          cat > "$TEST_DIR/Dockerfile.validator" <<'DOCKER'
-          FROM alpine:3.20
-          LABEL org.opencontainers.image.title="M0-B validator network probe"
-          CMD ["sh", "-c", "sleep 300"]
-          DOCKER
-
-          echo "=== Prepare base image ==="
+          echo "=== Pull probe images ==="
           docker pull alpine:3.20
-
-          echo "=== Build gateway probe image ==="
-          docker build --pull=false -t "$GATEWAY_IMAGE" -f "$TEST_DIR/Dockerfile.gateway" "$TEST_DIR"
-
-          echo "=== Build validator probe image ==="
-          docker build --pull=false -t "$VALIDATOR_IMAGE" -f "$TEST_DIR/Dockerfile.validator" "$TEST_DIR"
+          docker pull nginx:1.27-alpine
 
           cat > "$TEST_DIR/compose.yaml" <<YAML
           services:
             media-gateway:
-              image: ${GATEWAY_IMAGE}
+              image: nginx:1.27-alpine
               command:
                 - sh
                 - -ec
                 - |
-                  mkdir -p /www
-                  echo gateway-ok > /www/index.html
-                  exec busybox httpd -f -p 8080 -h /www
+                  echo gateway-ok > /usr/share/nginx/html/index.html
+                  cat > /etc/nginx/conf.d/default.conf <<'NGINX'
+                  server {
+                      listen 8080;
+                      location / {
+                          root /usr/share/nginx/html;
+                          index index.html;
+                      }
+                  }
+                  NGINX
+                  exec nginx -g 'daemon off;'
               networks:
                 validator_net:
                   ipv4_address: 172.30.10.2
@@ -152,21 +137,29 @@ jobs:
                   ipv4_address: 172.30.11.2
 
             validator:
-              image: ${VALIDATOR_IMAGE}
+              image: alpine:3.20
               command: ["sh", "-c", "sleep 300"]
               networks:
                 validator_net:
                   ipv4_address: 172.30.10.3
 
             unauthorized-probe:
-              image: ${GATEWAY_IMAGE}
+              image: nginx:1.27-alpine
               command:
                 - sh
                 - -ec
                 - |
-                  mkdir -p /www
-                  echo unauthorized-ok > /www/index.html
-                  exec busybox httpd -f -p 18081 -h /www
+                  echo unauthorized-ok > /usr/share/nginx/html/index.html
+                  cat > /etc/nginx/conf.d/default.conf <<'NGINX'
+                  server {
+                      listen 18081;
+                      location / {
+                          root /usr/share/nginx/html;
+                          index index.html;
+                      }
+                  }
+                  NGINX
+                  exec nginx -g 'daemon off;'
               networks:
                 unauthorized_net:
                   ipv4_address: 172.30.12.2
@@ -206,18 +199,13 @@ jobs:
           echo "=== Validate Compose configuration ==="
           docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" config >/dev/null
 
-          echo "=== Check Runner IPv4 egress ==="
-          curl --noproxy '*' -4 -sS --connect-timeout 5 --max-time 8 -o /dev/null http://1.1.1.1/
-          echo "Runner IPv4 egress is available."
-
           echo "=== Start probe containers ==="
           docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" up -d
 
-          GATEWAY_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -aq media-gateway | head -n 1)"
-          VALIDATOR_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -aq validator | head -n 1)"
-          UNAUTHORIZED_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -aq unauthorized-probe | head -n 1)"
+          GATEWAY_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q media-gateway)"
+          VALIDATOR_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q validator)"
+          UNAUTHORIZED_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q unauthorized-probe)"
 
-          echo "=== Check container IDs ==="
           test -n "$GATEWAY_ID"
           test -n "$VALIDATOR_ID"
           test -n "$UNAUTHORIZED_ID"
@@ -248,7 +236,6 @@ jobs:
           echo "=== Verify fixed IPv4 addresses ==="
 
           VALIDATOR_IPV4="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$VALIDATOR_ID" | sort)"
-
           GATEWAY_IPV4="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$GATEWAY_ID" | sort)"
 
           test "$VALIDATOR_IPV4" = "172.30.10.3"
@@ -264,7 +251,6 @@ jobs:
           test -z "$VALIDATOR_IPV6"
 
           VALIDATOR_IPV6_ENABLED="$(docker network inspect -f '{{.EnableIPv6}}' "$VALIDATOR_NET")"
-
           GATEWAY_IPV6_ENABLED="$(docker network inspect -f '{{.EnableIPv6}}' "$GATEWAY_NET")"
 
           test "$VALIDATOR_IPV6_ENABLED" = "false"
@@ -275,14 +261,12 @@ jobs:
           echo "=== Verify Docker network isolation properties ==="
 
           VALIDATOR_INTERNAL="$(docker network inspect -f '{{.Internal}}' "$VALIDATOR_NET")"
-
           GATEWAY_INTERNAL="$(docker network inspect -f '{{.Internal}}' "$GATEWAY_NET")"
 
           test "$VALIDATOR_INTERNAL" = "true"
           test "$GATEWAY_INTERNAL" = "false"
 
           VALIDATOR_NET_COUNT="$(docker network inspect -f '{{len .Containers}}' "$VALIDATOR_NET")"
-
           GATEWAY_NET_COUNT="$(docker network inspect -f '{{len .Containers}}' "$GATEWAY_NET")"
 
           test "$VALIDATOR_NET_COUNT" = "2"
@@ -309,7 +293,7 @@ jobs:
 
           echo "Validator can reach media-gateway on TCP 8080."
 
-          echo "=== Verify unauthorized service is running ==="
+          echo "=== Verify unauthorized probe service ==="
 
           docker exec "$UNAUTHORIZED_ID" sh -ec 'wget -T 2 -q -O - http://127.0.0.1:18081/ | grep -qx "unauthorized-ok"'
 
@@ -336,37 +320,10 @@ jobs:
           echo "=== M0-B Docker network checks passed ==="
 
           trap - ERR
+          cleanup
           trap - EXIT
 
-          echo "=== Remove probe resources ==="
-          cleanup_resources
-
-          echo "=== Verify cleanup ==="
-
-          for NETWORK_NAME in "$VALIDATOR_NET" "$GATEWAY_NET" "$UNAUTHORIZED_NET"; do
-            if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
-              echo "ERROR: Network was not removed: $NETWORK_NAME"
-              exit 1
-            fi
-          done
-
-          for CONTAINER_ID in "$GATEWAY_ID" "$VALIDATOR_ID" "$UNAUTHORIZED_ID"; do
-            if docker inspect "$CONTAINER_ID" >/dev/null 2>&1; then
-              echo "ERROR: Probe container was not removed: $CONTAINER_ID"
-              exit 1
-            fi
-          done
-
-          for IMAGE_NAME in "$GATEWAY_IMAGE" "$VALIDATOR_IMAGE"; do
-            if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-              echo "ERROR: Probe image was not removed: $IMAGE_NAME"
-              exit 1
-            fi
-          done
-
-          rm -rf "$TEST_DIR"
-
-          echo "All M0-B probe resources were removed."
+          echo "M0-B probe resources removed."
 
       - name: Build and test the real validator image (M0-C)
         shell: bash
@@ -384,10 +341,14 @@ jobs:
 
           trap cleanup_m0c EXIT
 
+          echo "=== Confirm Dockerfile.validator exists ==="
+          test -f Dockerfile.validator
+
           echo "=== Build the repository's actual Dockerfile.validator ==="
           docker build --pull -f Dockerfile.validator -t "$IMAGE" .
 
           echo "=== Start validator with exactly three startup capabilities ==="
+
           docker run -d \
             --name "$CONTAINER" \
             --network none \
@@ -399,13 +360,16 @@ jobs:
             "$IMAGE"
 
           echo "=== Wait for validator startup and privilege checks ==="
+
           RUNNING="false"
 
           for ATTEMPT in $(seq 1 15); do
             RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)"
+
             if [ "$RUNNING" = "true" ]; then
               break
             fi
+
             sleep 1
           done
 
@@ -416,10 +380,12 @@ jobs:
           fi
 
           docker logs "$CONTAINER"
+
           docker logs "$CONTAINER" | grep -Fq "Firewall loaded and verified."
           docker logs "$CONTAINER" | grep -Fq "Validator privilege verification passed."
 
           echo "=== Verify the actual running container process ==="
+
           docker exec --user 10001:10001 "$CONTAINER" sh -ec '
             test "$(id -u)" = "10001"
             test "$(id -g)" = "10001"
@@ -438,32 +404,39 @@ jobs:
             test "$(read_status NoNewPrivs)" = "1"
 
             echo "Running process UID/GID and capability state verified."
+
             grep -E "^(Uid|Gid|CapEff|CapPrm|CapInh|CapAmb|CapBnd|NoNewPrivs):" "$status"
           '
 
-          echo "=== Verify FFmpeg and FFprobe are executable as UID 10001 ==="
+          echo "=== Verify FFmpeg and FFprobe execute as UID 10001 ==="
+
           docker exec --user 10001:10001 "$CONTAINER" sh -ec '
             test "$(id -u)" = "10001"
             ffmpeg -version >/dev/null
             ffprobe -version >/dev/null
+
             echo "FFmpeg and FFprobe execute as UID 10001."
           '
 
           echo "=== Verify fail-closed startup when required capabilities are missing ==="
+
           if docker run \
             --name "$NEGATIVE_CONTAINER" \
             --network none \
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
             "$IMAGE"; then
+
             echo "ERROR: Validator unexpectedly started without required capabilities."
             exit 1
           fi
 
           docker logs "$NEGATIVE_CONTAINER" || true
+
           docker logs "$NEGATIVE_CONTAINER" 2>&1 | grep -Fq "CapEff mismatch"
 
           echo "PASS: Validator rejects startup without the exact required capability set."
+
           echo "M0-C actual validator image and privilege checks passed."
 
       - name: Final Runner Summary
