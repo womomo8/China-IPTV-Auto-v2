@@ -507,6 +507,7 @@ validator 容器必须在自己的网络命名空间内建立 nftables 防火墙
 规则缺失或加载失败时，validator 容器不得进入正常验证状态。
 
 ## 3.5 防火墙初始化与权限降级
+## 3.5 防火墙初始化与权限降级
 
 Dockerfile.validator 必须提供：
 
@@ -514,28 +515,52 @@ Dockerfile.validator 必须提供：
 - FFprobe。
 - nftables。
 - setpriv 所需工具。
-- 固定非 root 验证用户。
+- 固定 UID/GID 的非 root 验证用户。
 
 启动顺序固定为：
 
-1. validator 容器启动阶段以 root 身份运行初始化。
-2. 仅为加载 nftables 规则临时授予 NET_ADMIN。
-3. 加载并检查防火墙规则。
-4. 通过 setpriv 移除 NET_ADMIN 能力。
-5. 降权到固定非 root 用户。
-6. 使用非 root 身份运行容器常驻进程。
-7. validator.py 执行 docker compose exec 时明确指定非 root 用户。
-8. FFprobe 和 FFmpeg 始终以非 root 身份运行。
+1. validator 容器启动阶段以 root 身份运行初始化入口。
+2. 必须先移除容器全部默认 Linux capabilities。
+3. 启动阶段仅明确添加以下三项必要能力：
+   - NET_ADMIN：仅用于加载本容器网络命名空间内的 nftables 规则。
+   - SETUID：仅用于通过 setpriv 切换到固定非 root 用户。
+   - SETGID：仅用于通过 setpriv 切换到固定非 root 用户组并清除附加组。
+4. 加载 nftables 规则。
+5. 检查防火墙规则确实存在。
+6. 检查通过后，立即通过 setpriv 切换到固定 UID/GID 的非 root 用户。
+7. setpriv 必须启用 no-new-privileges。
+8. 权限切换后，常驻进程及其启动的 FFmpeg/FFprobe 必须以非 root 身份运行。
+9. 常驻进程及 FFmpeg/FFprobe 的 CapEff 和 CapPrm 均不得包含 NET_ADMIN、SETUID、SETGID。
+10. validator.py 执行 docker compose exec 时必须显式指定固定非 root 用户。
 
-NET_ADMIN 只用于启动阶段加载本容器网络命名空间内的防火墙规则。
+NET_ADMIN、SETUID 和 SETGID 只允许用于启动阶段的防火墙初始化及身份切换，不得作为 FFmpeg/FFprobe 的运行权限长期保留。
 
-不得让 FFmpeg/FFprobe 长期拥有 NET_ADMIN。
+不得仅凭 setpriv 或 no-new-privileges 配置，就认定启动能力已经全部清除。
+
+必须通过实际容器测试检查：
+
+- 运行进程的 UID。
+- 运行进程的 GID。
+- /proc/self/status 中的 CapEff。
+- /proc/self/status 中的 CapPrm。
+- /proc/self/status 中的 NoNewPrivs。
+
+必须确认：
+
+- 进程以固定非 root 用户运行。
+- CapEff 不包含 NET_ADMIN、SETUID、SETGID。
+- CapPrm 不包含 NET_ADMIN、SETUID、SETGID。
+- NoNewPrivs 为启用状态。
+
+不得仅根据 Docker Compose 配置文本认定权限隔离已经成功。
+
+不得让 FFmpeg/FFprobe 以 root 身份运行。
 
 不得使用 privileged 或 host 网络模式。
 
 不得挂载 Docker Socket。
 
-防火墙加载失败、权限降级失败或启动检查失败，均不得继续深度验证。
+防火墙加载失败、规则检查失败、权限降级失败或容器启动检查失败，均不得继续深度验证。
 
 ## 3.6 M0 施工任务
 
@@ -576,9 +601,14 @@ NET_ADMIN 只用于启动阶段加载本容器网络命名空间内的防火墙�
 - 网关其他端口无法访问。
 - 防火墙规则缺失时容器不能正常启动。
 - 防火墙加载失败时容器不能正常启动。
-- NET_ADMIN 能力在启动后移除。
+- validator 启动前已移除全部默认 Linux capabilities。
+- 启动阶段仅保留 NET_ADMIN、SETUID、SETGID 三项必要能力。
+- nftables 规则加载并检查通过。
+- setpriv 成功切换到固定 UID/GID 的非 root 用户。
+- 常驻进程及 FFmpeg/FFprobe 的 CapEff 不包含 NET_ADMIN、SETUID、SETGID。
+- 常驻进程及 FFmpeg/FFprobe 的 CapPrm 不包含 NET_ADMIN、SETUID、SETGID。
+- NoNewPrivs 为启用状态。
 - FFmpeg/FFprobe 使用非 root 用户。
-- FFmpeg/FFprobe 进程不具备 NET_ADMIN。
 
 **M0-D：媒体网关外部访问**
 
@@ -646,17 +676,17 @@ NET_ADMIN 只用于启动阶段加载本容器网络命名空间内的防火墙�
 - 网关其他端口不能被访问。
 - nftables 默认拒绝规则有效。
 - nftables 规则加载失败时容器不能继续运行。
-- NET_ADMIN 能力已移除。
+- validator 已移除全部默认 Linux capabilities。
+- 启动阶段仅使用 NET_ADMIN、SETUID、SETGID 三项必要能力。
+- setpriv 成功切换到固定非 root 用户。
+- 常驻进程及 FFmpeg/FFprobe 的 CapEff、CapPrm 均不包含上述三项启动能力。
+- NoNewPrivs 为启用状态。
 - FFmpeg/FFprobe 使用非 root 用户。
 - 网关不能被用作任意 IP 转发器。
 - DNS 检查与实际连接目标绑定有效。
 - 重定向逐跳检查有效。
 - HLS 受支持子资源经过网关。
 - 关键绕行测试全部通过。
-
-M0 未通过时，不允许进入正式深度验证施工。
-
-不允许用取消隔离或 FFmpeg 直接联网代替固定架构。
 
 ## 3.8 M0 交付物
 
