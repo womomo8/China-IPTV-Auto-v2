@@ -24,11 +24,9 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
           test -f /etc/os-release
           . /etc/os-release
           test "$ID" = "ubuntu"
-
           echo "Ubuntu: ${PRETTY_NAME}"
           echo "Kernel: $(uname -r)"
           echo "Architecture: $(uname -m)"
@@ -37,29 +35,24 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
           docker --version
           docker info >/dev/null
           docker compose version
-
           echo "Docker Engine and Compose are available."
 
       - name: Check required repository files
         shell: bash
         run: |
           set -Eeuo pipefail
-
           test -f Dockerfile.validator
           test -f .github/workflows/main.yml
-
           echo "Required repository files are present."
 
-      - name: Build Probe Images and Test Docker Network Isolation (M0-B)
+      - name: Test Docker Network Isolation (M0-B)
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          TEST_DIR="$(mktemp -d)"
           PROJECT="m0b-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           VALIDATOR_NET="${PROJECT}_validator_net"
@@ -71,259 +64,226 @@ jobs:
           UNAUTHORIZED_ID=""
 
           cleanup() {
-            docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" down --remove-orphans --volumes >/dev/null 2>&1 || true
-            rm -rf "$TEST_DIR"
+            docker rm -f "$GATEWAY_ID" "$VALIDATOR_ID" "$UNAUTHORIZED_ID" >/dev/null 2>&1 || true
+            docker network rm "$VALIDATOR_NET" "$GATEWAY_NET" "$UNAUTHORIZED_NET" >/dev/null 2>&1 || true
           }
 
           diagnose_failure() {
             rc="$?"
-
             echo ""
-            echo "=========================================="
-            echo "M0-B FAILURE DIAGNOSTICS"
-            echo "=========================================="
+            echo "========== M0-B FAILURE DIAGNOSTICS =========="
 
-            docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -a || true
-
-            for SERVICE in media-gateway validator unauthorized-probe; do
-              echo ""
-              echo "=== Logs: $SERVICE ==="
-
-              CONTAINER_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -aq "$SERVICE" | head -n 1 || true)"
-
+            for CONTAINER_ID in "$GATEWAY_ID" "$VALIDATOR_ID" "$UNAUTHORIZED_ID"; do
               if [ -n "$CONTAINER_ID" ]; then
-                docker inspect -f 'status={{.State.Status}} running={{.State.Running}} exit={{.State.ExitCode}} error={{.State.Error}}' "$CONTAINER_ID" || true
+                docker inspect -f 'name={{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' "$CONTAINER_ID" || true
                 docker logs --tail 80 "$CONTAINER_ID" || true
               fi
             done
 
-            echo ""
-            echo "=== Docker networks ==="
             docker network ls || true
-
             return "$rc"
           }
 
           trap cleanup EXIT
           trap diagnose_failure ERR
 
-          echo "=== Pull probe images ==="
+          echo "=== Pull test images ==="
           docker pull alpine:3.20
           docker pull nginx:1.27-alpine
 
-          cat > "$TEST_DIR/compose.yaml" <<YAML
-          services:
-            media-gateway:
-              image: nginx:1.27-alpine
-              command:
-                - sh
-                - -ec
-                - |
-                  echo gateway-ok > /usr/share/nginx/html/index.html
-                  cat > /etc/nginx/conf.d/default.conf <<'NGINX'
-                  server {
-                      listen 8080;
-                      location / {
-                          root /usr/share/nginx/html;
-                          index index.html;
-                      }
-                  }
-                  NGINX
-                  exec nginx -g 'daemon off;'
-              networks:
-                validator_net:
-                  ipv4_address: 172.30.10.2
-                gateway_egress:
-                  ipv4_address: 172.30.11.2
+          echo "=== Create isolated networks ==="
 
-            validator:
-              image: alpine:3.20
-              command: ["sh", "-c", "sleep 300"]
-              networks:
-                validator_net:
-                  ipv4_address: 172.30.10.3
+          docker network create \
+            --driver bridge \
+            --internal \
+            --subnet 172.30.10.0/24 \
+            --gateway 172.30.10.1 \
+            "$VALIDATOR_NET"
 
-            unauthorized-probe:
-              image: nginx:1.27-alpine
-              command:
-                - sh
-                - -ec
-                - |
-                  echo unauthorized-ok > /usr/share/nginx/html/index.html
-                  cat > /etc/nginx/conf.d/default.conf <<'NGINX'
-                  server {
-                      listen 18081;
-                      location / {
-                          root /usr/share/nginx/html;
-                          index index.html;
-                      }
-                  }
-                  NGINX
-                  exec nginx -g 'daemon off;'
-              networks:
-                unauthorized_net:
-                  ipv4_address: 172.30.12.2
+          docker network create \
+            --driver bridge \
+            --subnet 172.30.11.0/24 \
+            --gateway 172.30.11.1 \
+            "$GATEWAY_NET"
 
-          networks:
-            validator_net:
-              name: ${VALIDATOR_NET}
-              driver: bridge
-              internal: true
-              enable_ipv6: false
-              ipam:
-                config:
-                  - subnet: 172.30.10.0/24
-                    gateway: 172.30.10.1
+          docker network create \
+            --driver bridge \
+            --internal \
+            --subnet 172.30.12.0/24 \
+            --gateway 172.30.12.1 \
+            "$UNAUTHORIZED_NET"
 
-            gateway_egress:
-              name: ${GATEWAY_NET}
-              driver: bridge
-              internal: false
-              enable_ipv6: false
-              ipam:
-                config:
-                  - subnet: 172.30.11.0/24
-                    gateway: 172.30.11.1
+          echo "=== Start gateway test container ==="
 
-            unauthorized_net:
-              name: ${UNAUTHORIZED_NET}
-              driver: bridge
-              internal: true
-              enable_ipv6: false
-              ipam:
-                config:
-                  - subnet: 172.30.12.0/24
-                    gateway: 172.30.12.1
-          YAML
+          GATEWAY_ID="$(docker run -d \
+            --name "${PROJECT}-gateway" \
+            --network "$VALIDATOR_NET" \
+            --ip 172.30.10.2 \
+            nginx:1.27-alpine \
+            sh -ec '
+              echo gateway-ok > /usr/share/nginx/html/index.html
+              cat > /etc/nginx/conf.d/default.conf <<NGINX
+          server {
+              listen 8080;
+              location / {
+                  root /usr/share/nginx/html;
+                  index index.html;
+              }
+          }
+          NGINX
+              exec nginx -g "daemon off;"
+            ')"
 
-          echo "=== Validate Compose configuration ==="
-          docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" config >/dev/null
+          docker network connect \
+            --ip 172.30.11.2 \
+            "$GATEWAY_NET" \
+            "$GATEWAY_ID"
 
-          echo "=== Start probe containers ==="
-          docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" up -d
+          echo "=== Start validator test container ==="
 
-          GATEWAY_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q media-gateway)"
-          VALIDATOR_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q validator)"
-          UNAUTHORIZED_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q unauthorized-probe)"
+          VALIDATOR_ID="$(docker run -d \
+            --name "${PROJECT}-validator" \
+            --network "$VALIDATOR_NET" \
+            --ip 172.30.10.3 \
+            alpine:3.20 \
+            sh -c 'sleep 300')"
 
-          test -n "$GATEWAY_ID"
-          test -n "$VALIDATOR_ID"
-          test -n "$UNAUTHORIZED_ID"
+          echo "=== Start unauthorized test container ==="
 
-          echo "=== Check container running states ==="
+          UNAUTHORIZED_ID="$(docker run -d \
+            --name "${PROJECT}-unauthorized" \
+            --network "$UNAUTHORIZED_NET" \
+            --ip 172.30.12.2 \
+            nginx:1.27-alpine \
+            sh -ec '
+              echo unauthorized-ok > /usr/share/nginx/html/index.html
+              cat > /etc/nginx/conf.d/default.conf <<NGINX
+          server {
+              listen 18081;
+              location / {
+                  root /usr/share/nginx/html;
+                  index index.html;
+              }
+          }
+          NGINX
+              exec nginx -g "daemon off;"
+            ')"
+
+          echo "=== Verify containers are running ==="
 
           for CONTAINER_ID in "$GATEWAY_ID" "$VALIDATOR_ID" "$UNAUTHORIZED_ID"; do
-            RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER_ID")"
-            test "$RUNNING" = "true"
+            test "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_ID")" = "true"
           done
 
-          echo "All three containers are running."
+          echo "All test containers are running."
 
           echo "=== Verify exact network membership ==="
 
           get_networks() {
-            docker inspect -f '{{range $name, $value := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$1" | sort
+            docker inspect -f '{{range $name, $value := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$1" \
+              | sed '/^[[:space:]]*$/d' \
+              | sort
           }
 
-          diff -u <(printf '%s\n' "$VALIDATOR_NET") <(get_networks "$VALIDATOR_ID")
+          diff -u \
+            <(printf '%s\n' "$VALIDATOR_NET") \
+            <(get_networks "$VALIDATOR_ID")
 
-          diff -u <(printf '%s\n' "$VALIDATOR_NET" "$GATEWAY_NET" | sort) <(get_networks "$GATEWAY_ID")
+          diff -u \
+            <(printf '%s\n' "$VALIDATOR_NET" "$GATEWAY_NET" | sort) \
+            <(get_networks "$GATEWAY_ID")
 
-          diff -u <(printf '%s\n' "$UNAUTHORIZED_NET") <(get_networks "$UNAUTHORIZED_ID")
+          diff -u \
+            <(printf '%s\n' "$UNAUTHORIZED_NET") \
+            <(get_networks "$UNAUTHORIZED_ID")
 
-          echo "Network membership is correct."
+          echo "PASS: exact network membership."
 
           echo "=== Verify fixed IPv4 addresses ==="
 
-          VALIDATOR_IPV4="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$VALIDATOR_ID" | sort)"
-          GATEWAY_IPV4="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$GATEWAY_ID" | sort)"
+          test "$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$VALIDATOR_ID")" = "172.30.10.3"
 
-          test "$VALIDATOR_IPV4" = "172.30.10.3"
+          GATEWAY_IPS="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$GATEWAY_ID" | sed '/^[[:space:]]*$/d' | sort)"
 
-          diff -u <(printf '%s\n' "172.30.10.2" "172.30.11.2" | sort) <(printf '%s\n' "$GATEWAY_IPV4")
+          diff -u \
+            <(printf '%s\n' "172.30.10.2" "172.30.11.2" | sort) \
+            <(printf '%s\n' "$GATEWAY_IPS")
 
-          echo "Fixed IPv4 addresses are correct."
+          echo "PASS: fixed IPv4 addresses."
 
           echo "=== Verify IPv6 is disabled ==="
 
-          VALIDATOR_IPV6="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{if .GlobalIPv6Address}}{{println .GlobalIPv6Address}}{{end}}{{end}}' "$VALIDATOR_ID")"
+          for NETWORK_NAME in "$VALIDATOR_NET" "$GATEWAY_NET" "$UNAUTHORIZED_NET"; do
+            IPV6_ENABLED="$(docker network inspect -f '{{.EnableIPv6}}' "$NETWORK_NAME")"
+            test "$IPV6_ENABLED" = "false"
+          done
 
-          test -z "$VALIDATOR_IPV6"
+          echo "PASS: IPv6 disabled."
 
-          VALIDATOR_IPV6_ENABLED="$(docker network inspect -f '{{.EnableIPv6}}' "$VALIDATOR_NET")"
-          GATEWAY_IPV6_ENABLED="$(docker network inspect -f '{{.EnableIPv6}}' "$GATEWAY_NET")"
+          echo "=== Verify network isolation properties ==="
 
-          test "$VALIDATOR_IPV6_ENABLED" = "false"
-          test "$GATEWAY_IPV6_ENABLED" = "false"
+          test "$(docker network inspect -f '{{.Internal}}' "$VALIDATOR_NET")" = "true"
+          test "$(docker network inspect -f '{{.Internal}}' "$UNAUTHORIZED_NET")" = "true"
+          test "$(docker network inspect -f '{{.Internal}}' "$GATEWAY_NET")" = "false"
 
-          echo "IPv6 is disabled on both networks."
+          test "$(docker network inspect -f '{{len .Containers}}' "$VALIDATOR_NET")" = "2"
+          test "$(docker network inspect -f '{{len .Containers}}' "$GATEWAY_NET")" = "1"
+          test "$(docker network inspect -f '{{len .Containers}}' "$UNAUTHORIZED_NET")" = "1"
 
-          echo "=== Verify Docker network isolation properties ==="
+          echo "PASS: network isolation properties."
 
-          VALIDATOR_INTERNAL="$(docker network inspect -f '{{.Internal}}' "$VALIDATOR_NET")"
-          GATEWAY_INTERNAL="$(docker network inspect -f '{{.Internal}}' "$GATEWAY_NET")"
-
-          test "$VALIDATOR_INTERNAL" = "true"
-          test "$GATEWAY_INTERNAL" = "false"
-
-          VALIDATOR_NET_COUNT="$(docker network inspect -f '{{len .Containers}}' "$VALIDATOR_NET")"
-          GATEWAY_NET_COUNT="$(docker network inspect -f '{{len .Containers}}' "$GATEWAY_NET")"
-
-          test "$VALIDATOR_NET_COUNT" = "2"
-          test "$GATEWAY_NET_COUNT" = "1"
-
-          echo "validator_net internal: $VALIDATOR_INTERNAL"
-          echo "gateway_egress internal: $GATEWAY_INTERNAL"
-          echo "gateway_egress attached container count: $GATEWAY_NET_COUNT"
-
-          echo "=== Verify gateway access on TCP 8080 ==="
+          echo "=== Verify validator can reach gateway TCP 8080 ==="
 
           GATEWAY_READY="false"
 
           for ATTEMPT in $(seq 1 15); do
-            if docker exec "$VALIDATOR_ID" sh -c 'wget -T 2 -q -O - http://172.30.10.2:8080/' 2>/dev/null | grep -qx 'gateway-ok'; then
+            if docker exec "$VALIDATOR_ID" sh -c \
+              'wget -T 2 -q -O - http://172.30.10.2:8080/' 2>/dev/null \
+              | grep -qx 'gateway-ok'; then
               GATEWAY_READY="true"
               break
             fi
-
             sleep 1
           done
 
           test "$GATEWAY_READY" = "true"
 
-          echo "Validator can reach media-gateway on TCP 8080."
+          echo "PASS: validator can reach gateway TCP 8080."
 
-          echo "=== Verify unauthorized probe service ==="
+          echo "=== Verify unauthorized test service ==="
 
-          docker exec "$UNAUTHORIZED_ID" sh -ec 'wget -T 2 -q -O - http://127.0.0.1:18081/ | grep -qx "unauthorized-ok"'
+          docker exec "$UNAUTHORIZED_ID" sh -ec \
+            'wget -T 2 -q -O - http://127.0.0.1:18081/ | grep -qx "unauthorized-ok"'
 
-          echo "Unauthorized probe service is ready."
+          echo "PASS: unauthorized test service is ready."
 
-          echo "=== Verify validator cannot access public IPv4 ==="
+          echo "=== Verify validator cannot reach public IPv4 ==="
 
-          if docker exec "$VALIDATOR_ID" sh -c 'wget -T 3 -q -O /dev/null http://1.1.1.1/'; then
+          if docker exec "$VALIDATOR_ID" sh -c \
+            'wget -T 3 -q -O /dev/null http://1.1.1.1/'; then
             echo "ERROR: validator unexpectedly reached public IPv4."
             exit 1
           fi
 
           echo "PASS: validator cannot reach public IPv4."
 
-          echo "=== Verify validator cannot access unauthorized container ==="
+          echo "=== Verify validator cannot reach unauthorized container ==="
 
-          if docker exec "$VALIDATOR_ID" sh -c 'wget -T 3 -q -O /dev/null http://172.30.12.2:18081/'; then
+          if docker exec "$VALIDATOR_ID" sh -c \
+            'wget -T 3 -q -O /dev/null http://172.30.12.2:18081/'; then
             echo "ERROR: validator unexpectedly reached unauthorized container."
             exit 1
           fi
 
           echo "PASS: validator cannot reach unauthorized container."
 
-          echo "=== M0-B Docker network checks passed ==="
+          echo "M0-B Docker network isolation checks passed."
 
           trap - ERR
           cleanup
           trap - EXIT
 
-          echo "M0-B probe resources removed."
+          echo "M0-B test resources removed."
 
       - name: Build and test the real validator image (M0-C)
         shell: bash
@@ -344,10 +304,10 @@ jobs:
           echo "=== Confirm Dockerfile.validator exists ==="
           test -f Dockerfile.validator
 
-          echo "=== Build the repository's actual Dockerfile.validator ==="
+          echo "=== Build actual validator image ==="
           docker build --pull -f Dockerfile.validator -t "$IMAGE" .
 
-          echo "=== Start validator with exactly three startup capabilities ==="
+          echo "=== Start validator with three startup capabilities ==="
 
           docker run -d \
             --name "$CONTAINER" \
@@ -359,17 +319,15 @@ jobs:
             --security-opt no-new-privileges:true \
             "$IMAGE"
 
-          echo "=== Wait for validator startup and privilege checks ==="
+          echo "=== Wait for validator startup ==="
 
           RUNNING="false"
 
           for ATTEMPT in $(seq 1 15); do
             RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)"
-
             if [ "$RUNNING" = "true" ]; then
               break
             fi
-
             sleep 1
           done
 
@@ -384,7 +342,7 @@ jobs:
           docker logs "$CONTAINER" | grep -Fq "Firewall loaded and verified."
           docker logs "$CONTAINER" | grep -Fq "Validator privilege verification passed."
 
-          echo "=== Verify the actual running container process ==="
+          echo "=== Verify actual running process privileges ==="
 
           docker exec --user 10001:10001 "$CONTAINER" sh -ec '
             test "$(id -u)" = "10001"
@@ -408,17 +366,16 @@ jobs:
             grep -E "^(Uid|Gid|CapEff|CapPrm|CapInh|CapAmb|CapBnd|NoNewPrivs):" "$status"
           '
 
-          echo "=== Verify FFmpeg and FFprobe execute as UID 10001 ==="
+          echo "=== Verify FFmpeg and FFprobe as UID 10001 ==="
 
           docker exec --user 10001:10001 "$CONTAINER" sh -ec '
             test "$(id -u)" = "10001"
             ffmpeg -version >/dev/null
             ffprobe -version >/dev/null
-
             echo "FFmpeg and FFprobe execute as UID 10001."
           '
 
-          echo "=== Verify fail-closed startup when required capabilities are missing ==="
+          echo "=== Verify startup fails without required capabilities ==="
 
           if docker run \
             --name "$NEGATIVE_CONTAINER" \
@@ -426,7 +383,6 @@ jobs:
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
             "$IMAGE"; then
-
             echo "ERROR: Validator unexpectedly started without required capabilities."
             exit 1
           fi
@@ -435,14 +391,13 @@ jobs:
 
           docker logs "$NEGATIVE_CONTAINER" 2>&1 | grep -Fq "CapEff mismatch"
 
-          echo "PASS: Validator rejects startup without the exact required capability set."
-
+          echo "PASS: validator rejects startup without required capabilities."
           echo "M0-C actual validator image and privilege checks passed."
 
       - name: Final Runner Summary
         if: always()
         shell: bash
         run: |
-          echo "M0-A/M0-B/M0-C Docker and validator security precheck finished."
+          echo "Precheck job finished. Check the individual step results above."
           docker ps -a || true
           docker network ls || true
