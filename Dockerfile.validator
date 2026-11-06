@@ -1,0 +1,107 @@
+FROM debian:bookworm-slim
+
+LABEL org.opencontainers.image.title="China-IPTV-Auto V3 Validator"
+LABEL org.opencontainers.image.description="Isolated FFmpeg and FFprobe validation environment"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV HOME=/tmp
+ENV TMPDIR=/tmp
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        nftables \
+        util-linux \
+        passwd \
+    && groupadd --gid 10001 validator \
+    && useradd \
+        --uid 10001 \
+        --gid 10001 \
+        --no-create-home \
+        --home-dir /nonexistent \
+        --shell /usr/sbin/nologin \
+        validator \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cat > /usr/local/sbin/validator-entrypoint <<'ENTRYPOINT' \
+    && chmod 0755 /usr/local/sbin/validator-entrypoint
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: validator entrypoint must start as root." >&2
+    exit 1
+fi
+
+if ! command -v nft >/dev/null 2>&1; then
+    echo "ERROR: nftables is not installed." >&2
+    exit 1
+fi
+
+if ! command -v setpriv >/dev/null 2>&1; then
+    echo "ERROR: setpriv is not installed." >&2
+    exit 1
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "ERROR: FFmpeg is not installed." >&2
+    exit 1
+fi
+
+if ! command -v ffprobe >/dev/null 2>&1; then
+    echo "ERROR: FFprobe is not installed." >&2
+    exit 1
+fi
+
+if [ "$#" -eq 0 ]; then
+    set -- sleep infinity
+fi
+
+echo "Loading validator network firewall..."
+
+nft -f - <<'NFT'
+flush ruleset
+
+table inet validator_filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iifname "lo" accept
+        ct state established,related accept
+    }
+
+    chain output {
+        type filter hook output priority filter; policy drop;
+
+        oifname "lo" accept
+        ct state established,related accept
+
+        ip daddr 127.0.0.11 udp dport 53 accept
+        ip daddr 127.0.0.11 tcp dport 53 accept
+
+        ip daddr 172.30.10.2 tcp dport 8080 accept
+    }
+}
+NFT
+
+nft list table inet validator_filter >/dev/null
+
+echo "Firewall loaded successfully."
+echo "Dropping privileges to validator UID 10001..."
+
+exec setpriv \
+    --no-new-privs \
+    --reuid=10001 \
+    --regid=10001 \
+    --clear-groups \
+    "$@"
+ENTRYPOINT
+
+WORKDIR /tmp
+
+ENTRYPOINT ["/usr/local/sbin/validator-entrypoint"]
+
+CMD ["sleep", "infinity"]
+
+STOPSIGNAL SIGTERM
