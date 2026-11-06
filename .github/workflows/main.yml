@@ -1,4 +1,4 @@
-name: M0-A and M0-B Docker Network Precheck
+name: M0-A, M0-B and M0-C Validator Security Precheck
 
 on:
   workflow_dispatch:
@@ -368,10 +368,108 @@ jobs:
 
           echo "All M0-B probe resources were removed."
 
+      - name: Build and test the real validator image (M0-C)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          IMAGE="china-iptv-v3-validator:m0c-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          CONTAINER="m0c-validator-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          NEGATIVE_CONTAINER="${CONTAINER}-missing-caps"
+
+          cleanup_m0c() {
+            docker rm -f "$CONTAINER" "$NEGATIVE_CONTAINER" >/dev/null 2>&1 || true
+            docker image rm -f "$IMAGE" >/dev/null 2>&1 || true
+          }
+
+          trap cleanup_m0c EXIT
+
+          echo "=== Build the repository's actual Dockerfile.validator ==="
+          docker build --pull -f Dockerfile.validator -t "$IMAGE" .
+
+          echo "=== Start validator with exactly three startup capabilities ==="
+          docker run -d \
+            --name "$CONTAINER" \
+            --network none \
+            --cap-drop ALL \
+            --cap-add NET_ADMIN \
+            --cap-add SETUID \
+            --cap-add SETGID \
+            --security-opt no-new-privileges:true \
+            "$IMAGE"
+
+          echo "=== Wait for validator startup and privilege checks ==="
+          RUNNING="false"
+
+          for ATTEMPT in $(seq 1 15); do
+            RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)"
+            if [ "$RUNNING" = "true" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$RUNNING" != "true" ]; then
+            echo "ERROR: Validator did not remain running."
+            docker logs "$CONTAINER" || true
+            exit 1
+          fi
+
+          docker logs "$CONTAINER"
+          docker logs "$CONTAINER" | grep -Fq "Firewall loaded and verified."
+          docker logs "$CONTAINER" | grep -Fq "Validator privilege verification passed."
+
+          echo "=== Verify the actual running container process ==="
+          docker exec --user 10001:10001 "$CONTAINER" sh -ec '
+            test "$(id -u)" = "10001"
+            test "$(id -g)" = "10001"
+
+            status="/proc/1/status"
+
+            read_status() {
+              sed -n "s/^$1:[[:space:]]*//p" "$status"
+            }
+
+            test "$(read_status CapEff)" = "0000000000000000"
+            test "$(read_status CapPrm)" = "0000000000000000"
+            test "$(read_status CapInh)" = "0000000000000000"
+            test "$(read_status CapAmb)" = "0000000000000000"
+            test "$(read_status CapBnd)" = "0000000000000000"
+            test "$(read_status NoNewPrivs)" = "1"
+
+            echo "Running process UID/GID and capability state verified."
+            grep -E "^(Uid|Gid|CapEff|CapPrm|CapInh|CapAmb|CapBnd|NoNewPrivs):" "$status"
+          '
+
+          echo "=== Verify FFmpeg and FFprobe are executable as UID 10001 ==="
+          docker exec --user 10001:10001 "$CONTAINER" sh -ec '
+            test "$(id -u)" = "10001"
+            ffmpeg -version >/dev/null
+            ffprobe -version >/dev/null
+            echo "FFmpeg and FFprobe execute as UID 10001."
+          '
+
+          echo "=== Verify fail-closed startup when required capabilities are missing ==="
+          if docker run \
+            --name "$NEGATIVE_CONTAINER" \
+            --network none \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            "$IMAGE"; then
+            echo "ERROR: Validator unexpectedly started without required capabilities."
+            exit 1
+          fi
+
+          docker logs "$NEGATIVE_CONTAINER" || true
+          docker logs "$NEGATIVE_CONTAINER" 2>&1 | grep -Fq "CapEff mismatch"
+
+          echo "PASS: Validator rejects startup without the exact required capability set."
+          echo "M0-C actual validator image and privilege checks passed."
+
       - name: Final Runner Summary
         if: always()
         shell: bash
         run: |
-          echo "M0-A/M0-B Docker network precheck finished."
+          echo "M0-A/M0-B/M0-C Docker and validator security precheck finished."
           docker ps -a || true
           docker network ls || true
