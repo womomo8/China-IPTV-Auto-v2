@@ -1793,7 +1793,7 @@ MPEG-TS 和 MP4 是媒体封装或资源格式，不是独立的网络传输协�
 
 网关和 HLS 的限制必须同时生效，不允许某个模块只执行其中一套限制。
 
-### A. 网关映射预算
+### A. 网关映射和请求预算
 
 至少包括：
 
@@ -1803,6 +1803,7 @@ MPEG-TS 和 MP4 是媒体封装或资源格式，不是独立的网络传输协�
 - gateway_request_timeout：普通网关请求超时。
 - gateway_max_response_bytes：普通网关响应最大字节数。
 - gateway_max_redirect_hops：普通网关请求最大重定向跳数。
+- gateway_max_requests_per_task：单个验证任务最大外部 HTTP 请求次数。
 - gateway_max_header_count：允许的最大请求头数量。
 - gateway_max_header_value_bytes：单个请求头最大字节数。
 - gateway_max_header_total_bytes：请求头总字节数上限。
@@ -1817,6 +1818,23 @@ gateway_max_mappings_per_task 统计当前任务全部有效映射，包括：
 6. 其他已经明确支持的 HLS 子资源映射。
 
 所有映射共用同一个任务级总数量上限。
+
+gateway_max_requests_per_task 统计当前任务所有实际外部 HTTP 请求尝试。
+
+必须计入：
+
+1. 原始媒体请求。
+2. HLS 主播放列表请求。
+3. HLS 子播放列表请求。
+4. HLS 媒体分片请求。
+5. HLS 初始化分片请求。
+6. HLS 密钥请求。
+7. 每一次重定向产生的新请求。
+8. 上层重试产生的新请求。
+
+DNS 查询本身不计入 HTTP 请求次数。
+
+连接失败的外部请求尝试也必须按统一规则计入，不能通过反复连接尝试绕过任务预算。
 
 ### B. HLS 专用预算
 
@@ -1834,13 +1852,13 @@ gateway_max_mappings_per_task 统计当前任务全部有效映射，包括：
 - hls_max_redirect_hops：HLS 子资源请求最大重定向跳数。
 - hls_max_header_total_bytes：HLS 请求头总字节数上限。
 
-两个数量限制必须明确区分：
+三个数量限制必须明确区分：
 
 - hls_max_resources：限制单个播放列表中解析的子资源 URI 条目数量。
 - hls_max_mapping_count：限制整个验证任务累计创建的 HLS 子资源映射数量。
 - gateway_max_mappings_per_task：限制整个验证任务全部资源映射数量，包括原始媒体入口映射和 HLS 子资源映射。
 
-重复 URI 可以按规范化后的资源身份复用已有映射，但不得因此绕过请求次数、读取字节数和播放列表 URI 条目数限制。
+重复 URI 可以按规范化后的资源身份复用已有映射，但不得因此绕过请求次数、实际读取字节数和播放列表 URI 条目数限制。
 
 HLS 子资源映射必须同时满足：
 
@@ -1866,6 +1884,8 @@ HLS 子资源映射必须同时满足：
 | HLS 子资源响应字节数 | min(gateway_max_response_bytes, hls_max_resource_bytes) |
 | HLS 播放列表字节数 | min(gateway_max_response_bytes, hls_max_resource_bytes, hls_max_playlist_bytes) |
 | HLS 全部映射数量 | 同时受 hls_max_mapping_count 和 gateway_max_mappings_per_task 限制 |
+| HLS 总请求次数 | min(gateway_max_requests_per_task, hls_max_total_requests) |
+| HLS 单任务总读取字节数 | 同时受 hls_max_total_bytes 和适用的 max_media_bytes 限制 |
 
 这里的 min 表示取所有适用限制中的最小值。
 
@@ -1884,12 +1904,14 @@ HLS 子资源映射必须同时满足：
 - 外部请求次数。
 - 重定向请求次数。
 - 实际读取字节数。
-- HLS 子资源数量。
+- HLS 子资源 URI 条目数量。
 - HLS 映射数量。
 - 当前并发请求数量。
 - 当前任务创建的全部映射数量。
 
 重定向产生的每一次实际外部请求都必须计入请求次数。
+
+上层有限重试产生的每一次新请求也必须计入请求次数。
 
 同一个任务内的并发请求必须共享同一份预算。
 
@@ -1912,6 +1934,8 @@ HLS 子资源映射必须同时满足：
 - 清理失败的映射必须立即禁止继续授权。
 - 不得因为清理失败而让其他任务继续使用当前任务映射。
 - 不得让已过期或已结束任务的资源标识重新生效。
+
+
 
 ## 7.12 FFprobe 与 FFmpeg 验证规则
 
@@ -1990,6 +2014,7 @@ FFmpeg：
 - 网关请求超时。
 - 网关最大响应字节数。
 - 网关最大重定向次数。
+- 网关任务最大外部请求次数。
 - 网关映射有效期。
 - 网关映射最大数量。
 - 请求头数量和总字节数。
@@ -2020,7 +2045,7 @@ settings.py 至少应集中管理以下配置类别：
 | 来源发现 | source_timeout、source_max_bytes、max_source_count、source_retry、discovery_total_timeout、discovery_concurrency |
 | 快速筛选 | quick_connect_timeout、quick_read_timeout、quick_total_timeout、quick_concurrency |
 | 深度验证 | ffprobe_timeout、ffmpeg_timeout、max_media_bytes、max_media_duration、max_validation_jobs |
-| 媒体网关 | gateway_request_timeout、gateway_max_response_bytes、gateway_max_redirect_hops |
+| 媒体网关 | gateway_request_timeout、gateway_max_response_bytes、gateway_max_redirect_hops、gateway_max_requests_per_task |
 | 网关映射 | gateway_mapping_ttl_seconds、gateway_max_mappings_per_task、gateway_resource_id_bytes |
 | 请求头 | gateway_max_header_count、gateway_max_header_value_bytes、gateway_max_header_total_bytes |
 | HLS | hls_max_resources、hls_max_depth、hls_max_playlist_bytes、hls_max_resource_bytes、hls_max_total_bytes、hls_max_total_requests、hls_max_concurrent_requests、hls_max_request_timeout、hls_max_mapping_count、hls_max_redirect_hops、hls_max_header_total_bytes |
@@ -2048,6 +2073,7 @@ Docker Compose 中必须使用与 settings.py 一致的固定网络地址和端�
 
 达到单线路预算时，应根据实际情况返回 FAIL 或 UNKNOWN，不得影响其他独立线路继续验证。
 
+
 ## 7.15 Dockerfile 和共享安全模块
 
 network_guard.py 是唯一共享网络安全策略实现。
@@ -2065,7 +2091,477 @@ Dockerfile.validator 只负责准备 FFmpeg/FFprobe 验证运行环境和必要�
 Dockerfile.validator 不承担 Python 业务调度，不复制 pipeline.py 的业务逻辑。
 
 两个 Dockerfile 的职责必须保持独立。
+### 7.15.1 network_guard.py Python 接口契约
 
+本节固定 network_guard.py 与 discovery.py、validator.py、media_gateway.py 之间的 Python 调用契约。
+
+本节属于权威技术规范。实际代码、测试和调用方必须遵循本节，不得各自创造不兼容的接口。
+
+#### A. 模块职责边界
+
+network_guard.py 是唯一共享网络安全实现。
+
+负责：
+
+1. URL 格式和协议检查。
+2. 主机名和端口检查。
+3. DNS A 记录解析。
+4. IPv4 地址安全检查。
+5. DNS 检查结果与实际 socket 连接地址绑定。
+6. HTTPS Host、TLS SNI 和证书验证。
+7. HTTP 重定向逐跳安全检查。
+8. 请求头安全检查。
+9. 超时和单次响应字节限制。
+10. 流式响应读取和任务预算回调。
+11. 统一网络错误分类。
+
+不负责：
+
+1. 线路发现和来源管理。
+2. 频道名称规范化。
+3. HLS 标签和 URI 解析。
+4. HLS 子资源映射创建。
+5. 网关任务创建和删除。
+6. 网关任务映射生命周期管理。
+7. 频道质量评分。
+8. M3U 发布。
+
+HLS 解析、URI 改写和映射创建由 media_gateway.py 负责。
+
+任务级资源预算由 media_gateway.py 创建并持有，network_guard.py 通过统一预算接口报告请求和读取消耗。
+
+#### B. 对外 Python 接口
+
+network_guard.py 必须提供 NetworkGuard 类。
+
+固定公开接口：
+
+    guard = NetworkGuard()
+
+    parsed = guard.parse_url(
+        url,
+        policy=policy,
+    )
+
+    with guard.open_url(
+        url,
+        method="GET",
+        headers=headers,
+        policy=policy,
+        budget=task_budget,
+        is_hls=True,
+    ) as response:
+        for chunk in response.iter_bytes():
+            process(chunk)
+
+其中：
+
+1. parse_url() 只执行静态 URL 检查，不发起 DNS 查询，不建立网络连接。
+2. parse_url() 返回 ParsedURL。
+3. parse_url() 成功不代表目标已经通过 DNS 和实际连接安全检查。
+4. open_url() 是唯一允许执行实际外部 HTTP/HTTPS 请求的公开接口。
+5. open_url() 内部必须完成 URL 检查、DNS 检查、IPv4 绑定、实际连接、TLS 验证和重定向检查。
+6. open_url() 成功返回 GuardedResponse。
+7. open_url() 不得把未经检查的原始 URL 交给其他 HTTP 客户端重新请求。
+8. method 首批只允许 GET 和 HEAD。
+9. headers 必须经过统一请求头检查。
+10. policy 必须由调用方根据 settings.py 统一配置创建，不得在 network_guard.py 内复制另一套业务默认值。
+11. media_gateway.py 发起的每次外部请求都必须传入当前任务的 budget。
+12. HLS 主播放列表和全部 HLS 子资源请求都必须将 is_hls 设置为 True。
+13. 普通 HTTP/HTTPS 媒体请求将 is_hls 设置为 False。
+14. discovery.py 和快速筛选也必须通过 open_url() 访问外部 HTTP/HTTPS 资源。
+
+不得为不同调用方另外实现一套 DNS、IP、TLS 或重定向安全逻辑。
+
+#### C. RequestPolicy 配置对象
+
+network_guard.py 必须提供不可变的 RequestPolicy 配置对象。
+
+至少包含：
+
+- allowed_schemes：允许的 URL 协议。
+- allowed_ports：允许的目标端口。
+- connect_timeout_seconds：连接阶段超时。
+- read_timeout_seconds：响应读取阶段超时。
+- total_timeout_seconds：单次完整请求总超时。
+- max_response_bytes：单次响应最大读取字节数。
+- max_redirect_hops：最大重定向跳数。
+- max_header_count：请求头最大数量。
+- max_header_value_bytes：单个请求头最大字节数。
+- max_header_total_bytes：请求头总字节数上限。
+
+所有参数必须由调用方从 settings.py 读取后传入。
+
+total_timeout_seconds 必须覆盖：
+
+1. DNS 查询。
+2. TCP 连接。
+3. TLS 握手。
+4. 所有重定向跳转。
+5. 最终响应读取。
+
+连接超时和读取超时不能突破总请求截止时间。
+
+max_response_bytes 限制单次响应。
+
+任务累计读取量由 RequestBudget 继续限制。
+
+IPv4-only 和 TLS 证书验证属于不可关闭的安全规则，不得设计关闭开关。
+
+不得通过设置 verify=False、关闭证书验证或允许 IPv6 fallback 来解决连接问题。
+
+#### D. URL 和 DNS 检查规则
+
+parse_url() 必须检查：
+
+1. URL 格式是否合法。
+2. 协议是否在允许范围内。
+3. 端口是否在允许范围内。
+4. 主机名是否有效。
+5. URL 是否包含用户名或密码。
+6. 是否包含非法控制字符。
+7. 是否使用不支持的 IPv6 字面地址。
+
+不得接受包含用户名或密码的 URL。
+
+不得将 URL 查询参数中的敏感信息写入普通日志。
+
+open_url() 对域名必须执行 DNS A 记录解析。
+
+固定要求：
+
+1. 每次新的外部请求都必须取得并检查当前 DNS 结果。
+2. 只允许使用符合要求的公网 IPv4。
+3. 不查询 AAAA 记录作为备用连接目标。
+4. DNS 没有可用 IPv4 A 记录时拒绝访问。
+5. 对 DNS 返回的所有目标地址执行安全检查。
+6. DNS 结果中只要存在不允许访问的目标地址，就拒绝当前目标，不得只过滤危险地址后继续尝试。
+7. DNS timeout、临时 SERVFAIL 等暂时异常必须返回可识别的临时错误。
+8. 明确 NXDOMAIN 和没有 IPv4 A 记录必须与临时 DNS 故障区分。
+9. DNS 查询必须受到 total_timeout_seconds 的限制。
+
+不得在 DNS 解析异常时使用未经检查的备用地址。
+
+#### E. 实际 IPv4 连接绑定
+
+实际网络连接必须使用已经完成安全检查的 IPv4 地址。
+
+固定要求：
+
+1. DNS 检查后选择符合要求的 IPv4。
+2. TCP socket 必须直接连接已经检查过的 IPv4 地址。
+3. 不得让底层 HTTP 客户端重新解析原始域名。
+4. 不得使用未经检查的备用 IP。
+5. 不得自动回退 IPv6。
+6. 不得读取 HTTP_PROXY、HTTPS_PROXY 等环境变量后使用外部代理。
+7. 不得通过连接池复用其他任务或其他目标的连接。
+8. 每次新的外部请求必须重新执行目标检查和连接绑定。
+9. 实际 socket 对端 IP 必须与选定的安全 IPv4 一致。
+
+如果一个 DNS 结果中存在多个符合要求的 IPv4，可以按明确规则尝试这些已经检查过的地址。
+
+连接失败后不得转向未检查的地址。
+
+HTTPS 请求必须：
+
+1. 使用原始域名作为 HTTP Host 的依据。
+2. 使用原始域名作为 TLS SNI。
+3. 保留正常 CA 证书验证。
+4. 保留证书主机名验证。
+5. 不得因为固定连接 IP 而关闭 TLS 验证。
+
+不得将检查时的域名与实际连接 IP 分离。
+
+#### F. 重定向处理
+
+network_guard.py 必须自行处理重定向。
+
+不得依赖 HTTP 客户端自动跟随重定向。
+
+首批跟随：
+
+- 301
+- 302
+- 303
+- 307
+- 308
+
+每一跳必须：
+
+1. 读取 Location。
+2. 正确处理相对 Location。
+3. 生成新的目标 URL。
+4. 重新执行 parse_url()。
+5. 重新解析 DNS。
+6. 重新检查全部目标地址。
+7. 重新绑定实际 IPv4。
+8. 重新执行 HTTPS 证书验证。
+9. 检查重定向次数。
+10. 检查重定向循环。
+
+HTTPS 跳转到 HTTP 必须拒绝，不允许静默降级。
+
+跨域重定向必须执行请求头隔离：
+
+1. Authorization 不得传递到新域名。
+2. Cookie 不得传递到新域名。
+3. Referer 不得跨域传递。
+4. 自定义认证请求头不得跨域传递。
+5. 跨域时只允许按固定安全规则保留 User-Agent、Accept、Range 等非敏感请求头。
+6. Host 必须由当前目标地址重新生成。
+7. 不得传递 Proxy-Authorization 或其他代理控制请求头。
+
+同一 origin 的重定向可以保留当前任务允许使用的必要请求头。
+
+每次重定向都必须计入任务外部请求次数。
+
+#### G. 请求头安全
+
+所有请求头必须在发送前统一检查。
+
+必须检查：
+
+- 请求头名称是否合法。
+- 请求头值不存在 CRLF 注入。
+- 请求头数量不超过限制。
+- 单个请求头大小不超过限制。
+- 请求头总字节数不超过限制。
+
+调用方不得自行覆盖：
+
+- Host。
+- Connection。
+- Transfer-Encoding。
+- Content-Length。
+- Proxy-Authorization。
+- 其他 hop-by-hop 或代理控制请求头。
+
+Host 必须根据当前实际目标自动生成。
+
+必要的 Authorization、Cookie 和自定义请求头只能绑定到当前任务映射。
+
+跨域重定向不得泄漏敏感请求头。
+
+#### H. GuardedResponse 响应对象
+
+open_url() 必须返回 GuardedResponse。
+
+至少提供：
+
+- status_code：最终 HTTP 状态码。
+- headers：最终响应头。
+- final_url：最终响应地址。
+- peer_ip：实际连接的 IPv4 地址。
+- redirect_hops：已经执行的重定向跳数。
+- iter_bytes(chunk_size)：受限分块读取。
+- read_all()：在单次响应字节上限内读取完整响应。
+- close()：关闭响应并释放资源。
+
+GuardedResponse 必须支持上下文管理器。
+
+不得向调用方暴露可以绕过限制的原始 socket 或底层 HTTP Response 对象。
+
+响应读取必须同时执行：
+
+1. Content-Length 提前检查。
+2. 实际读取字节累计。
+3. 单次响应最大字节数检查。
+4. 任务级累计字节预算检查。
+5. 总请求截止时间检查。
+
+没有 Content-Length 时，仍必须逐块检查实际读取字节数。
+
+响应读取异常时必须关闭连接并释放并发请求占用。
+
+调用方未读取完整响应时，也必须通过 close() 释放资源。
+
+final_url 可能包含敏感查询参数，不得写入普通日志或公开报告。
+
+peer_ip 用于记录和核对实际连接目标。
+
+HTTP 非重定向状态码由调用方根据业务规则判断，不得在 network_guard.py 内把所有非 2xx 响应统一解释成网络安全错误。
+
+#### I. RequestBudget 预算接口
+
+network_guard.py 必须定义 RequestBudget 接口约定。
+
+固定方法：
+
+    begin_request(*, is_hls: bool) -> None
+
+    consume_bytes(
+        byte_count: int,
+        *,
+        is_hls: bool,
+    ) -> None
+
+    end_request(*, is_hls: bool) -> None
+
+media_gateway.py 必须提供当前任务对应的预算对象，并传入 open_url()。
+
+预算对象必须：
+
+1. 绑定唯一 run_id 和 task_id。
+2. 具备线程安全能力。
+3. begin_request() 负责累计外部请求次数并申请并发请求占用。
+4. consume_bytes() 负责累计实际读取字节数。
+5. end_request() 负责释放并发请求占用。
+6. 预算超限时抛出明确的 BudgetExceeded 错误。
+7. 不得因多个并发请求同时执行而突破上限。
+8. 记录当前任务的请求次数、读取字节数和并发请求数量。
+
+每次外部请求尝试都必须累计。
+
+每次重定向产生的新请求必须重新执行 begin_request()。
+
+上层重试产生的新请求也必须重新累计。
+
+DNS 查询不计入 HTTP 外部请求次数。
+
+GuardedResponse 关闭、读取结束或发生异常时，必须保证对应的 end_request() 被执行。
+
+media_gateway.py 的任务预算对象还必须负责：
+
+- gateway_max_requests_per_task。
+- hls_max_total_requests。
+- max_media_bytes。
+- hls_max_total_bytes。
+- hls_max_concurrent_requests。
+- HLS URI 条目数量。
+- HLS 映射数量。
+- 网关全部映射数量。
+
+HLS 请求必须同时遵守通用网关预算和 HLS 专用预算。
+
+HLS 请求次数实际限制采用：
+
+    min(gateway_max_requests_per_task, hls_max_total_requests)
+
+普通媒体请求遵守 gateway_max_requests_per_task。
+
+network_guard.py 不得自行建立第二套任务数据库或映射存储。
+
+#### J. 统一错误对象
+
+network_guard.py 必须提供统一 GuardError 错误体系。
+
+每个错误至少包含：
+
+- code：稳定的机器可识别错误代码。
+- kind：错误类别。
+- retryable：是否允许有限重试。
+
+kind 固定区分：
+
+- REJECTED：明确违反访问规则或目标不符合准入要求。
+- TRANSIENT：单次临时网络或 DNS 故障。
+- UNSUPPORTED：当前版本不支持的访问方式。
+- BUDGET：资源预算达到上限。
+- ENVIRONMENT：网络安全模块或本地运行环境异常。
+
+至少区分以下错误代码：
+
+- INVALID_URL
+- UNSUPPORTED_SCHEME
+- UNSUPPORTED_PORT
+- DNS_NXDOMAIN
+- DNS_NO_IPV4
+- DNS_TEMPORARY
+- ADDRESS_NOT_ALLOWED
+- IPV4_CONNECT_FAILED
+- CONNECT_TIMEOUT
+- TLS_CERTIFICATE_ERROR
+- REDIRECT_LIMIT
+- REDIRECT_LOOP
+- HTTPS_DOWNGRADE
+- RESPONSE_TOO_LARGE
+- HEADER_INVALID
+- BUDGET_EXCEEDED
+- RESPONSE_READ_ERROR
+- INTERNAL_GUARD_ERROR
+
+错误分类与项目统一状态的关系：
+
+| GuardError kind | 默认处理方向 |
+|---|---|
+| REJECTED | FAIL |
+| TRANSIENT | UNKNOWN |
+| UNSUPPORTED | 按明确支持范围判定 FAIL 或 UNKNOWN |
+| BUDGET | UNKNOWN |
+| ENVIRONMENT | NODE_ERROR |
+
+单次 DNS 临时错误不能直接判定共享 DNS 整体故障。
+
+共享 DNS 或网络基础设施是否达到 NODE_ERROR，必须结合多个请求和阶段级证据，由上层运行流程判断。
+
+不得把所有网络异常都归类为线路 FAIL。
+
+不得把 UNKNOWN 当成 PASS。
+
+不得在错误对象、异常文本或日志中泄漏：
+
+- 原始完整 URL。
+- 敏感查询参数。
+- Authorization。
+- Cookie。
+- 资源授权标识。
+- 完整控制请求。
+
+#### K. 调用方固定职责
+
+discovery.py：
+
+- 使用 parse_url() 执行静态检查。
+- 使用 open_url() 获取来源内容。
+- 自行执行来源数量、重试和来源响应预算管理。
+- 不得自行实现 DNS 或重定向安全逻辑。
+
+validator.py：
+
+- 快速筛选通过 open_url() 执行适用的网络访问。
+- 深度验证不直接访问原始外部媒体 URL。
+- 通过已经确定的网关控制接口创建和清理任务。
+
+media_gateway.py：
+
+- 通过 open_url() 执行所有实际外部媒体访问。
+- 负责 HLS 解析、URI 改写和资源映射。
+- 创建并持有任务预算对象。
+- 将 HLS 和普通媒体请求的资源类型传给统一预算接口。
+- 不得复制 network_guard.py 的 DNS、IP、TLS 和重定向实现。
+
+所有调用方必须使用同一份 network_guard.py 安全规则。
+
+#### L. 测试接口要求
+
+network_guard.py 必须支持对 DNS 解析和实际连接进行可控测试。
+
+测试必须能够验证：
+
+1. 正常公网 IPv4 A 记录。
+2. NXDOMAIN。
+3. 没有 IPv4 A 记录。
+4. DNS timeout。
+5. 临时 SERVFAIL。
+6. 混合公网和禁止地址的 DNS 结果。
+7. DNS 结果变化。
+8. DNS rebinding。
+9. 实际连接 IP 与检查 IP 一致。
+10. IPv6 fallback 被阻止。
+11. HTTPS Host、SNI 和证书验证。
+12. 重定向逐跳 DNS 检查。
+13. HTTPS 降级被阻止。
+14. 跨域敏感请求头不会泄漏。
+15. 重定向循环和跳数限制。
+16. 单次响应字节限制。
+17. 流式读取中途超时。
+18. 任务请求次数预算。
+19. 任务读取字节预算。
+20. 并发预算不会被突破。
+21. 响应关闭后并发占用能够释放。
+22. 异常路径不会遗留网络连接和预算占用。
+
+只有实际测试通过后，才能将对应能力标记为完成。
 ## 7.16 深度验证结果
 
 | 结果 | 处理 |
