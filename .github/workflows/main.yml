@@ -1,4 +1,4 @@
-name: M0-A Runner Environment Precheck
+name: M0-A and M0-B Docker Network Precheck
 
 on:
   workflow_dispatch:
@@ -7,14 +7,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: m0-a-runner-precheck
+  group: m0-docker-network-precheck
   cancel-in-progress: false
 
 jobs:
-  runner-check:
-    name: Check Runner and Docker Environment
+  network-check:
+    name: Check Runner and Docker Network Isolation
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Check Ubuntu Runner
@@ -28,40 +28,37 @@ jobs:
           echo "Kernel: $(uname -r)"
           echo "Architecture: $(uname -m)"
 
-      - name: Check Docker Engine
+      - name: Check Docker Engine and Compose
         shell: bash
         run: |
           set -Eeuo pipefail
           docker --version
           docker info >/dev/null
-          echo "Docker Engine is available."
-
-      - name: Check Docker Compose
-        shell: bash
-        run: |
-          set -Eeuo pipefail
           docker compose version
+          echo "Docker Engine and Compose are available."
 
-      - name: Prepare Test Base Image
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          docker pull alpine:3.20
-
-      - name: Build Probe Images and Test Internal Network
+      - name: Build Probe Images and Test Docker Network Isolation
         shell: bash
         run: |
           set -Eeuo pipefail
 
           TEST_DIR="$(mktemp -d)"
-          PROJECT="m0a-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          NETWORK_NAME="${PROJECT}_validator_net"
-          GATEWAY_IMAGE="${PROJECT}-gateway-probe:local"
-          VALIDATOR_IMAGE="${PROJECT}-validator-probe:local"
+          PROJECT="m0b-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          VALIDATOR_NET="${PROJECT}_validator_net"
+          GATEWAY_NET="${PROJECT}_gateway_egress"
+          UNAUTHORIZED_NET="${PROJECT}_unauthorized_net"
+          GATEWAY_IMAGE="${PROJECT}-media-gateway:local"
+          VALIDATOR_IMAGE="${PROJECT}-validator:local"
           GATEWAY_ID=""
           VALIDATOR_ID=""
+          UNAUTHORIZED_ID=""
+          HOST_SERVER_PID=""
 
           cleanup() {
+            if [[ -n "$HOST_SERVER_PID" ]]; then
+              kill "$HOST_SERVER_PID" >/dev/null 2>&1 || true
+              wait "$HOST_SERVER_PID" >/dev/null 2>&1 || true
+            fi
             docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" down --remove-orphans --volumes >/dev/null 2>&1 || true
             docker image rm -f "$GATEWAY_IMAGE" "$VALIDATOR_IMAGE" >/dev/null 2>&1 || true
             rm -rf "$TEST_DIR"
@@ -69,17 +66,24 @@ jobs:
 
           trap cleanup EXIT
 
+          cat > "$TEST_DIR/index.html" <<'HTML'
+          host-gateway-ok
+          HTML
+
           cat > "$TEST_DIR/Dockerfile.gateway" <<'DOCKER'
           FROM alpine:3.20
-          LABEL org.opencontainers.image.title="M0-A gateway build probe"
+          LABEL org.opencontainers.image.title="M0-B gateway network probe"
           CMD ["sh", "-c", "sleep 300"]
           DOCKER
 
           cat > "$TEST_DIR/Dockerfile.validator" <<'DOCKER'
           FROM alpine:3.20
-          LABEL org.opencontainers.image.title="M0-A validator build probe"
+          LABEL org.opencontainers.image.title="M0-B validator network probe"
           CMD ["sh", "-c", "sleep 300"]
           DOCKER
+
+          echo "=== Prepare base image ==="
+          docker pull alpine:3.20
 
           echo "=== Build gateway probe image ==="
           docker build --pull=false -t "$GATEWAY_IMAGE" -f "$TEST_DIR/Dockerfile.gateway" "$TEST_DIR"
@@ -89,23 +93,44 @@ jobs:
 
           cat > "$TEST_DIR/compose.yaml" <<YAML
           services:
-            gateway-probe:
+            media-gateway:
               image: ${GATEWAY_IMAGE}
-              command: ["sh", "-c", "sleep 300"]
+              command:
+                - sh
+                - -ec
+                - |
+                  mkdir -p /www
+                  echo gateway-ok > /www/index.html
+                  exec busybox httpd -f -p 8080 -h /www
               networks:
                 validator_net:
                   ipv4_address: 172.30.10.2
+                gateway_egress:
+                  ipv4_address: 172.30.11.2
 
-            validator-probe:
+            validator:
               image: ${VALIDATOR_IMAGE}
               command: ["sh", "-c", "sleep 300"]
               networks:
                 validator_net:
                   ipv4_address: 172.30.10.3
 
+            unauthorized-probe:
+              image: ${GATEWAY_IMAGE}
+              command:
+                - sh
+                - -ec
+                - |
+                  mkdir -p /www
+                  echo unauthorized-ok > /www/index.html
+                  exec busybox httpd -f -p 18081 -h /www
+              networks:
+                unauthorized_net:
+                  ipv4_address: 172.30.12.2
+
           networks:
             validator_net:
-              name: ${NETWORK_NAME}
+              name: ${VALIDATOR_NET}
               driver: bridge
               internal: true
               enable_ipv6: false
@@ -113,66 +138,169 @@ jobs:
                 config:
                   - subnet: 172.30.10.0/24
                     gateway: 172.30.10.1
+
+            gateway_egress:
+              name: ${GATEWAY_NET}
+              driver: bridge
+              internal: false
+              enable_ipv6: false
+              ipam:
+                config:
+                  - subnet: 172.30.11.0/24
+                    gateway: 172.30.11.1
+
+            unauthorized_net:
+              name: ${UNAUTHORIZED_NET}
+              driver: bridge
+              internal: true
+              enable_ipv6: false
+              ipam:
+                config:
+                  - subnet: 172.30.12.0/24
+                    gateway: 172.30.12.1
           YAML
 
           echo "=== Validate Compose configuration ==="
           docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" config >/dev/null
 
-          echo "=== Start probe containers ==="
+          echo "=== Confirm Runner has direct IPv4 egress for a valid control test ==="
+          curl --noproxy '*' -4 -sS --connect-timeout 5 --max-time 8 -o /dev/null http://1.1.1.1/
+          echo "Runner direct IPv4 control request succeeded."
+
+          echo "=== Start the three probe containers ==="
           docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" up -d
 
-          GATEWAY_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q gateway-probe)"
-          VALIDATOR_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q validator-probe)"
+          GATEWAY_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q media-gateway)"
+          VALIDATOR_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q validator)"
+          UNAUTHORIZED_ID="$(docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" ps -q unauthorized-probe)"
+
           test -n "$GATEWAY_ID"
           test -n "$VALIDATOR_ID"
+          test -n "$UNAUTHORIZED_ID"
 
-          GATEWAY_RUNNING="$(docker inspect -f '{{.State.Running}}' "$GATEWAY_ID")"
-          VALIDATOR_RUNNING="$(docker inspect -f '{{.State.Running}}' "$VALIDATOR_ID")"
-          test "$GATEWAY_RUNNING" = "true"
-          test "$VALIDATOR_RUNNING" = "true"
+          for CONTAINER_ID in "$GATEWAY_ID" "$VALIDATOR_ID" "$UNAUTHORIZED_ID"; do
+            RUNNING="$(docker inspect -f '{{.State.Running}}' "$CONTAINER_ID")"
+            test "$RUNNING" = "true"
+          done
 
-          GATEWAY_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$GATEWAY_ID")"
-          VALIDATOR_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$VALIDATOR_ID")"
-          test "$GATEWAY_IP" = "172.30.10.2"
-          test "$VALIDATOR_IP" = "172.30.10.3"
+          echo "=== Verify exact network membership ==="
+          get_networks() {
+            docker inspect -f '{{range $name, $value := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$1" | sort
+          }
 
-          NETWORK_INTERNAL="$(docker network inspect -f '{{.Internal}}' "$NETWORK_NAME")"
-          NETWORK_IPV6="$(docker network inspect -f '{{.EnableIPv6}}' "$NETWORK_NAME")"
-          test "$NETWORK_INTERNAL" = "true"
-          test "$NETWORK_IPV6" = "false"
+          diff -u <(printf '%s\n' "$VALIDATOR_NET") <(get_networks "$VALIDATOR_ID")
+          diff -u <(printf '%s\n' "$VALIDATOR_NET" "$GATEWAY_NET" | sort) <(get_networks "$GATEWAY_ID")
+          diff -u <(printf '%s\n' "$UNAUTHORIZED_NET") <(get_networks "$UNAUTHORIZED_ID")
 
-          echo "Gateway probe IPv4: $GATEWAY_IP"
-          echo "Validator probe IPv4: $VALIDATOR_IP"
-          echo "Internal network: $NETWORK_INTERNAL"
-          echo "IPv6 enabled: $NETWORK_IPV6"
+          VALIDATOR_IPV4="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$VALIDATOR_ID" | sort)"
+          GATEWAY_IPV4="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$GATEWAY_ID" | sort)"
+          test "$VALIDATOR_IPV4" = "172.30.10.3"
+          diff -u <(printf '%s\n' "172.30.10.2" "172.30.11.2" | sort) <(printf '%s\n' "$GATEWAY_IPV4")
 
-          echo "=== Stop and remove probe containers ==="
-          docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" stop
-          docker compose -p "$PROJECT" -f "$TEST_DIR/compose.yaml" down --remove-orphans --volumes
+          VALIDATOR_IPV6="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{if .GlobalIPv6Address}}{{println .GlobalIPv6Address}}{{end}}{{end}}' "$VALIDATOR_ID")"
+          test -z "$VALIDATOR_IPV6"
 
-          if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
-            echo "ERROR: Probe network was not removed."
-            exit 1
-          fi
+          VALIDATOR_INTERNAL="$(docker network inspect -f '{{.Internal}}' "$VALIDATOR_NET")"
+          VALIDATOR_IPV6_ENABLED="$(docker network inspect -f '{{.EnableIPv6}}' "$VALIDATOR_NET")"
+          GATEWAY_INTERNAL="$(docker network inspect -f '{{.Internal}}' "$GATEWAY_NET")"
+          GATEWAY_IPV6_ENABLED="$(docker network inspect -f '{{.EnableIPv6}}' "$GATEWAY_NET")"
 
-          if docker inspect "$GATEWAY_ID" >/dev/null 2>&1; then
-            echo "ERROR: Gateway probe container was not removed."
-            exit 1
-          fi
+          test "$VALIDATOR_INTERNAL" = "true"
+          test "$VALIDATOR_IPV6_ENABLED" = "false"
+          test "$GATEWAY_INTERNAL" = "false"
+          test "$GATEWAY_IPV6_ENABLED" = "false"
 
-          if docker inspect "$VALIDATOR_ID" >/dev/null 2>&1; then
-            echo "ERROR: Validator probe container was not removed."
-            exit 1
-          fi
+          VALIDATOR_NET_COUNT="$(docker network inspect -f '{{len .Containers}}' "$VALIDATOR_NET")"
+          GATEWAY_NET_COUNT="$(docker network inspect -f '{{len .Containers}}' "$GATEWAY_NET")"
+          test "$VALIDATOR_NET_COUNT" = "2"
+          test "$GATEWAY_NET_COUNT" = "1"
 
-          echo "Probe containers and network were removed successfully."
+          echo "validator networks: $(get_networks "$VALIDATOR_ID" | tr '\n' ' ')"
+          echo "gateway networks: $(get_networks "$GATEWAY_ID" | tr '\n' ' ')"
+          echo "validator_net internal: $VALIDATOR_INTERNAL"
+          echo "validator_net IPv6 enabled: $VALIDATOR_IPV6_ENABLED"
+          echo "gateway_egress internal: $GATEWAY_INTERNAL"
+          echo "gateway_egress IPv6 enabled: $GATEWAY_IPV6_ENABLED"
+          echo "gateway_egress attached container count: $GATEWAY_NET_COUNT"
+
+          echo "=== Start a temporary service on the validator host-gateway address ==="
+          python3 -m http.server 18080 --bind 172.30.10.1 --directory "$TEST_DIR" >"$TEST_DIR/host-http.log" 2>&1 &
+          HOST_SERVER_PID="$!"
+
+          HOST_READY="false"
+          for ATTEMPT in $(seq 1 15); do
+            if curl --noproxy '*' -fsS --connect-timeout 1 --max-time 2 http://172.30.10.1:18080/ | grep -q '^host-gateway-ok$'; then
+              HOST_READY="true"
+              break
+            fi
+            sleep 1
+          done
+          test "$HOST_READY" = "true"
+
+          echo "=== Verify expected internal gateway access works ==="
+          GATEWAY_READY="false"
+          for ATTEMPT in $(seq 1 15); do
+            if docker exec "$VALIDATOR_ID" sh -c 'wget -T 2 -q -O - http://172.30.10.2:8080/' 2>/dev/null | grep -q '^gateway-ok$'; then
+              GATEWAY_READY="true"
+              break
+            fi
+            sleep 1
+          done
+          test "$GATEWAY_READY" = "true"
+          echo "validator can reach the gateway probe on TCP 8080."
+
+          echo "=== Verify the unauthorized service is running ==="
+          docker exec "$UNAUTHORIZED_ID" sh -ec 'wget -T 2 -q -O - http://127.0.0.1:18081/ | grep -q "^unauthorized-ok$"'
+
+          echo "=== Verify validator cannot bypass the gateway ==="
+          expect_blocked() {
+            local description="$1"
+            local target="$2"
+            if docker exec "$VALIDATOR_ID" sh -c "wget -T 3 -q -O /dev/null '$target'"; then
+              echo "ERROR: validator unexpectedly reached ${description} (${target})."
+              return 1
+            fi
+            echo "PASS: validator could not reach ${description}."
+          }
+
+          expect_blocked "public IPv4 endpoint" "http://1.1.1.1/"
+          expect_blocked "public IPv6 endpoint" "http://[2606:4700:4700::1111]/"
+          expect_blocked "host gateway service" "http://172.30.10.1:18080/"
+          expect_blocked "unauthorized container service" "http://172.30.12.2:18081/"
+
+          echo "=== M0-B Docker network isolation checks passed ==="
+
+          echo "=== Stop and remove probe resources ==="
           cleanup
           trap - EXIT
+
+          for NETWORK_NAME in "$VALIDATOR_NET" "$GATEWAY_NET" "$UNAUTHORIZED_NET"; do
+            if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+              echo "ERROR: Network was not removed: $NETWORK_NAME"
+              exit 1
+            fi
+          done
+
+          for CONTAINER_ID in "$GATEWAY_ID" "$VALIDATOR_ID" "$UNAUTHORIZED_ID"; do
+            if docker inspect "$CONTAINER_ID" >/dev/null 2>&1; then
+              echo "ERROR: Probe container was not removed: $CONTAINER_ID"
+              exit 1
+            fi
+          done
+
+          for IMAGE_NAME in "$GATEWAY_IMAGE" "$VALIDATOR_IMAGE"; do
+            if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+              echo "ERROR: Probe image was not removed: $IMAGE_NAME"
+              exit 1
+            fi
+          done
+
+          echo "All M0-B probe containers, networks, and images were removed."
 
       - name: Final Runner Summary
         if: always()
         shell: bash
         run: |
-          echo "M0-A Runner Environment Precheck finished."
+          echo "M0-A/M0-B Docker network precheck finished."
           docker ps -a || true
           docker network ls || true
