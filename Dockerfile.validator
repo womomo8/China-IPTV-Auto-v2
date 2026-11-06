@@ -67,9 +67,9 @@ command -v ffmpeg >/dev/null 2>&1 || fail \
 command -v ffprobe >/dev/null 2>&1 || fail \
     "FFprobe is not installed."
 
-# Docker Compose must remove every default capability
-# and add only NET_ADMIN, SETUID and SETGID.
-# Their capability bitmask is 0x10c0.
+# Docker must remove all default capabilities and add only:
+# NET_ADMIN, SETUID and SETGID.
+# Their combined capability mask is 0x10c0.
 
 EXPECTED_START_CAPS="00000000000010c0"
 EXPECTED_EMPTY_CAPS="0000000000000000"
@@ -118,15 +118,18 @@ nft list table inet validator_filter >/dev/null \
 
 echo "Firewall loaded and verified."
 
-echo "Dropping all remaining capabilities and switching to validator UID/GID..."
+echo "Switching to validator UID/GID and clearing effective, permitted, inheritable and ambient capabilities..."
 
+# Do not use --bounding-set=-all here.
+# Clearing the bounding set requires CAP_SETPCAP, which is not granted.
+# The three startup capabilities remain in CapBnd, but must not remain
+# in CapEff or CapPrm after switching to the non-root user.
 exec setpriv \
     --reuid=10001 \
     --regid=10001 \
     --clear-groups \
     --inh-caps=-all \
     --ambient-caps=-all \
-    --bounding-set=-all \
     --no-new-privs \
     /usr/local/sbin/validator-user-entrypoint "$@"
 
@@ -158,6 +161,7 @@ check_status() {
 }
 
 EXPECTED_EMPTY_CAPS="0000000000000000"
+EXPECTED_BOUNDING_CAPS="00000000000010c0"
 
 [ "$(id -u)" = "10001" ] || fail \
     "Process is not running as UID 10001."
@@ -169,7 +173,11 @@ check_status CapEff "$EXPECTED_EMPTY_CAPS"
 check_status CapPrm "$EXPECTED_EMPTY_CAPS"
 check_status CapInh "$EXPECTED_EMPTY_CAPS"
 check_status CapAmb "$EXPECTED_EMPTY_CAPS"
-check_status CapBnd "$EXPECTED_EMPTY_CAPS"
+
+# Only the three explicitly granted startup capabilities may remain
+# in the bounding set. They are not effective or permitted.
+check_status CapBnd "$EXPECTED_BOUNDING_CAPS"
+
 check_status NoNewPrivs "1"
 
 echo "Validator privilege verification passed."
@@ -177,6 +185,8 @@ echo "UID: $(id -u)"
 echo "GID: $(id -g)"
 echo "CapEff: $(read_status CapEff)"
 echo "CapPrm: $(read_status CapPrm)"
+echo "CapInh: $(read_status CapInh)"
+echo "CapAmb: $(read_status CapAmb)"
 echo "CapBnd: $(read_status CapBnd)"
 echo "NoNewPrivs: $(read_status NoNewPrivs)"
 
