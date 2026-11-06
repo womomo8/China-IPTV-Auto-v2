@@ -186,3 +186,133 @@
 6. 修改文件前读取最新版本及上下游接口。
 7. 交付完整文件，并先完成可行的静态检查和测试。
 8. 不重复已经有证据的工作，不把未验证事项说成完成。
+## 九、2026-11-06 最新核对补充
+
+### 9.1 最新仓库基线
+
+- 核对日期：2026-11-06
+- 仓库：womomo8/China-IPTV-Auto-v3
+- 默认分支：main
+- 最新提交：1a49c671589480b42eb013eff7f370c8b062492e
+- 最新提交说明：docs: align HLS support scope with core flow
+
+本次已重新读取远程仓库最新文件，不能继续把第 1 节记录的旧 SHA 当作当前版本。
+
+### 9.2 当前文件树核对
+
+最新根目录已确认存在：
+
+- CORE_FLOW.md
+- MASTER_PLAN.md
+- README.md
+- PROGRESS.md
+- Dockerfile.validator
+- .github/workflows/main.yml
+
+目前尚未发现以下正式业务模块和配置：
+
+- network_guard.py
+- media_gateway.py
+- Dockerfile.gateway
+- compose.yaml
+- pipeline.py
+- settings.py
+- discovery.py
+- normalize.py
+- validator.py
+- publisher.py
+- tests/
+
+以上状态以本次核对的 main 分支文件树为准。
+
+### 9.3 HLS 规范核对结果
+
+状态：文档范围已对齐，代码及安全测试尚未完成。
+
+本次提交 1a49c671 修改了 MASTER_PLAN.md 的 HLS 施工范围。
+
+已确认：
+
+1. CORE_FLOW.md 第 7.10 节规定首批 HLS 支持范围。
+2. 首批支持 EXT-X-KEY 中符合要求的 AES-128 密钥 URI。
+3. 首批不支持 EXT-X-SESSION-KEY URI。
+4. 首批不支持 DRM、SAMPLE-AES、Low-Latency HLS 相关未支持资源引用及 Content Steering。
+5. 无法安全解析或尚未支持的资源必须拒绝或标记 UNKNOWN。
+6. 不得静默忽略 HLS 子资源。
+7. 不得把原始外部 URI 直接交给 FFmpeg 绕过网关。
+
+CORE_FLOW.md 与 MASTER_PLAN.md 的首批 HLS 范围目前已对齐。
+
+注意：这只是文档规范核对通过，不代表 HLS 解析、URI 改写、资源映射和网关代理已经实现或通过测试。
+
+### 9.4 网关和网络安全接口核对
+
+已确认的职责：
+
+- network_guard.py：统一 URL、DNS、IPv4、实际连接目标、重定向和网络请求安全控制。
+- media_gateway.py：接收验证任务的受控媒体请求，管理任务级资源映射，代理受支持的媒体资源。
+- validator.py：创建验证任务，通过内部网关地址调用 FFmpeg/FFprobe。
+- FFmpeg/FFprobe：只能访问内部媒体网关，不得直接访问外部媒体地址。
+
+已确认的安全要求：
+
+1. DNS 检查结果必须绑定实际 IPv4 连接。
+2. 禁止未经检查的 IPv6 fallback。
+3. HTTPS 必须保留正确 Host、TLS SNI 和证书验证。
+4. 每一跳重定向都必须重新检查。
+5. 网关必须验证任务级资源映射。
+6. 每个验证任务必须使用独立的高强度随机资源标识。
+7. 映射只保存在网关进程内存中，不建立第二套数据库。
+8. 必要请求头必须绑定任务映射，不能由 FFmpeg 任意覆盖。
+9. HLS 子资源必须经过解析、映射和 URI 改写。
+10. 不支持的资源不得回退到外部直连。
+
+### 9.5 新发现：具体调用接口尚未定义完整
+
+当前 CORE_FLOW.md 和 MASTER_PLAN.md 已规定模块职责及安全边界，但尚未形成完整的可直接编码接口契约。
+
+需要在编写 network_guard.py 和 media_gateway.py 之前明确：
+
+1. network_guard.py 对外提供哪些函数。
+2. URL 检查、DNS 解析和实际连接如何形成不可绕过的调用闭环。
+3. 普通小响应与媒体流式响应如何统一返回。
+4. media_gateway.py 如何接收 validator.py 创建的任务。
+5. 网关任务创建请求和返回数据的具体结构。
+6. FFmpeg 使用的内部资源地址格式。
+7. HLS 子资源如何创建映射并返回改写后的播放列表。
+8. 任务正常结束、超时和异常退出时如何注销映射。
+9. 错误如何区分安全拒绝、资源不支持、网络异常和节点故障。
+10. 如何验证网关接口不会成为开放代理。
+
+以上属于待定义的实现接口，不代表现有架构需要推翻。
+
+不得在不同模块中自行创造互不兼容的接口。
+
+### 9.6 更新后的施工顺序
+
+1. 已完成：重新核对最新仓库版本。
+2. 已完成：核对 CORE_FLOW.md 的网络安全、网关、DNS、redirect 和 HLS 规范。
+3. 已完成：核对 MASTER_PLAN.md 的 M0-D、M0-E、M0-F 施工要求。
+4. 当前进行：定义 network_guard.py 的统一调用接口。
+5. 随后：定义 media_gateway.py 与 validator.py 之间的任务接口。
+6. 核对接口与 CORE_FLOW.md、MASTER_PLAN.md 是否一致。
+7. 必要时先更新权威文档，再开始代码施工。
+8. 实现 network_guard.py。
+9. 实现 media_gateway.py 和 Dockerfile.gateway。
+10. 建立正式 compose.yaml。
+11. 完成网络隔离、DNS、redirect、HLS 和任务映射测试。
+12. 按 M0-A 至 M0-F 完整验收。
+
+### 9.7 当前验收状态
+
+- HLS 文档范围：已对齐。
+- network_guard.py：未实现。
+- media_gateway.py：未实现。
+- Dockerfile.gateway：未实现。
+- compose.yaml：未实现。
+- M0-D：未完成。
+- M0-E：未完成。
+- M0-F：未完成。
+- M0 总体验收：未通过，不能标记 PASS。
+
+下一步必须先完成接口契约，不得跳过接口定义直接堆代码。
