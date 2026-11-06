@@ -19,6 +19,7 @@
 - IPv4 准入和网络访问安全约束。
 - Docker 隔离与媒体网关固定架构。
 - HLS 主资源和子资源的安全访问。
+- 首批媒体协议支持范围。
 - 统一资源参数和运行限制。
 - 异常处理和正式发布保护。
 - GitHub Actions 自动运行和权限控制。
@@ -89,6 +90,10 @@
 
 不得把设计方案、模拟结果或未运行的测试描述为真实运行结果。
 
+本项目当前以 GitHub Runner 所在网络环境的检测结果作为本轮检测依据。
+
+云端检测通过，只能说明线路在本轮 Runner 所处网络环境和规定检测条件下通过，不能保证其他地区、其他运营商或用户家庭网络一定能够播放。
+
 ## 1.3 五阶段业务流程
 
 V3 固定采用以下五个业务阶段：
@@ -99,7 +104,7 @@ V3 固定采用以下五个业务阶段：
 4. 深度验证
 5. 安全发布
 
-唯一业务主流程：
+五阶段业务主流程：
 
     .github/workflows/main.yml
               |
@@ -122,9 +127,28 @@ V3 固定采用以下五个业务阶段：
         第五阶段：安全发布
               |
               v
-         output/iptv.m3u
+        publisher.py 生成本轮临时发布产物
+              |
+              v
+        pipeline Job 校验并上传 Artifact
+              |
+              v
+        GitHub Actions publish Job
+              |
+              v
+        校验当前运行的 Artifact
+              |
+              v
+        更新唯一正式订阅
+              |
+              v
+        output/iptv.m3u
 
 五个阶段由 pipeline.py 按固定顺序组织和调度。
+
+第五阶段由 publisher.py 负责生成本轮临时发布产物和发布资格结果；正式仓库文件的更新由 GitHub Actions 的 publish Job 完成。
+
+不得把临时 Artifact 误认为正式订阅，也不得让 pipeline Job 越过 publish Job 直接提交正式订阅。
 
 不得将五个阶段设计成相互独立、互相调用或并行争抢数据的业务入口。
 
@@ -180,9 +204,10 @@ V3 固定采用以下五个业务阶段：
 7. 确定 network_guard.py 对外部网络请求实施统一安全检查。
 8. 确定 HLS 主播放列表和全部受支持子资源的网关访问方式。
 9. 确定网关任务级资源映射和访问授权机制。
-10. 建立 Docker 网络隔离、网关访问和安全绕行测试。
-11. 建立模块接口和统一数据状态规则。
-12. 确定 GitHub Actions 双 Job 和 Artifact 交接方式。
+10. 确定验证容器网络命名空间内的端口级防火墙规则。
+11. 建立 Docker 网络隔离、网关访问和安全绕行测试。
+12. 建立模块接口和统一数据状态规则。
+13. 确定 GitHub Actions 双 Job 和 Artifact 交接方式。
 
 **架构决定：**
 
@@ -190,13 +215,30 @@ V3 采用独立媒体网关和独立 FFmpeg 验证容器的 Docker 双网络架�
 
 该架构是正式施工目标，不再把 FFmpeg 直接联网作为备用实现，也不把取消隔离作为临时降级方案。
 
-具体 Docker 配置、容器网络关系和网关通信方式必须按照本文件实现。
+端口级隔离固定采用以下实现：
+
+- validator 容器使用独立网络命名空间。
+- validator 容器只连接 internal: true 的 validator_net。
+- validator_net 使用固定 IPv4 子网和固定网关容器地址。
+- validator 容器启动时使用 nftables 建立本容器网络命名空间内的出站防火墙。
+- 防火墙默认拒绝所有出站连接。
+- 只允许访问 media-gateway 的固定内部 IPv4 地址和 TCP 8080 端口。
+- 只允许访问 Docker 内部 DNS 所需的 127.0.0.11 UDP/TCP 53 端口。
+- 允许 loopback 和已经建立连接的返回流量。
+- 不允许访问宿主机网关、其他容器、其他端口、外部 IPv4 或外部 IPv6。
+- 防火墙成功加载后，启动流程必须移除 NET_ADMIN 能力，并降权到非 root 用户运行 FFmpeg/FFprobe。
+- validator.py 调用 docker compose exec 时必须明确指定非 root 用户。
+- 防火墙加载失败、降权失败或容器启动检查失败，均不得继续深度验证。
+
+NET_ADMIN 只用于 validator 容器启动时加载自身网络命名空间内的防火墙规则，不用于赋予 FFmpeg 进程网络管理权限。
+
+Docker Compose 负责网络成员关系和固定内部地址；validator 容器内的 nftables 负责端口级出站限制；network_guard.py 负责媒体网关外部目标的统一安全检查。这三者职责不同，不得互相替代。
 
 **验收边界：**
 
 架构已经确定，可以直接进入配置和程序施工。
 
-但 Docker 网络是否真正隔离、FFmpeg 是否能够绕过网关、HLS 子资源是否全部经过网关，必须通过实际测试确认。
+但 Docker 网络是否真正隔离、nftables 规则是否生效、FFmpeg 是否能够绕过网关、HLS 子资源是否全部经过网关，必须通过实际测试确认。
 
 在相应安全测试通过之前，不得将隔离功能标记为完成，也不得依赖未经验证的隔离结果进行正式发布。
 
@@ -274,8 +316,8 @@ V3 目标结构如下：
 | validator.py | 快速筛选、调用 FFprobe 和隔离环境中的 FFmpeg |
 | publisher.py | 发布资格检查、临时 M3U 生成、校验和本轮发布产物准备 |
 | Dockerfile.gateway | 构建媒体网关容器镜像 |
-| Dockerfile.validator | 构建 FFmpeg 验证容器镜像 |
-| compose.yaml | 定义网关、验证容器和 Docker 网络关系 |
+| Dockerfile.validator | 构建 FFmpeg/FFprobe 验证环境，并提供 nftables、setpriv 等必要的启动安全工具 |
+| compose.yaml | 定义网关、验证容器、固定内部地址、Docker 网络和容器权限关系 |
 | requirements.txt | Python 项目依赖 |
 | tests/ | 模块、接口、安全、隔离和流程测试 |
 | output/iptv.m3u | 唯一正式订阅文件 |
@@ -295,8 +337,6 @@ V3 目标结构如下：
 唯一业务入口为：
 
     pipeline.py
-
-不增加 main.py。
 
 pipeline.py 负责：
 
@@ -349,6 +389,9 @@ GitHub Actions 只负责启动 pipeline.py 和执行必要的工作流操作。
                   |
                   v
            本轮发布产物
+                  |
+                  v
+        pipeline Job 上传 Artifact
                   |
                   v
         GitHub Actions 发布 Job
@@ -559,7 +602,9 @@ GitHub Actions 的发布 Job 只负责核验本轮产物并执行正式提交，
 
 - URL 格式明确无效。
 - 地址明确不符合 IPv4 准入规则。
-- DNS 结果明确不符合要求。
+- DNS 明确返回 NXDOMAIN。
+- DNS 查询成功，但域名没有可用的 IPv4 A 记录。
+- DNS 结果明确包含不允许访问的目标地址。
 - 目标明确返回不支持的资源或协议。
 - 目标明确不存在。
 - 明确的拒绝响应能够证明当前资源不可用。
@@ -574,6 +619,8 @@ GitHub Actions 的发布 Job 只负责核验本轮产物并执行正式提交，
 
 - 单条线路暂时超时，无法取得充分结论。
 - 单条线路连接暂时失败，但无法确认目标永久失效。
+- DNS 单次查询超时。
+- DNS 临时 SERVFAIL 或其他暂时解析异常。
 - 响应不完整。
 - 证据不足。
 - 检测达到单线路资源预算，但无法确认线路本身无效。
@@ -589,6 +636,8 @@ UNKNOWN 不得进入正式订阅。
 - FFprobe 或 FFmpeg 未安装、无法启动或工具本身崩溃。
 - Docker daemon 不可用。
 - Docker Compose 无法正常工作。
+- nftables 无法加载规定的隔离规则。
+- validator 容器无法完成降权启动。
 - 网络安全模块发生异常，无法可靠执行安全检查。
 - 媒体网关整体故障。
 - Docker 网络隔离测试失败。
@@ -607,6 +656,26 @@ UNKNOWN 不得进入正式订阅。
 如果共享工具、网络安全模块、Docker 环境或关键验证服务发生全局故障，必须根据影响范围判定 NODE_ERROR。
 
 同类故障如果影响整个阶段，不得伪装成大量独立线路 FAIL。
+
+### DNS 故障的统一分类
+
+DNS 结果必须按证据区分：
+
+| DNS 情况 | 状态 | 处理 |
+|---|---|---|
+| 明确 NXDOMAIN | FAIL | 当前域名不存在，淘汰候选 |
+| 查询成功但没有 IPv4 A 记录 | FAIL | 不符合 IPv4 准入要求 |
+| 查询成功且存在不允许的目标地址 | FAIL | 拒绝该目标，不得尝试绕过 |
+| 单次 DNS timeout | UNKNOWN | 有限重试，不能直接认定域名失效 |
+| 临时 SERVFAIL 或解析异常 | UNKNOWN | 记录原因，按有限重试处理 |
+| 共享 DNS 服务整体不可用 | NODE_ERROR | 停止依赖该 DNS 的检测并阻止发布 |
+| 大量不同域名同时出现相同 DNS 故障 | 先检查共享环境 | 确认是公共解析环境故障时判 NODE_ERROR |
+
+不得把 DNS 临时故障批量记为线路 FAIL。
+
+不得把明确 NXDOMAIN 无限重试。
+
+不得在 DNS 解析异常时改用未经检查的备用地址。
 
 ## 3.5 阶段传递规则
 
@@ -1028,9 +1097,37 @@ V3 固定使用独立媒体网关和独立 FFmpeg 验证容器。
 7. validator.py 不直接访问外部媒体服务器。
 8. 不得通过 Docker 配置、宿主机路由或其他容器为 FFmpeg 提供绕过网关的出口。
 
-该架构是固定施工方案，不代表配置已经实现或隔离已经通过实际测试。
+### 固定网络名称、地址和端口
 
-### 固定服务名称和端口
+Docker Compose 网络名称统一为：
+
+    validator_net
+    gateway_egress
+
+validator_net 必须：
+
+- 使用 Docker bridge 网络。
+- 设置 internal: true。
+- 使用固定 IPv4 子网。
+- 禁用 IPv6。
+- 不提供外部默认出口。
+
+gateway_egress 必须：
+
+- 只连接 media-gateway。
+- 使用普通受控 bridge 网络。
+- 禁用 IPv6。
+- 不连接 validator 容器。
+
+validator_net 的固定地址规划：
+
+    validator_net 子网：172.30.10.0/24
+    media-gateway：172.30.10.2
+    validator：172.30.10.3
+
+以上地址属于 V3 固定内部网络规划，不得在不同配置文件中随意改变。
+
+如果实际 Runner 环境发生子网冲突，必须先统一修改 settings.py、compose.yaml、防火墙规则和测试用例，再进行测试；不得只改其中一处。
 
 媒体网关的 Docker Compose 服务名统一为：
 
@@ -1044,48 +1141,102 @@ FFmpeg 容器访问网关时使用 Compose 内部服务 DNS：
 
     http://media-gateway:8080
 
-服务名、内部端口和代码中的监听端口必须保持一致。
+服务名、内部地址、代码中的监听地址和端口必须保持一致。
 
-不得在不同文件中分别使用不同服务名或端口。
+网关服务必须绑定 validator_net 的内部地址和 8080 端口提供服务。
 
-网关只在验证容器需要访问的内部网络中提供服务。
+不得将网关管理接口或内部管理端口暴露到公网。
 
-不应为了方便调试而将网关管理接口或内部管理端口暴露到公网。
+不得在 compose.yaml 中为媒体网关配置公网 ports 映射。
 
-## 7.5 网络隔离硬性要求
+不得依靠宿主机端口映射完成 FFmpeg 与网关之间的通信。
+
+## 7.5 网络隔离和端口级防火墙
+
+Docker 网络隔离与端口级访问控制是两个不同层次，必须同时实现。
+
+### A. Docker 网络层
+
+- validator 只加入 validator_net。
+- validator_net 设置 internal: true。
+- validator_net 禁用 IPv6。
+- validator 不加入 gateway_egress。
+- media-gateway 同时加入 validator_net 和 gateway_egress。
+- media-gateway 在 validator_net 使用固定地址 172.30.10.2。
+- 网关只提供内部 TCP 8080 服务。
+- 不发布网关端口到宿主机公网接口。
+
+### B. validator 容器内部 nftables 规则
+
+validator 容器启动时必须在自己的网络命名空间内建立 nftables 规则。
+
+规则采用默认拒绝策略：
+
+- OUTPUT 默认 DROP。
+- INPUT 默认 DROP。
+- 允许 loopback。
+- 允许已经建立或关联的返回流量。
+- 允许访问 Docker 内部 DNS 127.0.0.11 的 UDP 53。
+- 允许访问 Docker 内部 DNS 127.0.0.11 的 TCP 53。
+- 允许访问 172.30.10.2 的 TCP 8080。
+- 其他 IPv4 出站全部拒绝。
+- 其他 IPv6 出站全部拒绝。
+- 不允许访问宿主机网关。
+- 不允许访问其他容器。
+- 不允许访问 media-gateway 的其他端口。
+- 不允许访问外部媒体源。
+
+规则必须在 FFmpeg/FFprobe 进程启动之前完成加载。
+
+规则加载失败，容器必须启动失败，不得以无防火墙方式继续运行。
+
+### C. 防火墙初始化与权限降级
+
+Dockerfile.validator 只提供 FFmpeg/FFprobe 验证运行环境和必要的启动安全工具，不承担 Python 业务逻辑。
+
+其中必须提供：
+
+- FFmpeg。
+- FFprobe。
+- nftables。
+- setpriv 所需工具。
+- 非 root 验证用户。
+
+compose.yaml 固定：
+
+1. validator 容器启动阶段以 root 身份加载 nftables 规则。
+2. 仅为加载规则临时授予 NET_ADMIN。
+3. 加载规则后，立即通过 setpriv 移除 NET_ADMIN 能力。
+4. 降权到固定非 root 用户。
+5. 使用非 root 身份运行容器常驻进程。
+6. validator.py 执行 docker compose exec 时必须显式指定该非 root 用户。
+7. 不得让 FFmpeg/FFprobe 以 root 身份运行。
+8. 不得向 validator 容器挂载 Docker Socket。
+9. 不得使用 privileged。
+10. 不得使用 host 网络模式。
+
+NET_ADMIN 不能作为 FFmpeg 的运行权限长期保留。
+
+不得把容器启动时短暂加载防火墙的权限误写成 FFmpeg 运行时拥有网络管理能力。
+
+### D. 安全关卡
 
 必须通过实际测试证明：
 
 1. FFmpeg 容器不能直接访问公网 IPv4。
 2. FFmpeg 容器不能直接访问公网 IPv6。
-3. FFmpeg 容器不能通过宿主机或其他路由绕过网关。
-4. FFmpeg 容器只能访问规定的网关地址和端口。
-5. 网关可以按照安全策略访问允许的外部目标。
-6. 网关故障时，FFmpeg 不得自动退回直接联网。
-7. 网络隔离测试失败时，不得继续正式深度验证。
-8. 网络隔离测试未通过时，不得发布依赖该隔离方案的验证结果。
+3. FFmpeg 容器不能访问宿主机网关。
+4. FFmpeg 容器不能访问其他容器的非授权服务。
+5. FFmpeg 容器只能访问 172.30.10.2:8080。
+6. FFmpeg 容器不能访问网关其他端口。
+7. FFmpeg 容器不能通过 DNS、重定向或其他方式绕过网关。
+8. 网关故障时，FFmpeg 不得自动退回直接联网。
+9. nftables 规则缺失或加载失败时，validator 不得运行。
+10. 降权后的 FFmpeg 进程不具备 NET_ADMIN。
+11. 网络隔离测试失败时，不得继续正式深度验证。
+12. 网络隔离测试未通过时，不得发布依赖该隔离方案的验证结果。
 
-不能只凭 internal: true 配置就声称容器完全不能访问公网。
-
-Docker 网络隔离与端口级访问控制是两个不同层次。
-
-如果需要证明 FFmpeg 只能访问网关的 8080 端口，必须采用真实生效的端口级控制措施，例如容器网络命名空间中的防火墙规则，或经过验证的等效网络控制机制。
-
-仅使用 Docker 网络连接关系，不能自动证明容器只能访问某一个端口。
-
-必须测试真实网络行为，包括：
-
-- IPv4 直接访问。
-- IPv6 直接访问。
-- DNS 解析和访问路径。
-- 容器之间的访问范围。
-- 宿主机访问路径。
-- 非网关目标访问。
-- 网关其他端口访问。
-- 网关停止服务后的行为。
-- 其他可能的网络绕行路径。
-
-隔离测试必须验证实际访问结果，而不只是检查 compose.yaml 中的配置文本。
+隔离测试必须验证真实网络行为，而不只是检查 compose.yaml 中的配置文本。
 
 如果测试失败，必须阻止正式深度验证和发布。
 
@@ -1100,14 +1251,15 @@ FFmpeg 验证容器必须遵守最小权限原则。
 - 不挂载 Docker Socket。
 - 不挂载不必要的宿主机目录。
 - 不授予不必要的 Linux capabilities。
-- 在可行范围内使用 cap_drop。
+- 只在启动阶段短暂使用 NET_ADMIN 加载防火墙。
+- 防火墙加载后立即移除 NET_ADMIN。
 - 启用 no-new-privileges。
-- 使用非 root 用户运行适用进程。
+- 使用非 root 用户运行 FFmpeg/FFprobe。
 - 设置 CPU 资源限制。
 - 设置内存资源限制。
 - 设置进程数量限制。
 - 限制临时文件和缓存占用。
-- 只开放完成验证所需的内部通信端口。
+- 只允许完成验证所需的内部通信。
 
 验证容器不能拥有管理宿主机 Docker 或访问其他无关容器的权限。
 
@@ -1148,7 +1300,7 @@ media_gateway.py 必须对每一次外部媒体请求执行安全检查。
 7. 不能因为固定连接 IP 而关闭 HTTPS 证书验证。
 8. DNS 结果变化时必须重新检查。
 
-实现可以使用能够固定连接目标地址的安全 HTTP 传输方式，或经过测试的等效机制。
+实现必须使用能够固定连接目标地址的安全 HTTP 传输方式，或经过测试的等效实现。
 
 不得出现“检查时是安全 IP，真正连接时又被客户端重新解析到其他 IP”的情况。
 
@@ -1189,20 +1341,27 @@ media_gateway.py 必须对每一次外部媒体请求执行安全检查。
 
 FFmpeg 只能访问由 validator.py 为当前验证任务创建的内部网关地址。
 
-### 映射访问规则
+### 映射标识和授权
+
+映射必须采用以下固定规则：
 
 1. 每个验证任务使用独立、不可预测的资源标识。
-2. 资源标识不能直接暴露原始目标 URL。
-3. 映射必须绑定具体验证任务。
-4. 不同任务之间不得共享可写入的映射状态。
-5. 不允许通过修改 URL 参数访问任意外部目标。
-6. 不允许客户端自行提交一个 URL 就让网关代为访问。
-7. 不允许通过修改资源 ID 访问其他任务的资源。
-8. 必要请求头必须绑定在映射中，不能由 FFmpeg 任意覆盖。
-9. 映射必须有有效期。
-10. 验证任务结束后必须使映射失效。
-11. 任务异常退出时也必须清理映射。
-12. 映射清理失败时必须阻止其被其他任务继续使用。
+2. 资源标识使用安全随机数生成，至少具有 256 bit 随机强度。
+3. 资源标识不得直接暴露原始目标 URL。
+4. 资源标识同时承担内部访问授权凭证作用。
+5. 映射必须绑定本轮运行标识和具体验证任务。
+6. 不同任务之间不得共享可写入的映射状态。
+7. 不允许通过修改 URL 参数访问任意外部目标。
+8. 不允许客户端自行提交一个 URL 就让网关代为访问。
+9. 不允许通过修改资源 ID 访问其他任务的资源。
+10. 必要请求头必须绑定在映射中，不能由 FFmpeg 任意覆盖。
+11. 映射必须有明确有效期。
+12. 验证任务结束后必须使映射失效。
+13. 任务异常退出时也必须清理映射。
+14. 映射清理失败时必须阻止其被其他任务继续使用。
+15. 映射授权标识不得写入普通日志。
+
+映射只在当前网关进程内存中保存，不建立第二套数据库，不把任务授权映射持久化到公开文件。
 
 网关不能只依赖一个简单 URL 参数作为安全授权。
 
@@ -1224,6 +1383,10 @@ FFmpeg 只能访问由 validator.py 为当前验证任务创建的内部网关�
 对于需要透传的普通请求头，必须有明确允许规则。
 
 不得将其他任务的请求头传递给当前任务。
+
+必要请求头必须设置数量、单字段大小和总字节数上限。
+
+超过限制时拒绝创建映射，不得无限接受请求头。
 
 ## 7.9 HLS 子资源安全
 
@@ -1254,7 +1417,7 @@ HLS 不只是一个主播放列表 URL。
 2. 检查任务映射和访问权限。
 3. 通过 network_guard.py 安全获取播放列表。
 4. 判断内容属于 Master Playlist 还是 Media Playlist。
-5. 解析受支持的 HLS 标签和 URI。
+5. 解析当前首批支持的 HLS 标签和 URI。
 6. 正确处理相对 URI 与当前播放列表基础 URL。
 7. 解析普通 URI 行中的子资源。
 8. 解析 URI 属性中的子资源。
@@ -1272,24 +1435,7 @@ HLS 不只是一个主播放列表 URL。
 
 不能把原始 HLS 内容原样交给 FFmpeg，再依赖 FFmpeg 自行访问外部子资源。
 
-### HLS 资源限制
-
-必须限制：
-
-- 最大嵌套播放列表深度。
-- 单个播放列表最大资源数量。
-- 单个任务最大映射数量。
-- 单个播放列表最大字节数。
-- 单个子资源最大响应体积。
-- 子资源请求超时。
-- 子资源重定向次数。
-- 总体 HLS 任务资源预算。
-
-超过限制时必须拒绝继续处理或返回 UNKNOWN。
-
-不得无限递归解析。
-
-### Range 和 Byte Range
+### HLS Range 和 Byte Range
 
 对于受支持的 HLS 资源，必须正确处理 HTTP Range 请求。
 
@@ -1315,9 +1461,7 @@ HLS 不只是一个主播放列表 URL。
 
 如果某些请求头不能安全地跨子资源传递，必须明确拒绝或标记 UNKNOWN。
 
-### 不支持的 HLS 功能
-
-必须明确当前程序实际支持的 HLS 语法和功能范围。
+### HLS 不支持功能的处理
 
 对于尚未实现、无法安全解析或无法安全改写的 URI：
 
@@ -1329,7 +1473,140 @@ HLS 不只是一个主播放列表 URL。
 
 FFmpeg 协议白名单只能作为额外限制，不能代替网络隔离和网关控制。
 
-## 7.10 FFprobe 与 FFmpeg 验证规则
+## 7.10 首批媒体协议支持范围
+
+V3 首批实际支持范围固定为：
+
+### A. 传输协议
+
+只支持通过 HTTP 或 HTTPS 获取的媒体资源。
+
+HTTP 和 HTTPS 请求必须经过 network_guard.py 和 media_gateway.py 的安全访问流程。
+
+所有实际连接必须使用通过安全检查的 IPv4 目标。
+
+### B. 媒体资源类型
+
+首批支持：
+
+1. HTTP/HTTPS 直接媒体资源。
+2. HTTP/HTTPS 传输的 MPEG-TS 媒体资源。
+3. HTTP/HTTPS 传输的 MP4 媒体资源。
+4. HTTP/HTTPS 传输的 HLS M3U8 播放列表。
+5. 通过受控 HLS 解析和改写访问的子播放列表、媒体分片、初始化分片和受支持的加密密钥资源。
+
+MPEG-TS 和 MP4 是媒体封装或资源格式，不是独立的网络传输协议。
+
+不能把媒体容器格式和 RTSP、RTMP 等传输协议混为一谈。
+
+### C. 首批 HLS 语法范围
+
+首批实现必须明确支持并测试：
+
+- Master Playlist。
+- Media Playlist。
+- EXT-X-STREAM-INF 后续 URI。
+- EXT-X-MEDIA 的 URI 属性。
+- EXT-X-I-FRAME-STREAM-INF 的 URI 属性。
+- 普通媒体分片 URI。
+- EXT-X-KEY 的受支持密钥 URI。
+- EXT-X-MAP 的初始化分片 URI。
+- EXT-X-BYTERANGE。
+- 相对 URI。
+- 查询参数。
+- 嵌套播放列表。
+- HTTP Range 请求。
+
+加密密钥首批只支持能够由当前 FFmpeg 环境安全处理的 AES-128 方式。
+
+不支持 DRM、SAMPLE-AES 或无法确认兼容性的其他加密方式。
+
+### D. 首批不支持范围
+
+首批不支持以下独立传输协议：
+
+- RTSP。
+- RTP。
+- UDP 组播或单播媒体流。
+- RTMP。
+- MMS。
+- 其他未明确实现并通过安全测试的协议。
+
+首批不支持无法安全解析和改写的 HLS 扩展功能，例如：
+
+- Low-Latency HLS 的 PART、PRELOAD-HINT 等资源引用。
+- Content Steering。
+- 尚未实现的其他 URI 扩展标签。
+- 无法安全处理的 DRM 或特殊密钥格式。
+
+### E. 不支持时的统一处理
+
+对于不支持的协议或资源类型：
+
+1. normalize.py 必须识别并记录不支持原因。
+2. 不得把不支持的协议伪装成 HTTP/HTTPS。
+3. 不得尝试通过 FFmpeg 直接访问原始外部地址。
+4. 不得绕过媒体网关。
+5. 可以在数据整理阶段明确淘汰，也可以在运行时因无法确定而标记 UNKNOWN。
+6. 不支持的线路不得进入正式订阅。
+
+首批支持范围以实际代码和对应测试为准。
+
+以后增加协议或 HLS 功能，必须先修改本文件、统一接口和安全测试范围，再修改程序。
+
+不得在 README.md 或 MASTER_PLAN.md 中提前宣传尚未实现的协议支持。
+
+## 7.11 HLS 和网关资源预算
+
+所有网关和 HLS 参数必须由 settings.py 统一管理。
+
+至少包括：
+
+### 网关映射
+
+- gateway_mapping_ttl_seconds：任务映射有效期。
+- gateway_max_mappings_per_task：单任务最大映射数量。
+- gateway_resource_id_bytes：资源标识随机强度。
+- gateway_request_timeout：单次网关请求超时。
+- gateway_max_response_bytes：单个普通响应最大字节数。
+- gateway_max_redirect_hops：最大重定向跳数。
+- gateway_max_header_count：允许的最大请求头数量。
+- gateway_max_header_value_bytes：单个请求头最大字节数。
+- gateway_max_header_total_bytes：请求头总字节数上限。
+
+### HLS
+
+- hls_max_resources：单任务最大 HLS 子资源数量。
+- hls_max_depth：最大嵌套播放列表深度。
+- hls_max_playlist_bytes：单个播放列表最大字节数。
+- hls_max_resource_bytes：单个 HLS 子资源最大响应字节数。
+- hls_max_total_bytes：单个 HLS 验证任务所有资源的总读取字节数上限。
+- hls_max_total_requests：单个 HLS 任务最大请求次数。
+- hls_max_concurrent_requests：单任务最大并发子资源请求数。
+- hls_max_request_timeout：单个 HLS 子资源请求超时。
+- hls_max_mapping_count：单个 HLS 任务最大映射数量。
+- hls_max_redirect_hops：HLS 子资源最大重定向跳数。
+- hls_max_header_total_bytes：HLS 请求头总字节数上限。
+
+资源预算必须在整个验证任务范围内累计。
+
+不能只限制单个分片大小，却允许大量分片使整个任务无限下载。
+
+达到总资源预算后，必须停止当前任务并根据证据标记 UNKNOWN。
+
+不得因为达到资源上限就影响其他独立线路继续验证。
+
+### 映射生命周期
+
+- 映射创建时记录创建时间和过期时间。
+- 映射不得超过 settings.py 规定的有效期。
+- 任务结束后立即清理。
+- 任务异常退出时执行清理。
+- 网关定期清理已经过期的映射。
+- 清理失败的映射不得重新授权。
+- 不得因为请求仍在进行就无限延长映射有效期。
+
+## 7.12 FFprobe 与 FFmpeg 验证规则
 
 必须明确区分 FFprobe 和 FFmpeg 的职责。
 
@@ -1364,7 +1641,7 @@ FFmpeg：
 
 不能因为 FFmpeg 超时就一律判定线路无效，必须区分线路响应问题、媒体读取问题和检测环境故障。
 
-## 7.11 广告和占位内容识别边界
+## 7.13 广告和占位内容识别边界
 
 可以在媒体检测中研究和实现明显广告片段、占位内容或异常媒体的辅助识别。
 
@@ -1382,7 +1659,7 @@ FFmpeg：
 
 广告和占位内容识别属于深度验证的辅助检查，不得形成独立业务入口。
 
-## 7.12 统一资源控制
+## 7.14 统一资源控制
 
 深度验证必须统一限制：
 
@@ -1406,6 +1683,13 @@ FFmpeg：
 - 最大重定向次数。
 - HLS 最大子资源数量。
 - HLS 最大嵌套深度。
+- HLS 单播放列表最大字节数。
+- HLS 单任务总读取字节数。
+- HLS 单任务最大请求次数。
+- HLS 最大并发请求数。
+- 网关映射有效期。
+- 网关映射最大数量。
+- 请求头数量和总字节数。
 - 容器 CPU 资源限制。
 - 容器内存资源限制。
 - 容器进程数量限制。
@@ -1423,15 +1707,21 @@ settings.py 至少应集中管理以下配置类别：
 | 来源发现 | source_timeout、source_max_bytes、max_source_count、source_retry、discovery_total_timeout、discovery_concurrency |
 | 快速筛选 | quick_connect_timeout、quick_read_timeout、quick_total_timeout、quick_concurrency |
 | 深度验证 | ffprobe_timeout、ffmpeg_timeout、max_media_bytes、max_media_duration、max_validation_jobs |
-| 媒体网关 | gateway_request_timeout、gateway_max_response_bytes、redirect_max_hops |
-| HLS | hls_max_resources、hls_max_depth、hls_max_playlist_bytes |
+| 媒体网关 | gateway_request_timeout、gateway_max_response_bytes、gateway_max_redirect_hops |
+| 网关映射 | gateway_mapping_ttl_seconds、gateway_max_mappings_per_task、gateway_resource_id_bytes |
+| 请求头 | gateway_max_header_count、gateway_max_header_value_bytes、gateway_max_header_total_bytes |
+| HLS | hls_max_resources、hls_max_depth、hls_max_playlist_bytes、hls_max_resource_bytes、hls_max_total_bytes、hls_max_total_requests、hls_max_concurrent_requests、hls_max_request_timeout、hls_max_mapping_count |
 | Docker | validator_cpu_limit、validator_memory_limit、validator_pids_limit、gateway_cpu_limit、gateway_memory_limit |
-| 网络安全 | allowed_schemes、allowed_ports、IPv4 强制策略、禁止访问的地址范围 |
+| 网络安全 | allowed_schemes、allowed_ports、IPv4 强制策略、禁止访问的地址范围、validator_net 子网和网关内部地址 |
 | 运行控制 | run_mode、运行级总超时、任务清理超时 |
 
 所有实际参数必须由 settings.py 提供统一读取入口。
 
-不允许在 discovery.py、validator.py、media_gateway.py 等模块中重复写入不同的默认参数。
+不得在 discovery.py、validator.py、media_gateway.py 等模块中重复写入不同的默认参数。
+
+Docker Compose 中必须使用与 settings.py 一致的固定网络地址和端口。
+
+涉及 Docker 启动阶段必须使用的静态安全规则时，必须通过统一配置和固定接口传递，不能在多个地方各写一套互相冲突的地址。
 
 ### 初始值和校准
 
@@ -1445,7 +1735,7 @@ settings.py 至少应集中管理以下配置类别：
 
 达到单线路预算时，应根据实际情况返回 FAIL 或 UNKNOWN，不得影响其他独立线路继续验证。
 
-## 7.13 Dockerfile 和共享安全模块
+## 7.15 Dockerfile 和共享安全模块
 
 network_guard.py 是唯一共享网络安全策略实现。
 
@@ -1457,13 +1747,13 @@ Dockerfile.gateway 必须从仓库构建上下文中复制同一份 network_guar
 
 不得在 media_gateway.py 中复制另一套 IP 黑名单、DNS 检查或重定向策略。
 
-Dockerfile.validator 只负责准备 FFmpeg/FFprobe 验证运行环境。
+Dockerfile.validator 只负责准备 FFmpeg/FFprobe 验证运行环境和必要的防火墙启动工具。
 
 Dockerfile.validator 不承担 Python 业务调度，不复制 pipeline.py 的业务逻辑。
 
 两个 Dockerfile 的职责必须保持独立。
 
-## 7.14 深度验证结果
+## 7.16 深度验证结果
 
 | 结果 | 处理 |
 |---|---|
@@ -1476,15 +1766,18 @@ Dockerfile.validator 不承担 Python 业务调度，不复制 pipeline.py 的�
 
 不得把环境故障错误地归因于某条线路。
 
-## 7.15 验收标准
+## 7.17 验收标准
 
 - Docker 环境正常。
 - Docker Compose 服务关系正确。
 - FFmpeg 容器只连接隔离内部网络。
 - 媒体网关同时连接内部网络和受控外部网络。
+- validator 网络命名空间内 nftables 规则成功加载。
+- FFmpeg 运行进程不具备 NET_ADMIN。
 - FFmpeg 容器不能绕过网关访问外部媒体源。
-- FFmpeg 只能访问允许的网关端口。
+- FFmpeg 只能访问网关的 TCP 8080 端口。
 - IPv4 和 IPv6 隔离测试有效。
+- 宿主机网关和其他容器访问受到阻断。
 - DNS rebinding 和 TOCTOU 防护经过测试。
 - 重定向逐跳检查有效。
 - 实际连接目标与安全检查目标一致。
@@ -1492,6 +1785,7 @@ Dockerfile.validator 不承担 Python 业务调度，不复制 pipeline.py 的�
 - 网关任务级映射有效。
 - 不同验证任务之间不能互相访问资源。
 - 任务结束后映射能够失效。
+- 映射过期后不能继续访问。
 - HLS 已声明支持的子资源请求全部经过网关。
 - HLS 相对 URI、URI 属性、密钥和分片处理正确。
 - Range 和 Byte Range 行为经过测试。
@@ -1642,6 +1936,7 @@ Artifact 名称必须包含本轮唯一运行标识，不能只使用一个所�
 - 没有任何线路通过深度验证。
 - 关键阶段发生 NODE_ERROR。
 - Docker 网络隔离关卡未通过。
+- nftables 端口限制未通过。
 - 媒体网关无法正常工作。
 - 本轮关键检测未可靠完成。
 - 临时 M3U 文件校验失败。
@@ -1907,23 +2202,59 @@ TEST 可以运行完整五阶段流程，但不得修改正式订阅文件，不
 
 ## 9.7 并发控制
 
-必须配置并发保护，避免多个正式任务同时写入订阅。
+并发控制采用唯一固定策略，不保留多种可选方案。
 
-PRODUCTION 使用固定的生产并发组，确保正式任务串行执行。
+### 固定并发组
 
-同一时间不得有多个正式任务同时修改正式订阅。
+PRODUCTION 使用：
 
-PRODUCTION 的并发设置不得允许新的正式任务取消正在执行的正式任务。
+    iptv-production
 
-TEST 不得与 PRODUCTION 共用会导致相互取消的并发组。
+TEST 使用：
 
-TEST 任务不得因为并发设置错误而取消正在进行的 PRODUCTION 任务。
+    iptv-test
 
-TEST 可以使用独立并发组，或者使用每次运行唯一的并发标识。
+两个运行模式必须使用不同的并发组。
 
-任务取消时必须避免产生半写入文件。
+### 固定队列规则
 
-并发规则必须与 Git 提交流程保持一致。
+两个并发组均采用：
+
+    queue: max
+    cancel-in-progress: false
+
+固定要求：
+
+1. 同一时间，同一个并发组最多运行一个工作流。
+2. 同一并发组的后续任务进入等待队列。
+3. 不允许新任务取消正在运行的任务。
+4. 不允许新任务替换同组已经排队的任务。
+5. TEST 和 PRODUCTION 互不取消。
+6. TEST 不得取消 PRODUCTION。
+7. PRODUCTION 不得取消 TEST。
+8. 两个组可以分别运行，不互相占用同一个并发锁。
+9. 生产任务必须按队列顺序逐个处理。
+10. TEST 任务必须按自己的队列顺序逐个处理。
+
+GitHub Actions concurrency 的 queue: max 最多允许 100 个待执行任务。
+
+队列达到平台上限时，新的任务可能无法进入队列，必须以 GitHub Actions 实际运行结果为准，不得假称无限排队。
+
+队列顺序以任务实际进入等待队列的时间为准，不得宣称它一定等同于定时触发时间或严格的 FIFO 调度时间。
+
+不得使用默认只保留一个 pending 的策略，因为新任务可能替换已经等待的任务。
+
+不得让 TEST 和 PRODUCTION 共用一个并发组。
+
+不得设置 cancel-in-progress: true。
+
+### 正式发布保护
+
+并发控制不能替代正式发布校验。
+
+每次 PRODUCTION 发布仍必须核对当前 workflow run、Artifact、commit SHA、Manifest 和文件摘要。
+
+即使并发队列正常，也不得允许旧运行产物覆盖新运行产物。
 
 ## 9.8 第三方 Actions
 
@@ -1955,13 +2286,15 @@ main.yml 负责：
 6. 检查 FFprobe、FFmpeg 及必要工具。
 7. 构建媒体网关和验证容器。
 8. 准备 Docker 网络。
-9. 执行必要的网络隔离安全测试。
-10. 启动唯一业务入口 pipeline.py。
-11. 根据 TEST 或 PRODUCTION 模式执行对应流程。
-12. 生成本轮运行报告。
-13. 生成本轮 M3U 和 Manifest。
-14. 上传本轮 Artifact。
-15. 输出本轮运行状态和发布资格。
+9. 加载 validator 容器网络防火墙。
+10. 检查 validator 容器降权状态。
+11. 执行必要的网络隔离安全测试。
+12. 启动唯一业务入口 pipeline.py。
+13. 根据 TEST 或 PRODUCTION 模式执行对应流程。
+14. 生成本轮运行报告。
+15. 生成本轮 M3U 和 Manifest。
+16. 上传本轮 Artifact。
+17. 输出本轮运行状态和发布资格。
 
 ### publish Job
 
@@ -2001,6 +2334,7 @@ publish Job 不得重新执行采集、整理、快速筛选和深度验证。
 - 各阶段执行状态。
 - 失败和未确定原因。
 - Docker 安全检查结果。
+- nftables 防火墙检查结果。
 - Artifact 是否生成。
 - Artifact 校验结果。
 - 是否成功更新远端订阅。
@@ -2033,11 +2367,15 @@ publish Job 不得重新执行采集、整理、快速筛选和深度验证。
 - Docker 环境。
 - Docker Compose。
 - FFprobe 和 FFmpeg。
+- nftables。
+- setpriv。
 - 配置文件格式。
 - 必要目录和文件。
 - Docker 镜像构建。
 - 网关启动条件。
 - 验证容器启动条件。
+- validator 防火墙加载条件。
+- validator 非 root 运行条件。
 
 基础工具无法正常工作时，应判断为环境故障，不得将其误判为线路 FAIL。
 
@@ -2080,6 +2418,13 @@ publish Job 不得重新执行采集、整理、快速筛选和深度验证。
 - publish Job 只使用当前 workflow run 的 Artifact。
 - Artifact Manifest 和 SHA-256 校验有效。
 - publish Job 不重新运行五阶段业务。
+- validator 容器启动时先加载 nftables。
+- validator 防火墙加载失败时容器不能进入正常验证状态。
+- FFmpeg/FFprobe 以非 root 用户运行。
+- FFmpeg/FFprobe 进程不具备 NET_ADMIN。
+- validator.py 调用 docker compose exec 时明确使用非 root 用户。
+- TEST 与 PRODUCTION 使用不同并发组。
+- TEST 不会取消正在运行的 PRODUCTION。
 
 ## 10.5 安全测试
 
@@ -2091,6 +2436,11 @@ publish Job 不得重新执行采集、整理、快速筛选和深度验证。
 - 回环地址访问拦截。
 - 链路本地地址访问拦截。
 - 特殊 IP 地址访问拦截。
+- NXDOMAIN 判定测试。
+- 无 IPv4 A 记录判定测试。
+- DNS timeout 的 UNKNOWN 判定测试。
+- DNS SERVFAIL 的 UNKNOWN 判定测试。
+- 共享 DNS 故障的 NODE_ERROR 判定测试。
 - DNS rebinding 测试。
 - DNS 检查与实际连接绑定测试。
 - DNS 变化后的目标重新检查。
@@ -2104,10 +2454,16 @@ publish Job 不得重新执行采集、整理、快速筛选和深度验证。
 
 - FFmpeg 容器公网 IPv4 访问阻断测试。
 - FFmpeg 容器公网 IPv6 访问阻断测试。
+- FFmpeg 容器宿主机网关访问阻断测试。
 - FFmpeg 容器网络绕行测试。
-- FFmpeg 容器只能访问网关的测试。
+- FFmpeg 容器只能访问网关 8080 的测试。
 - FFmpeg 容器非网关端口访问阻断测试。
+- FFmpeg 容器其他容器访问阻断测试。
 - 网关故障时禁止直连测试。
+- nftables 规则缺失时禁止启动测试。
+- nftables 规则加载失败时禁止启动测试。
+- NET_ADMIN 能力移除测试。
+- 非 root 用户运行测试。
 - 宿主机路由绕行测试。
 - 其他容器访问路径测试。
 
@@ -2118,9 +2474,13 @@ publish Job 不得重新执行采集、整理、快速筛选和深度验证。
 - 跨任务访问测试。
 - 过期映射访问测试。
 - 任务结束后的映射失效测试。
+- 映射数量上限测试。
+- 映射有效期测试。
 - 必要请求头隔离测试。
+- 请求头大小上限测试。
 - 重定向目标安全测试。
 - 网关开放代理风险测试。
+- 网关异常时拒绝代理测试。
 
 ### HLS
 
@@ -2133,8 +2493,25 @@ publish Job 不得重新执行采集、整理、快速筛选和深度验证。
 - HLS 字节范围请求测试。
 - HLS 查询参数保留测试。
 - HLS 必要请求头传递测试。
-- 未支持 HLS 语法的拒绝测试。
+- HLS 总资源预算测试。
+- HLS 最大资源数量测试。
+- HLS 最大嵌套深度测试。
+- HLS 最大请求次数测试。
+- HLS 未支持语法的拒绝测试。
 - HLS 子资源不会回退外部直连测试。
+
+### 协议范围
+
+- HTTP 媒体资源测试。
+- HTTPS 媒体资源测试。
+- HTTP/HTTPS HLS 测试。
+- MPEG-TS 资源测试。
+- MP4 资源测试。
+- RTSP 拒绝测试。
+- RTP/UDP 拒绝测试。
+- RTMP 拒绝测试。
+- 未知协议拒绝测试。
+- 不支持协议不能绕过网关测试。
 
 ### 凭证和日志
 
@@ -2142,6 +2519,7 @@ publish Job 不得重新执行采集、整理、快速筛选和深度验证。
 - Token 和 Cookie 泄漏测试。
 - 公开订阅敏感信息检查。
 - Actions 日志敏感信息检查。
+- 网关资源授权标识日志泄漏测试。
 
 模拟测试通过不等于真实网络隔离测试通过。
 
@@ -2161,8 +2539,13 @@ publish Job 不得重新执行采集、整理、快速筛选和深度验证。
 
 - 网络安全模块可以正常加载。
 - Docker 网络关系符合预期。
+- nftables 规则成功加载。
+- validator 容器已经完成权限降级。
+- FFmpeg 运行用户不是 root。
+- FFmpeg 进程不具备 NET_ADMIN。
+- FFmpeg 容器不能访问预期之外的网络目标。
+- FFmpeg 容器可以访问网关内部 8080 端口。
 - 媒体网关正常启动。
-- FFmpeg 不能通过预期之外的网络路径访问外部目标。
 - 网关内部访问正常。
 - 必要的安全关卡没有失败。
 
@@ -2183,6 +2566,9 @@ DNS rebinding、端口绕行、任务映射隔离、HLS 复杂语法和完整网
 - HLS URI 解析和改写。
 - DNS 连接绑定。
 - Docker 网络和端口限制。
+- nftables 规则。
+- validator 容器权限降级方式。
+- 首批支持协议范围。
 
 不得因为普通测试通过就跳过受影响的专项安全回归。
 
@@ -2213,6 +2599,8 @@ DNS rebinding、端口绕行、任务映射隔离、HLS 复杂语法和完整网
 
 修改 Artifact 格式时，必须同时检查 pipeline Job 和 publish Job。
 
+修改 HLS 资源解析时，必须重新检查所有受支持 URI 类型、资源预算和子资源访问路径。
+
 ## 10.8 异常隔离
 
 必须验证：
@@ -2222,6 +2610,7 @@ DNS rebinding、端口绕行、任务映射隔离、HLS 复杂语法和完整网
 - 单条线路 UNKNOWN，不影响其他线路的检测。
 - 全局工具故障能够正确阻止正式发布。
 - Docker 隔离失败能够阻止深度验证上线。
+- nftables 规则加载失败不能让 FFmpeg 继续运行。
 - 网关故障不会让 FFmpeg 直接联网。
 - HLS 子资源处理失败不会回退到外部直连。
 - 发布校验失败不会破坏旧订阅。
@@ -2231,6 +2620,8 @@ DNS rebinding、端口绕行、任务映射隔离、HLS 复杂语法和完整网
 - Manifest 不匹配不会继续发布。
 - Artifact 摘要错误不会继续发布。
 - pipeline Job 失败不会执行 publish Job。
+- TEST 运行不会取消 PRODUCTION。
+- PRODUCTION 运行不会取消 TEST。
 
 ## 10.9 关键故障保护
 
@@ -2240,6 +2631,8 @@ DNS rebinding、端口绕行、任务映射隔离、HLS 复杂语法和完整网
 - 本轮没有合格线路。
 - 关键检测环境发生 NODE_ERROR。
 - Docker 网络安全测试失败。
+- nftables 端口限制测试失败。
+- validator 权限降级失败。
 - 媒体网关不可用。
 - HLS 受控访问关键功能未通过测试。
 - 临时文件格式错误。
@@ -2312,8 +2705,11 @@ DNS rebinding、端口绕行、任务映射隔离、HLS 复杂语法和完整网
 8. 五阶段名称、顺序和职责必须完全一致。
 9. 模块名称和唯一职责必须完全一致。
 10. Docker 双网络和媒体网关架构必须完全一致。
-11. GitHub Actions 双 Job 和权限规则必须完全一致。
-12. 测试和验收状态必须以实际证据为准。
+11. Docker 网络命名、固定地址和端口限制必须完全一致。
+12. 首批媒体协议支持范围必须完全一致。
+13. GitHub Actions 双 Job 和权限规则必须完全一致。
+14. TEST 与 PRODUCTION 并发组和队列规则必须完全一致。
+15. 测试和验收状态必须以实际证据为准。
 
 如果发现冲突，先确定核心规范，再同步其他文档。
 
@@ -2354,6 +2750,9 @@ DNS rebinding、端口绕行、任务映射隔离、HLS 复杂语法和完整网
 - 不得因为某个实现复杂就擅自取消已经确定的安全要求。
 - 不得为了让文件变短而删掉已经确定的实施规则。
 - 不得在不同文档中重复定义互相冲突的参数和状态。
+- 不得把架构确定写成运行验收通过。
+- 不得把配置存在写成安全测试通过。
+- 不得把云端检测结果描述为所有用户网络环境的播放保证。
 
 ---
 
@@ -2375,7 +2774,9 @@ China-IPTV-Auto V3 的唯一目标是：
 - 一个发布模块：publisher.py。
 - 一个正式订阅文件：output/iptv.m3u。
 - 一套 Docker 双网络隔离架构。
+- 一套 validator 容器内部 nftables 端口级出站限制。
 - 一套统一数据接口和状态规则。
+- 一套明确的首批 HTTP/HTTPS、MPEG-TS、MP4 和受控 HLS 支持范围。
 - 一套统一测试、验收和发布保护制度。
 - 一套 pipeline Job 与 publish Job 的 Artifact 交接机制。
 
@@ -2387,6 +2788,8 @@ China-IPTV-Auto V3 的唯一目标是：
 - 定时触发采用 PRODUCTION。
 - pipeline Job 只有读取权限。
 - publish Job 只有满足发布条件时才拥有写入权限。
+- TEST 与 PRODUCTION 使用独立并发组。
+- 两个并发组均采用排队、不取消运行任务的策略。
 - 只有当前运行的 Artifact 校验通过，才允许正式更新订阅。
 
 项目必须坚持：
@@ -2400,6 +2803,7 @@ China-IPTV-Auto V3 的唯一目标是：
 - 不允许 HLS 子资源绕过媒体网关。
 - 不允许网关成为开放公网代理。
 - 不允许不同验证任务互相访问资源。
+- 不允许不支持的协议绕过网关。
 - 不把设计方案冒充已完成的程序。
 - 不把模拟测试冒充实际安全验收。
 - 不把工作区文件更新冒充远端正式发布。
