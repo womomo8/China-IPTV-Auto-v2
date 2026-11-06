@@ -507,7 +507,6 @@ validator 容器必须在自己的网络命名空间内建立 nftables 防火墙
 规则缺失或加载失败时，validator 容器不得进入正常验证状态。
 
 ## 3.5 防火墙初始化与权限降级
-## 3.5 防火墙初始化与权限降级
 
 Dockerfile.validator 必须提供：
 
