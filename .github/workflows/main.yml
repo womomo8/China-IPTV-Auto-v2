@@ -1,4 +1,3 @@
-
 name: Validator Network-None Security Precheck
 
 on:
@@ -45,6 +44,523 @@ jobs:
 
           test -f Dockerfile.validator
           test -f .github/workflows/main.yml
+          test -f models.py
+
+      - name: Compile and test models.py contracts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== Python version ==="
+          python3 --version
+
+          echo "=== Compile models.py ==="
+          python3 -m py_compile models.py
+
+          echo "PASS: models.py Python compilation."
+
+          echo "=== Run data contract tests ==="
+
+          python3 - <<'PY'
+          from models import (
+              SCHEMA_VERSION,
+              STAGE_ORDER,
+              Candidate,
+              ContainerResult,
+              ContractError,
+              ErrorInfo,
+              HostVerification,
+              LineResult,
+              LineStatus,
+              MediaFileEntry,
+              MediaManifest,
+              ProbeEvidence,
+              PublishDecision,
+              RunMode,
+              RunSummary,
+              SourceOutcome,
+              StageName,
+              StageResult,
+              StageStatus,
+              TaskIdentity,
+              TaskRequest,
+              TaskType,
+              validate_container_result,
+          )
+
+          def rejects(function, label):
+              try:
+                  function()
+              except ContractError:
+                  return
+              raise AssertionError(
+                  f"Expected ContractError: {label}"
+              )
+
+          now = "2026-11-07T00:00:00+00:00"
+          later = "2026-11-07T00:00:10+00:00"
+
+          identity = TaskIdentity(
+              "100",
+              1,
+              "task-1",
+              "candidate-1",
+              "resource-1",
+          )
+
+          candidate = Candidate(
+              "candidate-1",
+              "Test Channel",
+              "http://example.invalid/live.ts",
+              "source-1",
+          )
+
+          error = ErrorInfo(
+              "TEST_ERROR",
+              "Test error",
+              False,
+              "test",
+          )
+
+          evidence = ProbeEvidence(
+              ffprobe_exit_code=0,
+              ffmpeg_exit_code=0,
+              media_bytes_read=1024,
+              packets_read=10,
+              streams=("video",),
+              probe_completed=True,
+              playback_seconds=5.0,
+          )
+
+          assert evidence.sufficient_for_pass
+
+          # Serialization round trips.
+          assert ErrorInfo.from_dict(error.to_dict()) == error
+          assert Candidate.from_dict(candidate.to_dict()) == candidate
+
+          source = SourceOutcome(
+              "source-1",
+              (candidate,),
+              None,
+              True,
+          )
+          assert SourceOutcome.from_dict(
+              source.to_dict()
+          ) == source
+
+          request = TaskRequest(
+              SCHEMA_VERSION,
+              identity,
+              TaskType.MEDIA_PROBE,
+              now,
+              later,
+          )
+          assert TaskRequest.from_dict(
+              request.to_dict()
+          ) == request
+
+          entry = MediaFileEntry(
+              SCHEMA_VERSION,
+              identity,
+              "file-1",
+              "media/segment.ts",
+              "video/mp2t",
+              1024,
+              "a" * 64,
+              True,
+              now,
+          )
+          assert MediaFileEntry.from_dict(
+              entry.to_dict()
+          ) == entry
+
+          manifest = MediaManifest(
+              SCHEMA_VERSION,
+              identity,
+              (entry,),
+              now,
+          )
+          assert MediaManifest.from_dict(
+              manifest.to_dict()
+          ) == manifest
+
+          assert ProbeEvidence.from_dict(
+              evidence.to_dict()
+          ) == evidence
+
+          result = ContainerResult(
+              SCHEMA_VERSION,
+              identity,
+              "sha256:" + "b" * 64,
+              0,
+              now,
+              later,
+              evidence,
+              None,
+          )
+          assert ContainerResult.from_dict(
+              result.to_dict()
+          ) == result
+
+          line = LineResult(
+              candidate,
+              LineStatus.PASS,
+              "Successful media probe",
+              evidence,
+              None,
+          )
+          assert LineResult.from_dict(
+              line.to_dict()
+          ) == line
+
+          print("PASS: serialization round trips.")
+
+          # Task identity and request validation.
+          rejects(
+              lambda: TaskIdentity(
+                  "100",
+                  True,
+                  "task-1",
+                  "candidate-1",
+                  "resource-1",
+              ),
+              "boolean run_attempt",
+          )
+
+          rejects(
+              lambda: TaskRequest(
+                  SCHEMA_VERSION,
+                  identity,
+                  TaskType.MEDIA_PROBE,
+                  later,
+                  now,
+              ),
+              "deadline before creation",
+          )
+
+          print("PASS: task identity and deadline checks.")
+
+          # Media manifest validation.
+          rejects(
+              lambda: MediaFileEntry(
+                  SCHEMA_VERSION,
+                  identity,
+                  "file-2",
+                  "../outside.ts",
+                  "video/mp2t",
+                  1024,
+                  "a" * 64,
+                  True,
+                  now,
+              ),
+              "path traversal",
+          )
+
+          rejects(
+              lambda: MediaFileEntry(
+                  SCHEMA_VERSION,
+                  identity,
+                  "file-2",
+                  "media/incomplete.ts",
+                  "video/mp2t",
+                  1024,
+                  "a" * 64,
+                  False,
+                  now,
+              ),
+              "incomplete media",
+          )
+
+          other_identity = TaskIdentity(
+              "100",
+              1,
+              "task-1",
+              "candidate-1",
+              "resource-2",
+          )
+
+          other_entry = MediaFileEntry(
+              SCHEMA_VERSION,
+              other_identity,
+              "file-3",
+              "media/other.ts",
+              "video/mp2t",
+              1024,
+              "c" * 64,
+              True,
+              now,
+          )
+
+          rejects(
+              lambda: MediaManifest(
+                  SCHEMA_VERSION,
+                  identity,
+                  (other_entry,),
+                  now,
+              ),
+              "manifest identity mismatch",
+          )
+
+          print("PASS: media manifest checks.")
+
+          # Container result and host verification.
+          host = HostVerification(
+              identity,
+              "c" * 64,
+              True,
+              True,
+              True,
+              True,
+              True,
+          )
+
+          validate_container_result(
+              result,
+              identity,
+              host,
+          )
+
+          rejects(
+              lambda: validate_container_result(
+                  result,
+                  other_identity,
+                  host,
+              ),
+              "expected task identity mismatch",
+          )
+
+          untrusted_host = HostVerification(
+              identity,
+              "c" * 64,
+              False,
+              True,
+              True,
+              True,
+              True,
+          )
+
+          rejects(
+              lambda: validate_container_result(
+                  result,
+                  identity,
+                  untrusted_host,
+              ),
+              "untrusted host verification",
+          )
+
+          bad_exit_result = ContainerResult(
+              SCHEMA_VERSION,
+              identity,
+              "sha256:" + "b" * 64,
+              1,
+              now,
+              later,
+              evidence,
+              None,
+          )
+
+          rejects(
+              lambda: validate_container_result(
+                  bad_exit_result,
+                  identity,
+                  host,
+              ),
+              "nonzero container exit code",
+          )
+
+          no_evidence_result = ContainerResult(
+              SCHEMA_VERSION,
+              identity,
+              "sha256:" + "b" * 64,
+              0,
+              now,
+              later,
+              None,
+              None,
+          )
+
+          rejects(
+              lambda: validate_container_result(
+                  no_evidence_result,
+                  identity,
+                  host,
+              ),
+              "missing media evidence",
+          )
+
+          print("PASS: container result trust checks.")
+
+          # Line status validation.
+          insufficient_evidence = ProbeEvidence(
+              0,
+              1,
+              1024,
+              10,
+              ("video",),
+              True,
+              5.0,
+          )
+
+          rejects(
+              lambda: LineResult(
+                  candidate,
+                  LineStatus.PASS,
+                  "Invalid PASS",
+                  insufficient_evidence,
+                  None,
+              ),
+              "PASS without sufficient evidence",
+          )
+
+          rejects(
+              lambda: LineResult(
+                  candidate,
+                  LineStatus.NODE_ERROR,
+                  "Missing error details",
+                  None,
+                  None,
+              ),
+              "NODE_ERROR without error details",
+          )
+
+          print("PASS: line status checks.")
+
+          # Publish eligibility.
+          pre_publish_stages = tuple(
+              StageResult(
+                  stage,
+                  StageStatus.COMPLETED,
+                  now,
+                  later,
+              )
+              for stage in STAGE_ORDER[:-1]
+          )
+
+          formal_run = RunSummary(
+              "100",
+              1,
+              RunMode.FORMAL,
+              pre_publish_stages,
+              (line,),
+              False,
+          )
+
+          assert formal_run.publish_eligible
+
+          completed_publish_run = RunSummary(
+              "100",
+              1,
+              RunMode.FORMAL,
+              pre_publish_stages + (
+                  StageResult(
+                      StageName.PUBLISH,
+                      StageStatus.COMPLETED,
+                      now,
+                      later,
+                  ),
+              ),
+              (line,),
+              False,
+          )
+
+          assert completed_publish_run.publish_eligible
+
+          failed_publish_run = RunSummary(
+              "100",
+              1,
+              RunMode.FORMAL,
+              pre_publish_stages + (
+                  StageResult(
+                      StageName.PUBLISH,
+                      StageStatus.FAILED,
+                      now,
+                      later,
+                      error,
+                  ),
+              ),
+              (line,),
+              False,
+          )
+
+          assert not failed_publish_run.publish_eligible
+
+          skipped_publish_run = RunSummary(
+              "100",
+              1,
+              RunMode.FORMAL,
+              pre_publish_stages + (
+                  StageResult(
+                      StageName.PUBLISH,
+                      StageStatus.SKIPPED,
+                  ),
+              ),
+              (line,),
+              False,
+          )
+
+          assert not skipped_publish_run.publish_eligible
+
+          test_run = RunSummary(
+              "100",
+              1,
+              RunMode.TEST,
+              pre_publish_stages,
+              (line,),
+              False,
+          )
+
+          assert not test_run.publish_eligible
+
+          zero_pass_run = RunSummary(
+              "100",
+              1,
+              RunMode.FORMAL,
+              pre_publish_stages,
+              (),
+              False,
+          )
+
+          assert not zero_pass_run.publish_eligible
+
+          critical_run = RunSummary(
+              "100",
+              1,
+              RunMode.FORMAL,
+              pre_publish_stages,
+              (line,),
+              True,
+          )
+
+          assert not critical_run.publish_eligible
+
+          print("PASS: publish eligibility checks.")
+
+          # Publish decision validation.
+          PublishDecision(True, ())
+          PublishDecision(False, ("No PASS lines",))
+
+          rejects(
+              lambda: PublishDecision(True, ("rejected",)),
+              "eligible decision with rejection reason",
+          )
+
+          rejects(
+              lambda: PublishDecision(False, ()),
+              "rejected decision without reason",
+          )
+
+          rejects(
+              lambda: PublishDecision(
+                  True,
+                  (),
+                  "output/other.m3u",
+              ),
+              "incorrect output path",
+          )
+
+          print("PASS: publish decision checks.")
+          print("ALL MODELS CONTRACT TESTS PASSED.")
+          PY
 
       - name: Build validator image
         shell: bash
@@ -78,11 +594,7 @@ jobs:
 
           printf 'validator-precheck-media\n' > "$SNAPSHOT/sample.ts"
 
-          # Permit the container user to traverse the snapshot directory.
-          # The directory remains non-writable to non-owner users.
           chmod 0711 "$SNAPSHOT"
-
-          # The validator only needs read access to the input file.
           chmod 0444 "$SNAPSHOT/sample.ts"
 
           EXPECTED_SHA="$(sha256sum "$SNAPSHOT/sample.ts" | awk '{print $1}')"
