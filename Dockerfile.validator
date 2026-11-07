@@ -8,12 +8,13 @@ LABEL org.opencontainers.image.description="Network-isolated FFmpeg and FFprobe 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HOME=/tmp
 ENV TMPDIR=/tmp
-ENV PATH=/usr/local/bin:/usr/bin:/bin
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         ffmpeg \
+        passwd \
     && groupadd --gid 10001 validator \
     && useradd \
         --uid 10001 \
@@ -49,14 +50,12 @@ check_status() {
         "$field mismatch: expected $expected, got $actual."
 }
 
-# The container must start directly as the unprivileged validator user.
 [ "$(id -u)" = "10001" ] || fail \
     "Validator must run as UID 10001."
 
 [ "$(id -g)" = "10001" ] || fail \
     "Validator must run as GID 10001."
 
-# No Linux capabilities may be available to the process.
 EXPECTED_EMPTY_CAPS="0000000000000000"
 
 check_status CapEff "$EXPECTED_EMPTY_CAPS"
@@ -65,7 +64,6 @@ check_status CapInh "$EXPECTED_EMPTY_CAPS"
 check_status CapAmb "$EXPECTED_EMPTY_CAPS"
 check_status CapBnd "$EXPECTED_EMPTY_CAPS"
 
-# The host must enable no-new-privileges.
 check_status NoNewPrivs "1"
 
 command -v ffmpeg >/dev/null 2>&1 || fail \
