@@ -1,3 +1,4 @@
+
 """Shared, dependency-free data contracts for China-IPTV-Auto V3.
 
 This module defines and validates data shapes. It does not perform network,
@@ -953,13 +954,20 @@ class RunSummary:
             for result in self.stages
         }
 
+        required_pre_publish_stages = STAGE_ORDER[:-1]
+        publish_status = stage_map.get(StageName.PUBLISH)
+
         return (
             self.mode is RunMode.FORMAL
             and not self.critical_error
             and self.pass_count > 0
             and all(
                 stage_map.get(stage) is StageStatus.COMPLETED
-                for stage in STAGE_ORDER
+                for stage in required_pre_publish_stages
+            )
+            and publish_status not in (
+                StageStatus.FAILED,
+                StageStatus.SKIPPED,
             )
         )
 
