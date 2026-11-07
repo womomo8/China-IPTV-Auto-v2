@@ -1,8 +1,7 @@
-
 """Central, dependency-free configuration for China-IPTV-Auto V3.
 
-All limits here are initial engineering defaults, not measured nationwide
-performance guarantees. Keep operational thresholds centralized in this file.
+All limits are initial engineering defaults, not measured nationwide
+performance guarantees. Keep operational thresholds centralized here.
 """
 from __future__ import annotations
 
@@ -14,9 +13,11 @@ from typing import Final
 SCHEMA_VERSION: Final[str] = "1.0"
 FORMAL_MODE: Final[str] = "formal"
 TEST_MODE: Final[str] = "test"
-ALLOWED_RUN_MODES: Final[tuple[str, str]] = (FORMAL_MODE, TEST_MODE)
+ALLOWED_RUN_MODES: Final[tuple[str, str]] = (
+    FORMAL_MODE,
+    TEST_MODE,
+)
 
-# The publication path is fixed by CORE_FLOW.md and models.py.
 PUBLISH_OUTPUT_PATH: Final[str] = "output/iptv.m3u"
 
 
@@ -26,7 +27,6 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class Config:
-    # Run mode. TEST is the safe default; FORMAL must be explicitly selected.
     run_mode: str = TEST_MODE
 
     # Discovery and source collection.
@@ -42,16 +42,15 @@ class Config:
     quick_filter_concurrency: int = 8
     quick_filter_budget_seconds: int = 120
 
-    # Deep validation and overall request budget.
+    # Deep validation and whole-run budgets.
     deep_validation_max_candidates: int = 40
     deep_validation_concurrency: int = 4
     deep_validation_budget_seconds: int = 540
     line_deadline_seconds: int = 30
     run_deadline_seconds: int = 840
-    # Counts every outbound HTTP attempt, including retries and redirect hops.
     total_http_request_budget: int = 1600
 
-    # Network request controls. DNS/connect/read are separate phase limits.
+    # Network request controls.
     dns_timeout_seconds: int = 3
     connect_timeout_seconds: int = 5
     read_timeout_seconds: int = 8
@@ -59,11 +58,13 @@ class Config:
     max_redirects: int = 3
     max_dns_cname_depth: int = 8
     max_dns_a_records: int = 16
+
     require_ipv4_only: bool = True
     pin_checked_ipv4: bool = True
     verify_tls_certificates: bool = True
     ignore_environment_proxies: bool = True
     reject_mixed_public_private_dns: bool = True
+
     max_retries: int = 1
     retry_backoff_seconds: float = 0.5
 
@@ -73,16 +74,18 @@ class Config:
     max_resources_per_candidate: int = 24
     max_download_bytes_per_candidate: int = 32 * 1024 * 1024
     max_download_bytes_per_run: int = 512 * 1024 * 1024
+
     hls_max_playlist_refreshes: int = 3
     hls_validation_seconds: int = 12
     hls_segment_request_timeout_seconds: int = 8
 
-    # Isolated validator container limits. These do not grant network access.
+    # Isolated validator container limits.
     validator_cpu_limit: float = 1.0
     validator_memory_bytes: int = 384 * 1024 * 1024
     validator_pids_limit: int = 32
     validator_nofile_limit: int = 128
     validator_tmpfs_bytes: int = 64 * 1024 * 1024
+
     ffprobe_timeout_seconds: int = 8
     ffmpeg_timeout_seconds: int = 12
     validator_container_timeout_seconds: int = 30
@@ -99,6 +102,7 @@ class Config:
     m3u_max_name_chars: int = 256
     m3u_max_group_chars: int = 128
     m3u_max_line_chars: int = 8192
+
     m3u_require_extm3u_header: bool = True
     m3u_require_extinf_for_each_url: bool = True
     m3u_allow_only_http_https: bool = True
@@ -110,6 +114,7 @@ DEFAULT_CONFIG: Final[Config] = Config()
 
 def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
     """Validate types, ranges, cross-field relationships and fixed contracts."""
+
     if not isinstance(config, Config):
         raise ConfigError("config must be a Config instance")
 
@@ -154,6 +159,7 @@ def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
         "m3u_max_group_chars",
         "m3u_max_line_chars",
     )
+
     non_negative_int_fields = (
         "max_redirects",
         "max_dns_cname_depth",
@@ -165,22 +171,37 @@ def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
 
     for name in positive_int_fields:
         value = getattr(config, name)
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"{name} must be a positive integer")
+
+        if value <= 0:
             raise ConfigError(f"{name} must be a positive integer")
 
     for name in non_negative_int_fields:
         value = getattr(config, name)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"{name} must be a non-negative integer")
+
+        if value < 0:
             raise ConfigError(f"{name} must be a non-negative integer")
 
     for name in ("validator_cpu_limit", "retry_backoff_seconds"):
         value = getattr(config, name)
+
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ConfigError(f"{name} must be numeric")
-        if not math.isfinite(value) or value <= 0:
-            raise ConfigError(f"{name} must be finite and greater than zero")
 
-    if not isinstance(config.run_mode, str) or config.run_mode not in ALLOWED_RUN_MODES:
+        if not math.isfinite(value) or value <= 0:
+            raise ConfigError(
+                f"{name} must be finite and greater than zero"
+            )
+
+    if (
+        not isinstance(config.run_mode, str)
+        or config.run_mode not in ALLOWED_RUN_MODES
+    ):
         raise ConfigError("run_mode must be 'formal' or 'test'")
 
     if config.m3u_output_path != PUBLISH_OUTPUT_PATH:
@@ -188,10 +209,13 @@ def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
             f"m3u_output_path is fixed at {PUBLISH_OUTPUT_PATH!r}"
         )
 
-    if not isinstance(config.m3u_encoding, str) or config.m3u_encoding.lower().replace("_", "-") != "utf-8":
+    if (
+        not isinstance(config.m3u_encoding, str)
+        or config.m3u_encoding.lower().replace("_", "-") != "utf-8"
+    ):
         raise ConfigError("m3u_encoding must be UTF-8")
 
-    for name in (
+    boolean_fields = (
         "m3u_require_extm3u_header",
         "m3u_require_extinf_for_each_url",
         "m3u_allow_only_http_https",
@@ -201,11 +225,13 @@ def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
         "verify_tls_certificates",
         "ignore_environment_proxies",
         "reject_mixed_public_private_dns",
-    ):
+    )
+
+    for name in boolean_fields:
         if not isinstance(getattr(config, name), bool):
             raise ConfigError(f"{name} must be bool")
 
-    # Network security switches are mandatory V3 boundaries, not optional tuning.
+    # Mandatory V3 security boundaries.
     for name in (
         "require_ipv4_only",
         "pin_checked_ipv4",
@@ -214,35 +240,50 @@ def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
         "reject_mixed_public_private_dns",
     ):
         if getattr(config, name) is not True:
-            raise ConfigError(f"{name} must remain enabled by CORE_FLOW.md")
+            raise ConfigError(
+                f"{name} must remain enabled by CORE_FLOW.md"
+            )
 
-    # Collection and filtering caps must be ordered and finite.
+    # Candidate limits describe different pipeline stages.
+    # M3U output capacity is independent of validation capacity.
     if config.max_candidates < config.quick_filter_max_candidates:
         raise ConfigError(
             "max_candidates must be >= quick_filter_max_candidates"
         )
-    if config.quick_filter_max_candidates < config.deep_validation_max_candidates:
+
+    if (
+        config.quick_filter_max_candidates
+        < config.deep_validation_max_candidates
+    ):
         raise ConfigError(
-            "quick_filter_max_candidates must be >= deep_validation_max_candidates"
-        )
-    if config.deep_validation_max_candidates > config.m3u_max_entries:
-        raise ConfigError(
-            "deep_validation_max_candidates must be <= m3u_max_entries"
+            "quick_filter_max_candidates must be >= "
+            "deep_validation_max_candidates"
         )
 
-    # Parallelism cannot exceed the number of work items.
     if config.source_concurrency > config.max_sources:
-        raise ConfigError("source_concurrency cannot exceed max_sources")
-    if config.quick_filter_concurrency > config.quick_filter_max_candidates:
         raise ConfigError(
-            "quick_filter_concurrency cannot exceed quick_filter_max_candidates"
-        )
-    if config.deep_validation_concurrency > config.deep_validation_max_candidates:
-        raise ConfigError(
-            "deep_validation_concurrency cannot exceed deep_validation_max_candidates"
+            "source_concurrency cannot exceed max_sources"
         )
 
-    # A single request's phase timeouts must fit inside its total timeout.
+    if (
+        config.quick_filter_concurrency
+        > config.quick_filter_max_candidates
+    ):
+        raise ConfigError(
+            "quick_filter_concurrency cannot exceed "
+            "quick_filter_max_candidates"
+        )
+
+    if (
+        config.deep_validation_concurrency
+        > config.deep_validation_max_candidates
+    ):
+        raise ConfigError(
+            "deep_validation_concurrency cannot exceed "
+            "deep_validation_max_candidates"
+        )
+
+    # Request timeout relationships.
     if config.request_timeout_seconds < max(
         config.dns_timeout_seconds,
         config.connect_timeout_seconds,
@@ -251,118 +292,175 @@ def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
         raise ConfigError(
             "request_timeout_seconds must be >= each phase timeout"
         )
+
     if config.source_timeout_seconds < config.request_timeout_seconds:
         raise ConfigError(
             "source_timeout_seconds must be >= request_timeout_seconds"
         )
-    if config.hls_segment_request_timeout_seconds > config.request_timeout_seconds:
+
+    if (
+        config.hls_segment_request_timeout_seconds
+        > config.request_timeout_seconds
+    ):
         raise ConfigError(
             "HLS segment timeout cannot exceed request_timeout_seconds"
         )
 
+    # Media resource budgets.
     if config.max_playlist_bytes > config.max_media_resource_bytes:
-        raise ConfigError("playlist byte limit cannot exceed the media resource limit")
+        raise ConfigError(
+            "playlist byte limit cannot exceed media resource limit"
+        )
 
-    # Media limits must be coherent at per-resource, per-candidate and run levels.
-    if config.max_download_bytes_per_candidate < config.max_media_resource_bytes:
+    if (
+        config.max_download_bytes_per_candidate
+        < config.max_media_resource_bytes
+    ):
         raise ConfigError(
             "per-candidate download budget must be >= one resource limit"
         )
-    if config.max_download_bytes_per_candidate > config.max_download_bytes_per_run:
+
+    if (
+        config.max_download_bytes_per_candidate
+        > config.max_download_bytes_per_run
+    ):
         raise ConfigError(
-            "per-candidate download budget cannot exceed per-run budget"
-        )
-    if config.max_resources_per_candidate * config.max_media_resource_bytes < config.max_download_bytes_per_candidate:
-        raise ConfigError(
-            "resource count and per-resource size cannot support the per-candidate budget"
-        )
-    if config.max_download_bytes_per_run < config.max_download_bytes_per_candidate:
-        raise ConfigError(
-            "per-run download budget must allow at least one full candidate budget"
+            "per-candidate budget cannot exceed per-run budget"
         )
 
-    # HLS validation must fit within a line deadline.
+    if (
+        config.max_resources_per_candidate
+        * config.max_media_resource_bytes
+        < config.max_download_bytes_per_candidate
+    ):
+        raise ConfigError(
+            "resource count and per-resource size cannot support "
+            "per-candidate budget"
+        )
+
+    # HLS and validator deadlines.
     if config.hls_validation_seconds > config.line_deadline_seconds:
         raise ConfigError(
-            "HLS validation time cannot exceed the per-line deadline"
-        )
-    if config.ffprobe_timeout_seconds + config.ffmpeg_timeout_seconds > config.validator_container_timeout_seconds:
-        raise ConfigError(
-            "FFprobe and FFmpeg timeouts exceed the container deadline"
-        )
-    if config.validator_container_timeout_seconds > config.line_deadline_seconds:
-        raise ConfigError(
-            "validator container timeout cannot exceed the per-line deadline"
+            "HLS validation time cannot exceed per-line deadline"
         )
 
-    # The run budget must leave time for all stages and cleanup.
+    if (
+        config.ffprobe_timeout_seconds
+        + config.ffmpeg_timeout_seconds
+        > config.validator_container_timeout_seconds
+    ):
+        raise ConfigError(
+            "FFprobe and FFmpeg timeouts exceed container deadline"
+        )
+
+    if (
+        config.validator_container_timeout_seconds
+        > config.line_deadline_seconds
+    ):
+        raise ConfigError(
+            "validator container timeout cannot exceed per-line deadline"
+        )
+
+    # Whole-run deadline must cover all stage budgets and cleanup.
     minimum_run_budget = (
         config.discovery_budget_seconds
         + config.quick_filter_budget_seconds
         + config.deep_validation_budget_seconds
         + config.cleanup_grace_seconds
     )
+
     if config.run_deadline_seconds < minimum_run_budget:
         raise ConfigError(
-            "run_deadline_seconds is shorter than the sum of stage budgets and cleanup"
-        )
-    if config.deep_validation_budget_seconds < config.line_deadline_seconds:
-        raise ConfigError(
-            "deep validation budget must allow at least one complete line deadline"
+            "run_deadline_seconds is shorter than stage budgets plus cleanup"
         )
 
-    # Keep container limits within the verified precheck safety envelope.
+    if (
+        config.deep_validation_budget_seconds
+        < config.line_deadline_seconds
+    ):
+        raise ConfigError(
+            "deep validation budget must allow at least one complete "
+            "line deadline"
+        )
+
+    # Keep container limits within the verified precheck envelope.
     if config.validator_memory_bytes < 256 * 1024 * 1024:
-        raise ConfigError("validator_memory_bytes must be at least 256 MiB")
+        raise ConfigError(
+            "validator_memory_bytes must be at least 256 MiB"
+        )
+
     if config.validator_pids_limit < 8:
-        raise ConfigError("validator_pids_limit must be at least 8")
+        raise ConfigError(
+            "validator_pids_limit must be at least 8"
+        )
+
     if config.validator_nofile_limit < 32:
-        raise ConfigError("validator_nofile_limit must be at least 32")
+        raise ConfigError(
+            "validator_nofile_limit must be at least 32"
+        )
+
     if config.validator_tmpfs_bytes < 16 * 1024 * 1024:
-        raise ConfigError("validator_tmpfs_bytes must be at least 16 MiB")
+        raise ConfigError(
+            "validator_tmpfs_bytes must be at least 16 MiB"
+        )
+
     if config.validator_cpu_limit > 1.0:
         raise ConfigError(
-            "validator_cpu_limit cannot exceed the currently verified 1 CPU boundary"
-        )
-    if config.validator_memory_bytes > 512 * 1024 * 1024:
-        raise ConfigError(
-            "validator_memory_bytes cannot exceed the currently verified 512 MiB boundary"
-        )
-    if config.validator_pids_limit > 64:
-        raise ConfigError(
-            "validator_pids_limit cannot exceed the currently verified 64 PID boundary"
-        )
-    if config.validator_tmpfs_bytes > 64 * 1024 * 1024:
-        raise ConfigError(
-            "validator_tmpfs_bytes cannot exceed the currently verified 64 MiB boundary"
+            "validator_cpu_limit cannot exceed 1 CPU"
         )
 
-    if config.task_ttl_seconds < config.validator_container_timeout_seconds:
+    if config.validator_memory_bytes > 512 * 1024 * 1024:
+        raise ConfigError(
+            "validator_memory_bytes cannot exceed 512 MiB"
+        )
+
+    if config.validator_pids_limit > 64:
+        raise ConfigError(
+            "validator_pids_limit cannot exceed 64 PID"
+        )
+
+    if config.validator_tmpfs_bytes > 64 * 1024 * 1024:
+        raise ConfigError(
+            "validator_tmpfs_bytes cannot exceed 64 MiB"
+        )
+
+    if (
+        config.task_ttl_seconds
+        < config.validator_container_timeout_seconds
+    ):
         raise ConfigError(
             "task_ttl_seconds must be >= validator_container_timeout_seconds"
         )
+
     if config.cleanup_grace_seconds < 5:
-        raise ConfigError("cleanup_grace_seconds must be at least 5 seconds")
+        raise ConfigError(
+            "cleanup_grace_seconds must be at least 5 seconds"
+        )
 
     if config.m3u_max_line_chars < 4096:
-        raise ConfigError("M3U line limit must accommodate the models.py URL limit")
-    if config.m3u_max_entries < 1:
-        raise ConfigError("M3U must permit at least one entry")
+        raise ConfigError(
+            "M3U line limit must accommodate models.py URL limit"
+        )
 
     return config
 
 
 def load_config(run_mode: str | None = None) -> Config:
-    """Return validated configuration, requiring an explicit formal mode."""
+    """Return validated configuration; FORMAL must be explicitly selected."""
     selected_mode = TEST_MODE if run_mode is None else run_mode
-    config = Config(run_mode=selected_mode)
-    return validate_config(config)
+    return validate_config(Config(run_mode=selected_mode))
 
 
-def config_as_dict(config: Config = DEFAULT_CONFIG) -> dict[str, object]:
+def config_as_dict(
+    config: Config = DEFAULT_CONFIG,
+) -> dict[str, object]:
     """Return a plain dictionary for diagnostics without mutating the config."""
     validate_config(config)
-    return {item.name: getattr(config, item.name) for item in fields(config)}
+
+    return {
+        item.name: getattr(config, item.name)
+        for item in fields(config)
+    }
 
 
 # Fail fast if source-controlled defaults are internally inconsistent.
