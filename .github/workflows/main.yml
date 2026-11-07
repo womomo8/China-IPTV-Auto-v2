@@ -45,7 +45,186 @@ jobs:
           test -f Dockerfile.validator
           test -f .github/workflows/main.yml
           test -f models.py
+      - name: Compile and test config.py
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
+          echo "=== Compile config.py ==="
+          python3 -m py_compile config.py
+
+          echo "=== Run config.py tests ==="
+
+          python3 - <<'PY'
+          from dataclasses import replace
+
+          from config import (
+              Config,
+              ConfigError,
+              DEFAULT_CONFIG,
+              FORMAL_MODE,
+              TEST_MODE,
+              config_as_dict,
+              load_config,
+              validate_config,
+          )
+
+          def rejects(function, label):
+              try:
+                  function()
+              except ConfigError:
+                  return
+              raise AssertionError(
+                  f"Expected ConfigError: {label}"
+              )
+
+          # Default configuration.
+          assert validate_config(DEFAULT_CONFIG) == DEFAULT_CONFIG
+          assert load_config().run_mode == TEST_MODE
+          assert load_config(FORMAL_MODE).run_mode == FORMAL_MODE
+          assert config_as_dict(DEFAULT_CONFIG)["run_mode"] == TEST_MODE
+
+          print("PASS: default configuration and run modes.")
+
+          # Validation candidate capacity is independent of M3U output cap.
+          independent_output_cap = replace(
+              DEFAULT_CONFIG,
+              deep_validation_max_candidates=40,
+              m3u_max_entries=10,
+          )
+          assert validate_config(independent_output_cap)
+
+          print("PASS: validation capacity is independent of M3U entry cap.")
+
+          # Invalid modes and object types.
+          rejects(
+              lambda: load_config("unknown"),
+              "unknown run mode",
+          )
+
+          rejects(
+              lambda: validate_config({}),
+              "wrong configuration object",
+          )
+
+          # Invalid integer types and ranges.
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_sources=True)
+              ),
+              "boolean used as integer",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_sources=0)
+              ),
+              "zero source limit",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_redirects=-1)
+              ),
+              "negative redirect limit",
+          )
+
+          # Security switches must not be disabled.
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, require_ipv4_only=False)
+              ),
+              "IPv4-only security boundary disabled",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, verify_tls_certificates=False)
+              ),
+              "TLS verification disabled",
+          )
+
+          # Invalid output contract.
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, m3u_output_path="other.m3u")
+              ),
+              "output path changed",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, m3u_encoding="ascii")
+              ),
+              "invalid output encoding",
+          )
+
+          # Contradictory request timeouts.
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, request_timeout_seconds=2)
+              ),
+              "request timeout shorter than phase timeout",
+          )
+
+          # Contradictory candidate limits.
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_candidates=100)
+              ),
+              "candidate capacity below quick-filter capacity",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(
+                      DEFAULT_CONFIG,
+                      quick_filter_max_candidates=20,
+                  )
+              ),
+              "quick-filter capacity below deep-validation capacity",
+          )
+
+          # Contradictory media budgets.
+          rejects(
+              lambda: validate_config(
+                  replace(
+                      DEFAULT_CONFIG,
+                      max_download_bytes_per_candidate=1024,
+                  )
+              ),
+              "candidate download budget below resource size",
+          )
+
+          # Contradictory run deadlines.
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, run_deadline_seconds=100)
+              ),
+              "whole-run deadline too short",
+          )
+
+          # Container security resource boundaries.
+          rejects(
+              lambda: validate_config(
+                  replace(
+                      DEFAULT_CONFIG,
+                      validator_memory_bytes=600 * 1024 * 1024,
+                  )
+              ),
+              "container memory exceeds verified boundary",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, validator_pids_limit=100)
+              ),
+              "container PID limit exceeds verified boundary",
+          )
+
+          print("PASS: invalid types, values and security boundaries.")
+          print("ALL CONFIGURATION TESTS PASSED.")
+          PY
       - name: Compile and test models.py contracts
         shell: bash
         run: |
