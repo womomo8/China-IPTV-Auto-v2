@@ -144,14 +144,6 @@ jobs:
               "TLS verification disabled",
           )
 
-          # Invalid output contract.
-          rejects(
-              lambda: validate_config(
-                  replace(DEFAULT_CONFIG, m3u_output_path="other.m3u")
-              ),
-              "output path changed",
-          )
-
           rejects(
               lambda: validate_config(
                   replace(DEFAULT_CONFIG, m3u_encoding="ascii")
@@ -258,7 +250,6 @@ jobs:
               RunMode,
               RunSummary,
               SourceOutcome,
-              StageName,
               StageResult,
               StageStatus,
               TaskIdentity,
@@ -604,7 +595,7 @@ jobs:
 
           print("PASS: line status checks.")
 
-          # Publish eligibility.
+          # RunSummary stores run data only; it does not decide publication.
           pre_publish_stages = tuple(
               StageResult(
                   stage,
@@ -615,7 +606,7 @@ jobs:
               for stage in STAGE_ORDER[:-1]
           )
 
-          formal_run = RunSummary(
+          run_summary = RunSummary(
               "100",
               1,
               RunMode.FORMAL,
@@ -624,97 +615,22 @@ jobs:
               False,
           )
 
-          assert formal_run.publish_eligible
+          summary_data = run_summary.to_dict()
 
-          completed_publish_run = RunSummary(
-              "100",
-              1,
-              RunMode.FORMAL,
-              pre_publish_stages + (
-                  StageResult(
-                      StageName.PUBLISH,
-                      StageStatus.COMPLETED,
-                      now,
-                      later,
-                  ),
-              ),
-              (line,),
-              False,
-          )
+          assert set(summary_data) == {
+              "run_id",
+              "run_attempt",
+              "mode",
+              "stages",
+              "line_results",
+              "critical_error",
+          }
+          assert "pass_count" not in summary_data
+          assert "publish_eligible" not in summary_data
 
-          assert completed_publish_run.publish_eligible
+          print("PASS: RunSummary data-only serialization.")
 
-          failed_publish_run = RunSummary(
-              "100",
-              1,
-              RunMode.FORMAL,
-              pre_publish_stages + (
-                  StageResult(
-                      StageName.PUBLISH,
-                      StageStatus.FAILED,
-                      now,
-                      later,
-                      error,
-                  ),
-              ),
-              (line,),
-              False,
-          )
-
-          assert not failed_publish_run.publish_eligible
-
-          skipped_publish_run = RunSummary(
-              "100",
-              1,
-              RunMode.FORMAL,
-              pre_publish_stages + (
-                  StageResult(
-                      StageName.PUBLISH,
-                      StageStatus.SKIPPED,
-                  ),
-              ),
-              (line,),
-              False,
-          )
-
-          assert not skipped_publish_run.publish_eligible
-
-          test_run = RunSummary(
-              "100",
-              1,
-              RunMode.TEST,
-              pre_publish_stages,
-              (line,),
-              False,
-          )
-
-          assert not test_run.publish_eligible
-
-          zero_pass_run = RunSummary(
-              "100",
-              1,
-              RunMode.FORMAL,
-              pre_publish_stages,
-              (),
-              False,
-          )
-
-          assert not zero_pass_run.publish_eligible
-
-          critical_run = RunSummary(
-              "100",
-              1,
-              RunMode.FORMAL,
-              pre_publish_stages,
-              (line,),
-              True,
-          )
-
-          assert not critical_run.publish_eligible
-
-          print("PASS: publish eligibility checks.")
-
-          # Publish decision validation.
+          # PublishDecision contains eligibility and reasons only.
           PublishDecision(True, ())
           PublishDecision(False, ("No PASS lines",))
 
@@ -728,16 +644,7 @@ jobs:
               "rejected decision without reason",
           )
 
-          rejects(
-              lambda: PublishDecision(
-                  True,
-                  (),
-                  "output/other.m3u",
-              ),
-              "incorrect output path",
-          )
-
-          print("PASS: publish decision checks.")
+          print("PASS: publish decision data contract.")
           print("ALL MODELS CONTRACT TESTS PASSED.")
           PY
 
