@@ -7,7 +7,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 import math
+import re
 from typing import Final
+from urllib.parse import urlsplit
 
 
 FORMAL_MODE: Final[str] = "formal"
@@ -19,9 +21,80 @@ ALLOWED_RUN_MODES: Final[tuple[str, str]] = (
 
 PUBLISH_OUTPUT_PATH: Final[str] = "output/iptv.m3u"
 
+_SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
 
 class ConfigError(ValueError):
     """Raised when configuration values are invalid or contradictory."""
+
+
+@dataclass(frozen=True)
+class SourceDefinition:
+    """A configured source entry.
+
+    URL syntax is checked here. Public-IP, DNS, redirect, TLS and network
+    safety checks must be performed by security.py at runtime.
+    """
+
+    source_id: str
+    url: str
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.source_id, str)
+            or not _SOURCE_ID_RE.fullmatch(self.source_id)
+        ):
+            raise ConfigError(
+                "source_id must be a valid non-empty identifier"
+            )
+
+        if (
+            not isinstance(self.url, str)
+            or not self.url
+            or len(self.url) > 4096
+            or self.url != self.url.strip()
+            or any(ord(char) < 32 for char in self.url)
+        ):
+            raise ConfigError("source URL must be a valid non-empty string")
+
+        try:
+            parsed = urlsplit(self.url)
+            # Accessing .port also validates the port syntax and range.
+            _ = parsed.port
+        except ValueError as exc:
+            raise ConfigError("source URL has an invalid port or format") from exc
+
+        if parsed.scheme.lower() not in ("http", "https"):
+            raise ConfigError("source URL must use HTTP or HTTPS")
+
+        if not parsed.hostname:
+            raise ConfigError("source URL must contain a hostname")
+
+        if parsed.username is not None or parsed.password is not None:
+            raise ConfigError("source URL must not contain embedded credentials")
+
+        if parsed.fragment:
+            raise ConfigError("source URL must not contain a fragment")
+
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("source enabled must be bool")
+
+
+# Source registry:
+# - Add a SourceDefinition to register another source.
+# - Change its URL to replace a source address.
+# - Set enabled=False to temporarily disable a source.
+# - Remove the entry to delete it from the registry.
+#
+# This is a configuration registry, not a trust list. Every network request
+# must still pass the complete security checks in security.py.
+SOURCE_REGISTRY: Final[tuple[SourceDefinition, ...]] = (
+    SourceDefinition(
+        source_id="source-001",
+        url="http://1.94.31.214/live/live9/dgtv.txt",
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -108,6 +181,64 @@ class Config:
 
 
 DEFAULT_CONFIG: Final[Config] = Config()
+
+
+def validate_source_registry(
+    sources: tuple[SourceDefinition, ...] = SOURCE_REGISTRY,
+    config: Config = DEFAULT_CONFIG,
+) -> tuple[SourceDefinition, ...]:
+    """Validate the configured source registry without network access."""
+
+    if not isinstance(sources, tuple):
+        raise ConfigError("source registry must be a tuple")
+
+    if not isinstance(config, Config):
+        raise ConfigError("config must be a Config instance")
+
+    source_ids: set[str] = set()
+    source_urls: set[str] = set()
+    enabled_count = 0
+
+    for source in sources:
+        if not isinstance(source, SourceDefinition):
+            raise ConfigError(
+                "every source registry entry must be SourceDefinition"
+            )
+
+        if source.source_id in source_ids:
+            raise ConfigError(
+                f"duplicate source_id: {source.source_id}"
+            )
+
+        normalized_url = source.url.rstrip("/")
+
+        if normalized_url in source_urls:
+            raise ConfigError(
+                f"duplicate source URL: {source.source_id}"
+            )
+
+        source_ids.add(source.source_id)
+        source_urls.add(normalized_url)
+
+        if source.enabled:
+            enabled_count += 1
+
+    if enabled_count > config.max_sources:
+        raise ConfigError(
+            "enabled source count cannot exceed max_sources"
+        )
+
+    return sources
+
+
+def enabled_sources(
+    sources: tuple[SourceDefinition, ...] = SOURCE_REGISTRY,
+) -> tuple[SourceDefinition, ...]:
+    """Return enabled source entries in their configured order."""
+
+    validate_source_registry(sources)
+
+    return tuple(source for source in sources if source.enabled)
 
 
 def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
@@ -458,3 +589,4 @@ def config_as_dict(
 
 # Fail fast if source-controlled defaults are internally inconsistent.
 validate_config(DEFAULT_CONFIG)
+validate_source_registry()
