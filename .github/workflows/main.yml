@@ -45,6 +45,7 @@ jobs:
           test -f Dockerfile.validator
           test -f .github/workflows/main.yml
           test -f models.py
+
       - name: Compile and test config.py
         shell: bash
         run: |
@@ -64,10 +65,14 @@ jobs:
               DEFAULT_CONFIG,
               FORMAL_MODE,
               TEST_MODE,
+              USER_CHANNELS,
               config_as_dict,
               load_config,
+              user_channel_mode,
               validate_config,
+              validate_user_channels,
           )
+          from models import ChannelMode, UserChannelConfig
 
           def rejects(function, label):
               try:
@@ -215,8 +220,139 @@ jobs:
           )
 
           print("PASS: invalid types, values and security boundaries.")
+
+          # New global discovery budget boundaries.
+          assert validate_config(
+              replace(
+                  DEFAULT_CONFIG,
+                  max_total_redirects=800,
+                  max_total_retries=800,
+              )
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_total_redirects=True)
+              ),
+              "boolean global redirect budget",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_total_retries=-1)
+              ),
+              "negative global retry budget",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(
+                      DEFAULT_CONFIG,
+                      max_total_redirects=801,
+                      max_total_retries=800,
+                  )
+              ),
+              "combined redirect and retry budgets exceed total request budget",
+          )
+
+          print("PASS: global redirect and retry budget boundaries.")
+
+          # Channel discovery result and report-size boundaries.
+          assert validate_config(
+              replace(
+                  DEFAULT_CONFIG,
+                  max_channel_discovery_results=DEFAULT_CONFIG.max_candidates,
+                  max_discovery_report_bytes=1,
+              )
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_channel_discovery_results=True)
+              ),
+              "boolean channel discovery result limit",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_channel_discovery_results=0)
+              ),
+              "zero channel discovery result limit",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(
+                      DEFAULT_CONFIG,
+                      max_channel_discovery_results=(
+                          DEFAULT_CONFIG.max_candidates + 1
+                      ),
+                  )
+              ),
+              "channel discovery result limit exceeds candidate limit",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_discovery_report_bytes=False)
+              ),
+              "boolean discovery report size limit",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_discovery_report_bytes=0)
+              ),
+              "zero discovery report size limit",
+          )
+
+          print("PASS: channel discovery and report-size budget boundaries.")
+
+          # Empty user configuration selects automatic discovery.
+          assert USER_CHANNELS == ()
+          assert validate_user_channels() == ()
+          assert user_channel_mode() is ChannelMode.AUTO_DISCOVERY
+
+          # A non-empty user configuration selects user-configured mode.
+          configured_channels = (
+              UserChannelConfig("CCTV-1", "测试分组", 1),
+              UserChannelConfig("CCTV-5", "体育", 2),
+          )
+          assert validate_user_channels(configured_channels) == configured_channels
+          assert (
+              user_channel_mode(configured_channels)
+              is ChannelMode.USER_CONFIGURED
+          )
+
+          rejects(
+              lambda: validate_user_channels(
+                  (
+                      UserChannelConfig("CCTV-1", "测试分组", 1),
+                      UserChannelConfig("cctv-1", "测试分组", 2),
+                  )
+              ),
+              "duplicate channel names ignoring case",
+          )
+
+          rejects(
+              lambda: validate_user_channels(
+                  (
+                      UserChannelConfig("CCTV-1", "测试分组", 1),
+                      UserChannelConfig("CCTV-5", "体育", 1),
+                  )
+              ),
+              "duplicate channel order",
+          )
+
+          rejects(
+              lambda: validate_user_channels([]),
+              "user channel configuration must be a tuple",
+          )
+
+          print("PASS: empty and configured channel modes and invalid channel settings.")
           print("ALL CONFIGURATION TESTS PASSED.")
           PY
+
       - name: Compile and test models.py contracts
         shell: bash
         run: |
