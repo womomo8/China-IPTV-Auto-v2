@@ -10,7 +10,6 @@ import math
 from typing import Final
 
 
-SCHEMA_VERSION: Final[str] = "1.0"
 FORMAL_MODE: Final[str] = "formal"
 TEST_MODE: Final[str] = "test"
 ALLOWED_RUN_MODES: Final[tuple[str, str]] = (
@@ -96,7 +95,6 @@ class Config:
     cleanup_retry_count: int = 2
 
     # M3U output validation.
-    m3u_output_path: str = PUBLISH_OUTPUT_PATH
     m3u_encoding: str = "utf-8"
     m3u_max_entries: int = 40
     m3u_max_name_chars: int = 256
@@ -203,11 +201,6 @@ def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
         or config.run_mode not in ALLOWED_RUN_MODES
     ):
         raise ConfigError("run_mode must be 'formal' or 'test'")
-
-    if config.m3u_output_path != PUBLISH_OUTPUT_PATH:
-        raise ConfigError(
-            f"m3u_output_path is fixed at {PUBLISH_OUTPUT_PATH!r}"
-        )
 
     if (
         not isinstance(config.m3u_encoding, str)
