@@ -1,24 +1,25 @@
 """Shared, dependency-free data contracts for China-IPTV-Auto V3.
 
-This module validates data shape and identity only. It does not perform network
-access, filesystem access, Docker operations, media probing, or PASS decisions.
+This module defines and validates data shapes. It does not perform network,
+filesystem, Docker, media-probing, cryptographic-file, or publication actions.
+Those operations belong to security.py, the host controller, and pipeline.py.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 import re
-import math
 from typing import Any, Mapping
 
 SCHEMA_VERSION = "1.0"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_RELATIVE_PATH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,512}$")
 
 
 class ContractError(ValueError):
-    """Raised when data does not satisfy a shared V3 contract."""
+    """Raised when a value violates a V3 data contract."""
 
 
 class RunMode(str, Enum):
@@ -39,6 +40,15 @@ class StageName(str, Enum):
     QUICK_FILTER = "quick_filter"
     DEEP_VALIDATION = "deep_validation"
     PUBLISH = "publish"
+
+
+STAGE_ORDER = (
+    StageName.DISCOVERY,
+    StageName.NORMALIZATION,
+    StageName.QUICK_FILTER,
+    StageName.DEEP_VALIDATION,
+    StageName.PUBLISH,
+)
 
 
 class StageStatus(str, Enum):
@@ -76,19 +86,12 @@ class ErrorInfo:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ErrorInfo":
-        _mapping(value, "error")
-        _only_keys(
-            value,
-            {"code", "message", "retryable", "component"},
-            "error",
-        )
+        _keys(value, {"code", "message", "retryable", "component"}, "error")
         return cls(**dict(value))
 
 
 @dataclass(frozen=True)
 class Candidate:
-    """A discovered IPTV candidate. URL is business data, never a container task field."""
-
     candidate_id: str
     name: str
     url: str
@@ -99,10 +102,10 @@ class Candidate:
     logo: str = ""
 
     def __post_init__(self) -> None:
-        _identifier(self.candidate_id, "candidate_id")
+        _id(self.candidate_id, "candidate_id")
         _nonempty(self.name, "candidate.name", 256)
         _nonempty(self.url, "candidate.url", 4096)
-        _identifier(self.source_id, "candidate.source_id")
+        _id(self.source_id, "candidate.source_id")
 
         for key in ("group", "tvg_id", "tvg_name", "logo"):
             _string(
@@ -114,20 +117,22 @@ class Candidate:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "candidate_id": self.candidate_id,
-            "name": self.name,
-            "url": self.url,
-            "source_id": self.source_id,
-            "group": self.group,
-            "tvg_id": self.tvg_id,
-            "tvg_name": self.tvg_name,
-            "logo": self.logo,
+            key: getattr(self, key)
+            for key in (
+                "candidate_id",
+                "name",
+                "url",
+                "source_id",
+                "group",
+                "tvg_id",
+                "tvg_name",
+                "logo",
+            )
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "Candidate":
-        _mapping(value, "candidate")
-        _only_keys(
+        _keys(
             value,
             {
                 "candidate_id",
@@ -152,8 +157,8 @@ class SourceOutcome:
     completed: bool = True
 
     def __post_init__(self) -> None:
-        _identifier(self.source_id, "source_id")
-        _tuple_of(self.candidates, Candidate, "source.candidates")
+        _id(self.source_id, "source_id")
+        _tuple_type(self.candidates, Candidate, "source.candidates")
 
         if self.error is not None and not isinstance(self.error, ErrorInfo):
             raise ContractError("source.error must be ErrorInfo or None")
@@ -170,8 +175,7 @@ class SourceOutcome:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "SourceOutcome":
-        _mapping(value, "source_outcome")
-        _only_keys(
+        _keys(
             value,
             {"source_id", "candidates", "error", "completed"},
             "source_outcome",
@@ -206,25 +210,27 @@ class TaskIdentity:
     resource_id: str
 
     def __post_init__(self) -> None:
-        _identifier(self.run_id, "run_id")
-        _int(self.run_attempt, "run_attempt", minimum=1)
-        _identifier(self.task_id, "task_id")
-        _identifier(self.candidate_id, "candidate_id")
-        _identifier(self.resource_id, "resource_id")
+        _id(self.run_id, "run_id")
+        _int(self.run_attempt, "run_attempt", 1)
+        _id(self.task_id, "task_id")
+        _id(self.candidate_id, "candidate_id")
+        _id(self.resource_id, "resource_id")
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "run_id": self.run_id,
-            "run_attempt": self.run_attempt,
-            "task_id": self.task_id,
-            "candidate_id": self.candidate_id,
-            "resource_id": self.resource_id,
+            key: getattr(self, key)
+            for key in (
+                "run_id",
+                "run_attempt",
+                "task_id",
+                "candidate_id",
+                "resource_id",
+            )
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "TaskIdentity":
-        _mapping(value, "task_identity")
-        _only_keys(
+        _keys(
             value,
             {
                 "run_id",
@@ -236,6 +242,9 @@ class TaskIdentity:
             "task_identity",
         )
         return cls(**dict(value))
+
+    def matches(self, other: "TaskIdentity") -> bool:
+        return isinstance(other, TaskIdentity) and self == other
 
 
 @dataclass(frozen=True)
@@ -258,7 +267,7 @@ class TaskRequest:
         _timestamp(self.created_at, "task.created_at")
         _timestamp(self.deadline, "task.deadline")
 
-        if _parse_time(self.deadline) <= _parse_time(self.created_at):
+        if _dt(self.deadline) <= _dt(self.created_at):
             raise ContractError(
                 "task.deadline must be later than task.created_at"
             )
@@ -274,8 +283,6 @@ class TaskRequest:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "TaskRequest":
-        _mapping(value, "task_request")
-
         expected = {
             "schema_version",
             "run_id",
@@ -287,7 +294,7 @@ class TaskRequest:
             "created_at",
             "deadline",
         }
-        _only_keys(value, expected, "task_request")
+        _keys(value, expected, "task_request")
 
         identity = TaskIdentity.from_dict(
             {
@@ -304,7 +311,7 @@ class TaskRequest:
 
         try:
             task_type = TaskType(value["task_type"])
-        except (ValueError, TypeError, KeyError) as exc:
+        except (ValueError, TypeError) as exc:
             raise ContractError(
                 "task.task_type is unsupported"
             ) from exc
@@ -336,10 +343,10 @@ class MediaFileEntry:
         if not isinstance(self.identity, TaskIdentity):
             raise ContractError("media.identity must be TaskIdentity")
 
-        _identifier(self.file_id, "media.file_id")
+        _id(self.file_id, "media.file_id")
         _relative_path(self.relative_path)
         _nonempty(self.content_type, "media.content_type", 128)
-        _int(self.actual_size, "media.actual_size", minimum=1)
+        _int(self.actual_size, "media.actual_size", 1)
 
         if (
             not isinstance(self.sha256, str)
@@ -362,4 +369,847 @@ class MediaFileEntry:
         return {
             "schema_version": self.schema_version,
             **self.identity.to_dict(),
-            "f
+            "file_id": self.file_id,
+            "relative_path": self.relative_path,
+            "content_type": self.content_type,
+            "actual_size": self.actual_size,
+            "sha256": self.sha256,
+            "complete": self.complete,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "MediaFileEntry":
+        expected = {
+            "schema_version",
+            "run_id",
+            "run_attempt",
+            "task_id",
+            "candidate_id",
+            "resource_id",
+            "file_id",
+            "relative_path",
+            "content_type",
+            "actual_size",
+            "sha256",
+            "complete",
+            "created_at",
+        }
+        _keys(value, expected, "media_file_entry")
+
+        identity = TaskIdentity.from_dict(
+            {
+                key: value[key]
+                for key in (
+                    "run_id",
+                    "run_attempt",
+                    "task_id",
+                    "candidate_id",
+                    "resource_id",
+                )
+            }
+        )
+
+        return cls(
+            value["schema_version"],
+            identity,
+            value["file_id"],
+            value["relative_path"],
+            value["content_type"],
+            value["actual_size"],
+            value["sha256"],
+            value["complete"],
+            value["created_at"],
+        )
+
+
+@dataclass(frozen=True)
+class MediaManifest:
+    schema_version: str
+    identity: TaskIdentity
+    entries: tuple[MediaFileEntry, ...]
+    created_at: str
+
+    def __post_init__(self) -> None:
+        _schema(self.schema_version)
+
+        if not isinstance(self.identity, TaskIdentity):
+            raise ContractError("manifest.identity must be TaskIdentity")
+
+        _tuple_type(self.entries, MediaFileEntry, "manifest.entries")
+
+        if not self.entries:
+            raise ContractError("manifest.entries must not be empty")
+
+        _timestamp(self.created_at, "manifest.created_at")
+
+        ids: set[str] = set()
+        paths: set[str] = set()
+
+        for entry in self.entries:
+            if not self.identity.matches(entry.identity):
+                raise ContractError(
+                    "manifest entry task identity mismatch"
+                )
+
+            if entry.file_id in ids or entry.relative_path in paths:
+                raise ContractError(
+                    "manifest contains duplicate file_id or path"
+                )
+
+            ids.add(entry.file_id)
+            paths.add(entry.relative_path)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            **self.identity.to_dict(),
+            "entries": [item.to_dict() for item in self.entries],
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "MediaManifest":
+        expected = {
+            "schema_version",
+            "run_id",
+            "run_attempt",
+            "task_id",
+            "candidate_id",
+            "resource_id",
+            "entries",
+            "created_at",
+        }
+        _keys(value, expected, "media_manifest")
+
+        if not isinstance(value["entries"], list):
+            raise ContractError("manifest.entries must be a list")
+
+        identity = TaskIdentity.from_dict(
+            {
+                key: value[key]
+                for key in (
+                    "run_id",
+                    "run_attempt",
+                    "task_id",
+                    "candidate_id",
+                    "resource_id",
+                )
+            }
+        )
+
+        return cls(
+            value["schema_version"],
+            identity,
+            tuple(
+                MediaFileEntry.from_dict(item)
+                for item in value["entries"]
+            ),
+            value["created_at"],
+        )
+
+
+@dataclass(frozen=True)
+class ProbeEvidence:
+    """Probe evidence; host authenticity is checked separately."""
+
+    ffprobe_exit_code: int
+    ffmpeg_exit_code: int
+    media_bytes_read: int
+    packets_read: int
+    streams: tuple[str, ...]
+    probe_completed: bool
+    playback_seconds: float
+
+    def __post_init__(self) -> None:
+        _int(self.ffprobe_exit_code, "evidence.ffprobe_exit_code", 0)
+        _int(self.ffmpeg_exit_code, "evidence.ffmpeg_exit_code", 0)
+        _int(self.media_bytes_read, "evidence.media_bytes_read", 0)
+        _int(self.packets_read, "evidence.packets_read", 0)
+        _tuple_str(self.streams, "evidence.streams", 64)
+        _bool(self.probe_completed, "evidence.probe_completed")
+
+        if (
+            isinstance(self.playback_seconds, bool)
+            or not isinstance(self.playback_seconds, (int, float))
+            or not (0 <= self.playback_seconds < float("inf"))
+        ):
+            raise ContractError(
+                "evidence.playback_seconds must be a finite non-negative number"
+            )
+
+    @property
+    def sufficient_for_pass(self) -> bool:
+        return (
+            self.probe_completed
+            and self.ffprobe_exit_code == 0
+            and self.ffmpeg_exit_code == 0
+            and self.media_bytes_read > 0
+            and self.packets_read > 0
+            and bool(self.streams)
+            and self.playback_seconds > 0
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ffprobe_exit_code": self.ffprobe_exit_code,
+            "ffmpeg_exit_code": self.ffmpeg_exit_code,
+            "media_bytes_read": self.media_bytes_read,
+            "packets_read": self.packets_read,
+            "streams": list(self.streams),
+            "probe_completed": self.probe_completed,
+            "playback_seconds": self.playback_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ProbeEvidence":
+        _keys(
+            value,
+            {
+                "ffprobe_exit_code",
+                "ffmpeg_exit_code",
+                "media_bytes_read",
+                "packets_read",
+                "streams",
+                "probe_completed",
+                "playback_seconds",
+            },
+            "probe_evidence",
+        )
+
+        if not isinstance(value["streams"], list):
+            raise ContractError("evidence.streams must be a list")
+
+        return cls(
+            value["ffprobe_exit_code"],
+            value["ffmpeg_exit_code"],
+            value["media_bytes_read"],
+            value["packets_read"],
+            tuple(value["streams"]),
+            value["probe_completed"],
+            value["playback_seconds"],
+        )
+
+
+@dataclass(frozen=True)
+class ContainerResult:
+    schema_version: str
+    identity: TaskIdentity
+    validator_image_digest: str
+    exit_code: int
+    started_at: str
+    finished_at: str
+    evidence: ProbeEvidence | None = None
+    error: ErrorInfo | None = None
+
+    def __post_init__(self) -> None:
+        _schema(self.schema_version)
+
+        if not isinstance(self.identity, TaskIdentity):
+            raise ContractError(
+                "container_result.identity must be TaskIdentity"
+            )
+
+        _nonempty(
+            self.validator_image_digest,
+            "validator_image_digest",
+            256,
+        )
+        _int(self.exit_code, "container_result.exit_code", 0)
+        _timestamp(self.started_at, "container_result.started_at")
+        _timestamp(self.finished_at, "container_result.finished_at")
+
+        if _dt(self.finished_at) < _dt(self.started_at):
+            raise ContractError(
+                "container result finished_at precedes started_at"
+            )
+
+        if (
+            self.evidence is not None
+            and not isinstance(self.evidence, ProbeEvidence)
+        ):
+            raise ContractError(
+                "container_result.evidence must be ProbeEvidence or None"
+            )
+
+        if self.error is not None and not isinstance(self.error, ErrorInfo):
+            raise ContractError(
+                "container_result.error must be ErrorInfo or None"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            **self.identity.to_dict(),
+            "validator_image_digest": self.validator_image_digest,
+            "exit_code": self.exit_code,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "evidence": (
+                self.evidence.to_dict() if self.evidence else None
+            ),
+            "error": self.error.to_dict() if self.error else None,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ContainerResult":
+        expected = {
+            "schema_version",
+            "run_id",
+            "run_attempt",
+            "task_id",
+            "candidate_id",
+            "resource_id",
+            "validator_image_digest",
+            "exit_code",
+            "started_at",
+            "finished_at",
+            "evidence",
+            "error",
+        }
+        _keys(value, expected, "container_result")
+
+        identity = TaskIdentity.from_dict(
+            {
+                key: value[key]
+                for key in (
+                    "run_id",
+                    "run_attempt",
+                    "task_id",
+                    "candidate_id",
+                    "resource_id",
+                )
+            }
+        )
+
+        evidence = (
+            ProbeEvidence.from_dict(value["evidence"])
+            if value["evidence"] is not None
+            else None
+        )
+
+        error = (
+            ErrorInfo.from_dict(value["error"])
+            if value["error"] is not None
+            else None
+        )
+
+        return cls(
+            value["schema_version"],
+            identity,
+            value["validator_image_digest"],
+            value["exit_code"],
+            value["started_at"],
+            value["finished_at"],
+            evidence,
+            error,
+        )
+
+
+@dataclass(frozen=True)
+class HostVerification:
+    """Host-controller verification record.
+
+    Never construct this from container JSON alone.
+    """
+
+    identity: TaskIdentity
+    result_sha256: str
+    image_digest_verified: bool
+    exit_code_verified: bool
+    output_bounded: bool
+    identity_verified: bool
+    schema_verified: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, TaskIdentity):
+            raise ContractError(
+                "host_verification.identity must be TaskIdentity"
+            )
+
+        if (
+            not isinstance(self.result_sha256, str)
+            or not _SHA256_RE.fullmatch(self.result_sha256)
+        ):
+            raise ContractError(
+                "host_verification.result_sha256 must be lowercase SHA-256"
+            )
+
+        for name in (
+            "image_digest_verified",
+            "exit_code_verified",
+            "output_bounded",
+            "identity_verified",
+            "schema_verified",
+        ):
+            _bool(
+                getattr(self, name),
+                f"host_verification.{name}",
+            )
+
+    @property
+    def trusted(self) -> bool:
+        return all(
+            (
+                self.image_digest_verified,
+                self.exit_code_verified,
+                self.output_bounded,
+                self.identity_verified,
+                self.schema_verified,
+            )
+        )
+
+
+@dataclass(frozen=True)
+class LineResult:
+    candidate: Candidate
+    status: LineStatus
+    reason: str
+    evidence: ProbeEvidence | None = None
+    error: ErrorInfo | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate, Candidate):
+            raise ContractError(
+                "line_result.candidate must be Candidate"
+            )
+
+        if not isinstance(self.status, LineStatus):
+            raise ContractError(
+                "line_result.status must be LineStatus"
+            )
+
+        _nonempty(self.reason, "line_result.reason", 1000)
+
+        if (
+            self.evidence is not None
+            and not isinstance(self.evidence, ProbeEvidence)
+        ):
+            raise ContractError(
+                "line_result.evidence must be ProbeEvidence or None"
+            )
+
+        if self.error is not None and not isinstance(self.error, ErrorInfo):
+            raise ContractError(
+                "line_result.error must be ErrorInfo or None"
+            )
+
+        if self.status is LineStatus.PASS and (
+            self.evidence is None
+            or not self.evidence.sufficient_for_pass
+        ):
+            raise ContractError(
+                "PASS requires sufficient successful media probe evidence"
+            )
+
+        if self.status is LineStatus.NODE_ERROR and self.error is None:
+            raise ContractError(
+                "NODE_ERROR requires error details"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate": self.candidate.to_dict(),
+            "status": self.status.value,
+            "reason": self.reason,
+            "evidence": (
+                self.evidence.to_dict() if self.evidence else None
+            ),
+            "error": self.error.to_dict() if self.error else None,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "LineResult":
+        _keys(
+            value,
+            {"candidate", "status", "reason", "evidence", "error"},
+            "line_result",
+        )
+
+        try:
+            status = LineStatus(value["status"])
+        except (ValueError, TypeError) as exc:
+            raise ContractError(
+                "line_result.status is unsupported"
+            ) from exc
+
+        evidence = (
+            ProbeEvidence.from_dict(value["evidence"])
+            if value["evidence"] is not None
+            else None
+        )
+
+        error = (
+            ErrorInfo.from_dict(value["error"])
+            if value["error"] is not None
+            else None
+        )
+
+        return cls(
+            Candidate.from_dict(value["candidate"]),
+            status,
+            value["reason"],
+            evidence,
+            error,
+        )
+
+
+@dataclass(frozen=True)
+class StageResult:
+    stage: StageName
+    status: StageStatus
+    started_at: str | None = None
+    finished_at: str | None = None
+    error: ErrorInfo | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.stage, StageName)
+            or not isinstance(self.status, StageStatus)
+        ):
+            raise ContractError(
+                "stage result has invalid stage or status"
+            )
+
+        if self.started_at is not None:
+            _timestamp(self.started_at, "stage.started_at")
+
+        if self.finished_at is not None:
+            _timestamp(self.finished_at, "stage.finished_at")
+
+        if (
+            self.started_at
+            and self.finished_at
+            and _dt(self.finished_at) < _dt(self.started_at)
+        ):
+            raise ContractError(
+                "stage finished_at precedes started_at"
+            )
+
+        if self.error is not None and not isinstance(self.error, ErrorInfo):
+            raise ContractError(
+                "stage.error must be ErrorInfo or None"
+            )
+
+        if self.status is StageStatus.FAILED and self.error is None:
+            raise ContractError(
+                "failed stage requires error details"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage.value,
+            "status": self.status.value,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "error": self.error.to_dict() if self.error else None,
+        }
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    run_id: str
+    run_attempt: int
+    mode: RunMode
+    stages: tuple[StageResult, ...]
+    line_results: tuple[LineResult, ...]
+    critical_error: bool = False
+
+    def __post_init__(self) -> None:
+        _id(self.run_id, "run_id")
+        _int(self.run_attempt, "run_attempt", 1)
+
+        if not isinstance(self.mode, RunMode):
+            raise ContractError("run.mode must be RunMode")
+
+        _tuple_type(self.stages, StageResult, "run.stages")
+        _tuple_type(self.line_results, LineResult, "run.line_results")
+        _bool(self.critical_error, "run.critical_error")
+
+        stage_names = [stage.stage for stage in self.stages]
+
+        if len(stage_names) != len(set(stage_names)):
+            raise ContractError("run contains duplicate stages")
+
+        if stage_names != sorted(
+            stage_names,
+            key=STAGE_ORDER.index,
+        ):
+            raise ContractError(
+                "run stages are not in the fixed five-step order"
+            )
+
+    @property
+    def pass_count(self) -> int:
+        return sum(
+            result.status is LineStatus.PASS
+            for result in self.line_results
+        )
+
+    @property
+    def publish_eligible(self) -> bool:
+        stage_map = {
+            result.stage: result.status
+            for result in self.stages
+        }
+
+        return (
+            self.mode is RunMode.FORMAL
+            and not self.critical_error
+            and self.pass_count > 0
+            and all(
+                stage_map.get(stage) is StageStatus.COMPLETED
+                for stage in STAGE_ORDER
+            )
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "run_attempt": self.run_attempt,
+            "mode": self.mode.value,
+            "stages": [
+                result.to_dict()
+                for result in self.stages
+            ],
+            "line_results": [
+                result.to_dict()
+                for result in self.line_results
+            ],
+            "critical_error": self.critical_error,
+            "pass_count": self.pass_count,
+            "publish_eligible": self.publish_eligible,
+        }
+
+
+@dataclass(frozen=True)
+class PublishDecision:
+    eligible: bool
+    reasons: tuple[str, ...]
+    output_path: str = "output/iptv.m3u"
+
+    def __post_init__(self) -> None:
+        _bool(self.eligible, "publish.eligible")
+        _tuple_str(self.reasons, "publish.reasons", 1000)
+
+        if self.eligible and self.reasons:
+            raise ContractError(
+                "eligible publish decision cannot contain rejection reasons"
+            )
+
+        if not self.eligible and not self.reasons:
+            raise ContractError(
+                "rejected publish decision must explain why"
+            )
+
+        if self.output_path != "output/iptv.m3u":
+            raise ContractError(
+                "publish output_path is fixed by CORE_FLOW.md"
+            )
+
+
+def validate_container_result(
+    result: ContainerResult,
+    expected: TaskIdentity,
+    host: HostVerification,
+) -> None:
+    """Raise unless the host-verified result matches the expected task."""
+
+    if (
+        not isinstance(result, ContainerResult)
+        or not isinstance(expected, TaskIdentity)
+    ):
+        raise ContractError(
+            "invalid result or expected identity"
+        )
+
+    if not isinstance(host, HostVerification) or not host.trusted:
+        raise ContractError(
+            "container result has not passed host verification"
+        )
+
+    if (
+        not result.identity.matches(expected)
+        or not host.identity.matches(expected)
+    ):
+        raise ContractError("task identity mismatch")
+
+    if result.exit_code != 0:
+        raise ContractError(
+            "container exit code is not zero"
+        )
+
+    if result.error is not None:
+        raise ContractError(
+            "container reported an error"
+        )
+
+    if result.evidence is None:
+        raise ContractError(
+            "container result has no media evidence"
+        )
+
+
+def _mapping(value: Any, name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ContractError(f"{name} must be a mapping")
+
+
+def _keys(
+    value: Mapping[str, Any],
+    expected: set[str],
+    name: str,
+) -> None:
+    _mapping(value, name)
+
+    missing = expected - set(value)
+    extra = set(value) - expected
+
+    if missing or extra:
+        raise ContractError(
+            f"{name} keys mismatch; "
+            f"missing={sorted(missing)}, extra={sorted(extra)}"
+        )
+
+
+def _string(
+    value: Any,
+    name: str,
+    maximum: int,
+    allow_empty: bool = False,
+) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) > maximum
+        or (not allow_empty and not value.strip())
+    ):
+        raise ContractError(
+            f"{name} must be a "
+            f"{'possibly empty ' if allow_empty else 'non-empty '}"
+            f"string up to {maximum} characters"
+        )
+
+
+def _nonempty(value: Any, name: str, maximum: int) -> None:
+    _string(value, name, maximum, False)
+
+
+def _bool(value: Any, name: str) -> None:
+    if not isinstance(value, bool):
+        raise ContractError(f"{name} must be bool")
+
+
+def _int(value: Any, name: str, minimum: int) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+    ):
+        raise ContractError(
+            f"{name} must be an integer >= {minimum}"
+        )
+
+
+def _id(value: Any, name: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not _ID_RE.fullmatch(value)
+    ):
+        raise ContractError(
+            f"{name} is not a valid identifier"
+        )
+
+
+def _schema(value: Any) -> None:
+    if value != SCHEMA_VERSION:
+        raise ContractError(
+            f"unsupported schema_version: {value!r}"
+        )
+
+
+def _relative_path(value: Any) -> None:
+    if (
+        not isinstance(value, str)
+        or not _RELATIVE_PATH_RE.fullmatch(value)
+    ):
+        raise ContractError(
+            "media.relative_path must be a safe relative path"
+        )
+
+    if (
+        value.startswith("/")
+        or "\\" in value
+        or any(
+            part in ("", ".", "..")
+            for part in value.split("/")
+        )
+    ):
+        raise ContractError(
+            "media.relative_path contains traversal or invalid segments"
+        )
+
+    if re.match(r"^[A-Za-z]:", value):
+        raise ContractError(
+            "media.relative_path must not be a drive path"
+        )
+
+
+def _timestamp(value: Any, name: str) -> None:
+    _dt(value, name)
+
+
+def _dt(value: Any, name: str = "timestamp") -> datetime:
+    if not isinstance(value, str):
+        raise ContractError(
+            f"{name} must be an ISO-8601 string"
+        )
+
+    try:
+        parsed = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise ContractError(
+            f"{name} must be a valid ISO-8601 timestamp"
+        ) from exc
+
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ContractError(
+            f"{name} must include a timezone"
+        )
+
+    return parsed
+
+
+def _tuple_type(
+    value: Any,
+    expected: type,
+    name: str,
+) -> None:
+    if (
+        not isinstance(value, tuple)
+        or any(not isinstance(item, expected) for item in value)
+    ):
+        raise ContractError(
+            f"{name} must be a tuple of {expected.__name__}"
+        )
+
+
+def _tuple_str(
+    value: Any,
+    name: str,
+    maximum: int,
+) -> None:
+    if (
+        not isinstance(value, tuple)
+        or any(
+            not isinstance(item, str)
+            or not item
+            or len(item) > maximum
+            for item in value
+        )
+    ):
+        raise ContractError(
+            f"{name} must be a tuple of non-empty strings "
+            f"up to {maximum} characters"
+        )
