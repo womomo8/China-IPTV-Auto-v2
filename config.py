@@ -266,4 +266,104 @@ def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
     # Media limits must be coherent at per-resource, per-candidate and run levels.
     if config.max_download_bytes_per_candidate < config.max_media_resource_bytes:
         raise ConfigError(
-            "per-candidate download budge
+            "per-candidate download budget must be >= one resource limit"
+        )
+    if config.max_download_bytes_per_candidate > config.max_download_bytes_per_run:
+        raise ConfigError(
+            "per-candidate download budget cannot exceed per-run budget"
+        )
+    if config.max_resources_per_candidate * config.max_media_resource_bytes < config.max_download_bytes_per_candidate:
+        raise ConfigError(
+            "resource count and per-resource size cannot support the per-candidate budget"
+        )
+    if config.max_download_bytes_per_run < config.max_download_bytes_per_candidate:
+        raise ConfigError(
+            "per-run download budget must allow at least one full candidate budget"
+        )
+
+    # HLS validation must fit within a line deadline.
+    if config.hls_validation_seconds > config.line_deadline_seconds:
+        raise ConfigError(
+            "HLS validation time cannot exceed the per-line deadline"
+        )
+    if config.ffprobe_timeout_seconds + config.ffmpeg_timeout_seconds > config.validator_container_timeout_seconds:
+        raise ConfigError(
+            "FFprobe and FFmpeg timeouts exceed the container deadline"
+        )
+    if config.validator_container_timeout_seconds > config.line_deadline_seconds:
+        raise ConfigError(
+            "validator container timeout cannot exceed the per-line deadline"
+        )
+
+    # The run budget must leave time for all stages and cleanup.
+    minimum_run_budget = (
+        config.discovery_budget_seconds
+        + config.quick_filter_budget_seconds
+        + config.deep_validation_budget_seconds
+        + config.cleanup_grace_seconds
+    )
+    if config.run_deadline_seconds < minimum_run_budget:
+        raise ConfigError(
+            "run_deadline_seconds is shorter than the sum of stage budgets and cleanup"
+        )
+    if config.deep_validation_budget_seconds < config.line_deadline_seconds:
+        raise ConfigError(
+            "deep validation budget must allow at least one complete line deadline"
+        )
+
+    # Keep container limits within the verified precheck safety envelope.
+    if config.validator_memory_bytes < 256 * 1024 * 1024:
+        raise ConfigError("validator_memory_bytes must be at least 256 MiB")
+    if config.validator_pids_limit < 8:
+        raise ConfigError("validator_pids_limit must be at least 8")
+    if config.validator_nofile_limit < 32:
+        raise ConfigError("validator_nofile_limit must be at least 32")
+    if config.validator_tmpfs_bytes < 16 * 1024 * 1024:
+        raise ConfigError("validator_tmpfs_bytes must be at least 16 MiB")
+    if config.validator_cpu_limit > 1.0:
+        raise ConfigError(
+            "validator_cpu_limit cannot exceed the currently verified 1 CPU boundary"
+        )
+    if config.validator_memory_bytes > 512 * 1024 * 1024:
+        raise ConfigError(
+            "validator_memory_bytes cannot exceed the currently verified 512 MiB boundary"
+        )
+    if config.validator_pids_limit > 64:
+        raise ConfigError(
+            "validator_pids_limit cannot exceed the currently verified 64 PID boundary"
+        )
+    if config.validator_tmpfs_bytes > 64 * 1024 * 1024:
+        raise ConfigError(
+            "validator_tmpfs_bytes cannot exceed the currently verified 64 MiB boundary"
+        )
+
+    if config.task_ttl_seconds < config.validator_container_timeout_seconds:
+        raise ConfigError(
+            "task_ttl_seconds must be >= validator_container_timeout_seconds"
+        )
+    if config.cleanup_grace_seconds < 5:
+        raise ConfigError("cleanup_grace_seconds must be at least 5 seconds")
+
+    if config.m3u_max_line_chars < 4096:
+        raise ConfigError("M3U line limit must accommodate the models.py URL limit")
+    if config.m3u_max_entries < 1:
+        raise ConfigError("M3U must permit at least one entry")
+
+    return config
+
+
+def load_config(run_mode: str | None = None) -> Config:
+    """Return validated configuration, requiring an explicit formal mode."""
+    selected_mode = TEST_MODE if run_mode is None else run_mode
+    config = Config(run_mode=selected_mode)
+    return validate_config(config)
+
+
+def config_as_dict(config: Config = DEFAULT_CONFIG) -> dict[str, object]:
+    """Return a plain dictionary for diagnostics without mutating the config."""
+    validate_config(config)
+    return {item.name: getattr(config, item.name) for item in fields(config)}
+
+
+# Fail fast if source-controlled defaults are internally inconsistent.
+validate_config(DEFAULT_CONFIG)
