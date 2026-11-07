@@ -1,4 +1,3 @@
-
 """Shared, dependency-free data contracts for China-IPTV-Auto V3.
 
 This module defines and validates data shapes. It does not perform network,
@@ -940,38 +939,8 @@ class RunSummary:
                 "run stages are not in the fixed five-step order"
             )
 
-    @property
-    def pass_count(self) -> int:
-        return sum(
-            result.status is LineStatus.PASS
-            for result in self.line_results
-        )
-
-    @property
-    def publish_eligible(self) -> bool:
-        stage_map = {
-            result.stage: result.status
-            for result in self.stages
-        }
-
-        required_pre_publish_stages = STAGE_ORDER[:-1]
-        publish_status = stage_map.get(StageName.PUBLISH)
-
-        return (
-            self.mode is RunMode.FORMAL
-            and not self.critical_error
-            and self.pass_count > 0
-            and all(
-                stage_map.get(stage) is StageStatus.COMPLETED
-                for stage in required_pre_publish_stages
-            )
-            and publish_status not in (
-                StageStatus.FAILED,
-                StageStatus.SKIPPED,
-            )
-        )
-
     def to_dict(self) -> dict[str, Any]:
+        """Serialize the run data without making business decisions."""
         return {
             "run_id": self.run_id,
             "run_attempt": self.run_attempt,
@@ -985,8 +954,6 @@ class RunSummary:
                 for result in self.line_results
             ],
             "critical_error": self.critical_error,
-            "pass_count": self.pass_count,
-            "publish_eligible": self.publish_eligible,
         }
 
 
@@ -994,7 +961,6 @@ class RunSummary:
 class PublishDecision:
     eligible: bool
     reasons: tuple[str, ...]
-    output_path: str = "output/iptv.m3u"
 
     def __post_init__(self) -> None:
         _bool(self.eligible, "publish.eligible")
@@ -1008,11 +974,6 @@ class PublishDecision:
         if not self.eligible and not self.reasons:
             raise ContractError(
                 "rejected publish decision must explain why"
-            )
-
-        if self.output_path != "output/iptv.m3u":
-            raise ContractError(
-                "publish output_path is fixed by CORE_FLOW.md"
             )
 
 
