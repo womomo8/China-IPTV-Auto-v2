@@ -1,4 +1,4 @@
-"""Central, dependency-free configuration for China-IPTV-Auto V3.
+"""Central configuration for China-IPTV-Auto V3.
 
 All limits are initial engineering defaults, not measured nationwide
 performance guarantees. Keep operational thresholds centralized here.
@@ -10,6 +10,14 @@ import math
 import re
 from typing import Final
 from urllib.parse import urlsplit
+
+from models import (
+    ChannelMode,
+    ContractError,
+    UserChannelConfig,
+    channel_mode_for,
+    validate_user_channel_config,
+)
 
 
 FORMAL_MODE: Final[str] = "formal"
@@ -97,6 +105,30 @@ SOURCE_REGISTRY: Final[tuple[SourceDefinition, ...]] = (
 )
 
 
+# User-maintained channel display configuration.
+# Leave this tuple empty to enable automatic channel discovery.
+# Entries may contain only name, group and order; never put URLs or candidate IDs here.
+USER_CHANNELS: Final[tuple[UserChannelConfig, ...]] = ()
+
+
+def validate_user_channels(
+    channels: tuple[UserChannelConfig, ...] = USER_CHANNELS,
+) -> tuple[UserChannelConfig, ...]:
+    """Validate user channel settings against the models.py data contract."""
+    try:
+        return validate_user_channel_config(channels)
+    except ContractError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def user_channel_mode(
+    channels: tuple[UserChannelConfig, ...] = USER_CHANNELS,
+) -> ChannelMode:
+    """Return the single channel mode selected by whether config is empty."""
+    validated = validate_user_channels(channels)
+    return channel_mode_for(validated)
+
+
 @dataclass(frozen=True)
 class Config:
     run_mode: str = TEST_MODE
@@ -121,6 +153,12 @@ class Config:
     line_deadline_seconds: int = 30
     run_deadline_seconds: int = 840
     total_http_request_budget: int = 1600
+
+    # Discovery-wide budgets. These are separate from per-request limits.
+    max_total_redirects: int = 400
+    max_total_retries: int = 200
+    max_channel_discovery_results: int = 300
+    max_discovery_report_bytes: int = 2 * 1024 * 1024
 
     # Network request controls.
     dns_timeout_seconds: int = 3
@@ -233,10 +271,11 @@ def validate_source_registry(
 
 def enabled_sources(
     sources: tuple[SourceDefinition, ...] = SOURCE_REGISTRY,
+    config: Config = DEFAULT_CONFIG,
 ) -> tuple[SourceDefinition, ...]:
     """Return enabled source entries in their configured order."""
 
-    validate_source_registry(sources)
+    validate_source_registry(sources, config)
 
     return tuple(source for source in sources if source.enabled)
 
@@ -263,6 +302,8 @@ def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
         "line_deadline_seconds",
         "run_deadline_seconds",
         "total_http_request_budget",
+        "max_channel_discovery_results",
+        "max_discovery_report_bytes",
         "dns_timeout_seconds",
         "connect_timeout_seconds",
         "read_timeout_seconds",
@@ -291,6 +332,8 @@ def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
 
     non_negative_int_fields = (
         "max_redirects",
+        "max_total_redirects",
+        "max_total_retries",
         "max_dns_cname_depth",
         "max_dns_a_records",
         "max_retries",
@@ -428,6 +471,26 @@ def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
     ):
         raise ConfigError(
             "HLS segment timeout cannot exceed request_timeout_seconds"
+        )
+
+    # Discovery budget relationships. Redirects and retries are separately
+    # bounded globally and remain subordinate to the total HTTP request cap.
+    if (
+        config.max_total_redirects + config.max_total_retries
+        > config.total_http_request_budget
+    ):
+        raise ConfigError(
+            "global redirect and retry budgets cannot exceed total HTTP request budget"
+        )
+
+    if config.max_channel_discovery_results > config.max_candidates:
+        raise ConfigError(
+            "channel discovery result limit cannot exceed candidate limit"
+        )
+
+    if config.max_sources * config.source_max_requests > config.total_http_request_budget:
+        raise ConfigError(
+            "source request capacity cannot exceed total HTTP request budget"
         )
 
     # Media resource budgets.
@@ -587,6 +650,7 @@ def config_as_dict(
     }
 
 
-# Fail fast if source-controlled defaults are internally inconsistent.
+# Fail fast if source-controlled defaults are internally consistent.
 validate_config(DEFAULT_CONFIG)
 validate_source_registry()
+validate_user_channels()
