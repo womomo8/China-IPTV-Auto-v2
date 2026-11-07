@@ -1,656 +1,1009 @@
-"""Central configuration for China-IPTV-Auto V3.
-
-All limits are initial engineering defaults, not measured nationwide
-performance guarantees. Keep operational thresholds centralized here.
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass, fields
-import math
-import re
-from typing import Final
-from urllib.parse import urlsplit
-
-from models import (
-    ChannelMode,
-    ContractError,
-    UserChannelConfig,
-    channel_mode_for,
-    validate_user_channel_config,
-)
-
-
-FORMAL_MODE: Final[str] = "formal"
-TEST_MODE: Final[str] = "test"
-ALLOWED_RUN_MODES: Final[tuple[str, str]] = (
-    FORMAL_MODE,
-    TEST_MODE,
-)
-
-PUBLISH_OUTPUT_PATH: Final[str] = "output/iptv.m3u"
-
-_SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-
-
-class ConfigError(ValueError):
-    """Raised when configuration values are invalid or contradictory."""
-
-
-@dataclass(frozen=True)
-class SourceDefinition:
-    """A configured source entry.
-
-    URL syntax is checked here. Public-IP, DNS, redirect, TLS and network
-    safety checks must be performed by security.py at runtime.
-    """
-
-    source_id: str
-    url: str
-    enabled: bool = True
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.source_id, str)
-            or not _SOURCE_ID_RE.fullmatch(self.source_id)
-        ):
-            raise ConfigError(
-                "source_id must be a valid non-empty identifier"
-            )
-
-        if (
-            not isinstance(self.url, str)
-            or not self.url
-            or len(self.url) > 4096
-            or self.url != self.url.strip()
-            or any(ord(char) < 32 for char in self.url)
-        ):
-            raise ConfigError("source URL must be a valid non-empty string")
-
-        try:
-            parsed = urlsplit(self.url)
-            # Accessing .port also validates the port syntax and range.
-            _ = parsed.port
-        except ValueError as exc:
-            raise ConfigError("source URL has an invalid port or format") from exc
-
-        if parsed.scheme.lower() not in ("http", "https"):
-            raise ConfigError("source URL must use HTTP or HTTPS")
-
-        if not parsed.hostname:
-            raise ConfigError("source URL must contain a hostname")
-
-        if parsed.username is not None or parsed.password is not None:
-            raise ConfigError("source URL must not contain embedded credentials")
-
-        if parsed.fragment:
-            raise ConfigError("source URL must not contain a fragment")
-
-        if not isinstance(self.enabled, bool):
-            raise ConfigError("source enabled must be bool")
-
-
-# Source registry:
-# - Add a SourceDefinition to register another source.
-# - Change its URL to replace a source address.
-# - Set enabled=False to temporarily disable a source.
-# - Remove the entry to delete it from the registry.
-#
-# This is a configuration registry, not a trust list. Every network request
-# must still pass the complete security checks in security.py.
-SOURCE_REGISTRY: Final[tuple[SourceDefinition, ...]] = (
-    SourceDefinition(
-        source_id="source-001",
-        url="http://1.94.31.214/live/live9/dgtv.txt",
-    ),
-)
-
-
-# User-maintained channel display configuration.
-# Leave this tuple empty to enable automatic channel discovery.
-# Entries may contain only name, group and order; never put URLs or candidate IDs here.
-USER_CHANNELS: Final[tuple[UserChannelConfig, ...]] = ()
-
-
-def validate_user_channels(
-    channels: tuple[UserChannelConfig, ...] = USER_CHANNELS,
-) -> tuple[UserChannelConfig, ...]:
-    """Validate user channel settings against the models.py data contract."""
-    try:
-        return validate_user_channel_config(channels)
-    except ContractError as exc:
-        raise ConfigError(str(exc)) from exc
-
-
-def user_channel_mode(
-    channels: tuple[UserChannelConfig, ...] = USER_CHANNELS,
-) -> ChannelMode:
-    """Return the single channel mode selected by whether config is empty."""
-    validated = validate_user_channels(channels)
-    return channel_mode_for(validated)
-
-
-@dataclass(frozen=True)
-class Config:
-    run_mode: str = TEST_MODE
-
-    # Discovery and source collection.
-    max_sources: int = 20
-    source_timeout_seconds: int = 12
-    discovery_budget_seconds: int = 120
-    source_max_requests: int = 4
-    source_concurrency: int = 4
-    max_candidates: int = 300
-
-    # Quick filtering.
-    quick_filter_max_candidates: int = 200
-    quick_filter_concurrency: int = 8
-    quick_filter_budget_seconds: int = 120
-
-    # Deep validation and whole-run budgets.
-    deep_validation_max_candidates: int = 40
-    deep_validation_concurrency: int = 4
-    deep_validation_budget_seconds: int = 540
-    line_deadline_seconds: int = 30
-    run_deadline_seconds: int = 840
-    total_http_request_budget: int = 1600
-
-    # Discovery-wide budgets. These are separate from per-request limits.
-    max_total_redirects: int = 400
-    max_total_retries: int = 200
-    max_channel_discovery_results: int = 300
-    max_discovery_report_bytes: int = 2 * 1024 * 1024
-
-    # Network request controls.
-    dns_timeout_seconds: int = 3
-    connect_timeout_seconds: int = 5
-    read_timeout_seconds: int = 8
-    request_timeout_seconds: int = 12
-    max_redirects: int = 3
-    max_dns_cname_depth: int = 8
-    max_dns_a_records: int = 16
-
-    require_ipv4_only: bool = True
-    pin_checked_ipv4: bool = True
-    verify_tls_certificates: bool = True
-    ignore_environment_proxies: bool = True
-    reject_mixed_public_private_dns: bool = True
-
-    max_retries: int = 1
-    retry_backoff_seconds: float = 0.5
-
-    # Media and HLS resource budgets.
-    max_media_resource_bytes: int = 8 * 1024 * 1024
-    max_playlist_bytes: int = 1024 * 1024
-    max_resources_per_candidate: int = 24
-    max_download_bytes_per_candidate: int = 32 * 1024 * 1024
-    max_download_bytes_per_run: int = 512 * 1024 * 1024
-
-    hls_max_playlist_refreshes: int = 3
-    hls_validation_seconds: int = 12
-    hls_segment_request_timeout_seconds: int = 8
-
-    # Isolated validator container limits.
-    validator_cpu_limit: float = 1.0
-    validator_memory_bytes: int = 384 * 1024 * 1024
-    validator_pids_limit: int = 32
-    validator_nofile_limit: int = 128
-    validator_tmpfs_bytes: int = 64 * 1024 * 1024
-
-    ffprobe_timeout_seconds: int = 8
-    ffmpeg_timeout_seconds: int = 12
-    validator_container_timeout_seconds: int = 30
-
-    # Task lifetime and cleanup.
-    task_ttl_seconds: int = 300
-    cleanup_grace_seconds: int = 30
-    cleanup_retry_count: int = 2
-
-    # M3U output validation.
-    m3u_encoding: str = "utf-8"
-    m3u_max_entries: int = 40
-    m3u_max_name_chars: int = 256
-    m3u_max_group_chars: int = 128
-    m3u_max_line_chars: int = 8192
-
-    m3u_require_extm3u_header: bool = True
-    m3u_require_extinf_for_each_url: bool = True
-    m3u_allow_only_http_https: bool = True
-    m3u_reject_embedded_credentials: bool = True
-
-
-DEFAULT_CONFIG: Final[Config] = Config()
-
-
-def validate_source_registry(
-    sources: tuple[SourceDefinition, ...] = SOURCE_REGISTRY,
-    config: Config = DEFAULT_CONFIG,
-) -> tuple[SourceDefinition, ...]:
-    """Validate the configured source registry without network access."""
-
-    if not isinstance(sources, tuple):
-        raise ConfigError("source registry must be a tuple")
-
-    if not isinstance(config, Config):
-        raise ConfigError("config must be a Config instance")
-
-    source_ids: set[str] = set()
-    source_urls: set[str] = set()
-    enabled_count = 0
-
-    for source in sources:
-        if not isinstance(source, SourceDefinition):
-            raise ConfigError(
-                "every source registry entry must be SourceDefinition"
-            )
-
-        if source.source_id in source_ids:
-            raise ConfigError(
-                f"duplicate source_id: {source.source_id}"
-            )
-
-        normalized_url = source.url.rstrip("/")
-
-        if normalized_url in source_urls:
-            raise ConfigError(
-                f"duplicate source URL: {source.source_id}"
-            )
-
-        source_ids.add(source.source_id)
-        source_urls.add(normalized_url)
-
-        if source.enabled:
-            enabled_count += 1
-
-    if enabled_count > config.max_sources:
-        raise ConfigError(
-            "enabled source count cannot exceed max_sources"
-        )
-
-    return sources
-
-
-def enabled_sources(
-    sources: tuple[SourceDefinition, ...] = SOURCE_REGISTRY,
-    config: Config = DEFAULT_CONFIG,
-) -> tuple[SourceDefinition, ...]:
-    """Return enabled source entries in their configured order."""
-
-    validate_source_registry(sources, config)
-
-    return tuple(source for source in sources if source.enabled)
-
-
-def validate_config(config: Config = DEFAULT_CONFIG) -> Config:
-    """Validate types, ranges, cross-field relationships and fixed contracts."""
-
-    if not isinstance(config, Config):
-        raise ConfigError("config must be a Config instance")
-
-    positive_int_fields = (
-        "max_sources",
-        "source_timeout_seconds",
-        "discovery_budget_seconds",
-        "source_max_requests",
-        "source_concurrency",
-        "max_candidates",
-        "quick_filter_max_candidates",
-        "quick_filter_concurrency",
-        "quick_filter_budget_seconds",
-        "deep_validation_max_candidates",
-        "deep_validation_concurrency",
-        "deep_validation_budget_seconds",
-        "line_deadline_seconds",
-        "run_deadline_seconds",
-        "total_http_request_budget",
-        "max_channel_discovery_results",
-        "max_discovery_report_bytes",
-        "dns_timeout_seconds",
-        "connect_timeout_seconds",
-        "read_timeout_seconds",
-        "request_timeout_seconds",
-        "max_media_resource_bytes",
-        "max_playlist_bytes",
-        "max_resources_per_candidate",
-        "max_download_bytes_per_candidate",
-        "max_download_bytes_per_run",
-        "hls_validation_seconds",
-        "hls_segment_request_timeout_seconds",
-        "validator_memory_bytes",
-        "validator_pids_limit",
-        "validator_nofile_limit",
-        "validator_tmpfs_bytes",
-        "ffprobe_timeout_seconds",
-        "ffmpeg_timeout_seconds",
-        "validator_container_timeout_seconds",
-        "task_ttl_seconds",
-        "cleanup_grace_seconds",
-        "m3u_max_entries",
-        "m3u_max_name_chars",
-        "m3u_max_group_chars",
-        "m3u_max_line_chars",
-    )
-
-    non_negative_int_fields = (
-        "max_redirects",
-        "max_total_redirects",
-        "max_total_retries",
-        "max_dns_cname_depth",
-        "max_dns_a_records",
-        "max_retries",
-        "hls_max_playlist_refreshes",
-        "cleanup_retry_count",
-    )
-
-    for name in positive_int_fields:
-        value = getattr(config, name)
-
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ConfigError(f"{name} must be a positive integer")
-
-        if value <= 0:
-            raise ConfigError(f"{name} must be a positive integer")
-
-    for name in non_negative_int_fields:
-        value = getattr(config, name)
-
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ConfigError(f"{name} must be a non-negative integer")
-
-        if value < 0:
-            raise ConfigError(f"{name} must be a non-negative integer")
-
-    for name in ("validator_cpu_limit", "retry_backoff_seconds"):
-        value = getattr(config, name)
-
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ConfigError(f"{name} must be numeric")
-
-        if not math.isfinite(value) or value <= 0:
-            raise ConfigError(
-                f"{name} must be finite and greater than zero"
-            )
-
-    if (
-        not isinstance(config.run_mode, str)
-        or config.run_mode not in ALLOWED_RUN_MODES
-    ):
-        raise ConfigError("run_mode must be 'formal' or 'test'")
-
-    if (
-        not isinstance(config.m3u_encoding, str)
-        or config.m3u_encoding.lower().replace("_", "-") != "utf-8"
-    ):
-        raise ConfigError("m3u_encoding must be UTF-8")
-
-    boolean_fields = (
-        "m3u_require_extm3u_header",
-        "m3u_require_extinf_for_each_url",
-        "m3u_allow_only_http_https",
-        "m3u_reject_embedded_credentials",
-        "require_ipv4_only",
-        "pin_checked_ipv4",
-        "verify_tls_certificates",
-        "ignore_environment_proxies",
-        "reject_mixed_public_private_dns",
-    )
-
-    for name in boolean_fields:
-        if not isinstance(getattr(config, name), bool):
-            raise ConfigError(f"{name} must be bool")
-
-    # Mandatory V3 security boundaries.
-    for name in (
-        "require_ipv4_only",
-        "pin_checked_ipv4",
-        "verify_tls_certificates",
-        "ignore_environment_proxies",
-        "reject_mixed_public_private_dns",
-    ):
-        if getattr(config, name) is not True:
-            raise ConfigError(
-                f"{name} must remain enabled by CORE_FLOW.md"
-            )
-
-    # Candidate limits describe different pipeline stages.
-    # M3U output capacity is independent of validation capacity.
-    if config.max_candidates < config.quick_filter_max_candidates:
-        raise ConfigError(
-            "max_candidates must be >= quick_filter_max_candidates"
-        )
-
-    if (
-        config.quick_filter_max_candidates
-        < config.deep_validation_max_candidates
-    ):
-        raise ConfigError(
-            "quick_filter_max_candidates must be >= "
-            "deep_validation_max_candidates"
-        )
-
-    if config.source_concurrency > config.max_sources:
-        raise ConfigError(
-            "source_concurrency cannot exceed max_sources"
-        )
-
-    if (
-        config.quick_filter_concurrency
-        > config.quick_filter_max_candidates
-    ):
-        raise ConfigError(
-            "quick_filter_concurrency cannot exceed "
-            "quick_filter_max_candidates"
-        )
-
-    if (
-        config.deep_validation_concurrency
-        > config.deep_validation_max_candidates
-    ):
-        raise ConfigError(
-            "deep_validation_concurrency cannot exceed "
-            "deep_validation_max_candidates"
-        )
-
-    # Request timeout relationships.
-    if config.request_timeout_seconds < max(
-        config.dns_timeout_seconds,
-        config.connect_timeout_seconds,
-        config.read_timeout_seconds,
-    ):
-        raise ConfigError(
-            "request_timeout_seconds must be >= each phase timeout"
-        )
-
-    if config.source_timeout_seconds < config.request_timeout_seconds:
-        raise ConfigError(
-            "source_timeout_seconds must be >= request_timeout_seconds"
-        )
-
-    if (
-        config.hls_segment_request_timeout_seconds
-        > config.request_timeout_seconds
-    ):
-        raise ConfigError(
-            "HLS segment timeout cannot exceed request_timeout_seconds"
-        )
-
-    # Discovery budget relationships. Redirects and retries are separately
-    # bounded globally and remain subordinate to the total HTTP request cap.
-    if (
-        config.max_total_redirects + config.max_total_retries
-        > config.total_http_request_budget
-    ):
-        raise ConfigError(
-            "global redirect and retry budgets cannot exceed total HTTP request budget"
-        )
-
-    if config.max_channel_discovery_results > config.max_candidates:
-        raise ConfigError(
-            "channel discovery result limit cannot exceed candidate limit"
-        )
-
-    if config.max_sources * config.source_max_requests > config.total_http_request_budget:
-        raise ConfigError(
-            "source request capacity cannot exceed total HTTP request budget"
-        )
-
-    # Media resource budgets.
-    if config.max_playlist_bytes > config.max_media_resource_bytes:
-        raise ConfigError(
-            "playlist byte limit cannot exceed media resource limit"
-        )
-
-    if (
-        config.max_download_bytes_per_candidate
-        < config.max_media_resource_bytes
-    ):
-        raise ConfigError(
-            "per-candidate download budget must be >= one resource limit"
-        )
-
-    if (
-        config.max_download_bytes_per_candidate
-        > config.max_download_bytes_per_run
-    ):
-        raise ConfigError(
-            "per-candidate budget cannot exceed per-run budget"
-        )
-
-    if (
-        config.max_resources_per_candidate
-        * config.max_media_resource_bytes
-        < config.max_download_bytes_per_candidate
-    ):
-        raise ConfigError(
-            "resource count and per-resource size cannot support "
-            "per-candidate budget"
-        )
-
-    # HLS and validator deadlines.
-    if config.hls_validation_seconds > config.line_deadline_seconds:
-        raise ConfigError(
-            "HLS validation time cannot exceed per-line deadline"
-        )
-
-    if (
-        config.ffprobe_timeout_seconds
-        + config.ffmpeg_timeout_seconds
-        > config.validator_container_timeout_seconds
-    ):
-        raise ConfigError(
-            "FFprobe and FFmpeg timeouts exceed container deadline"
-        )
-
-    if (
-        config.validator_container_timeout_seconds
-        > config.line_deadline_seconds
-    ):
-        raise ConfigError(
-            "validator container timeout cannot exceed per-line deadline"
-        )
-
-    # Whole-run deadline must cover all stage budgets and cleanup.
-    minimum_run_budget = (
-        config.discovery_budget_seconds
-        + config.quick_filter_budget_seconds
-        + config.deep_validation_budget_seconds
-        + config.cleanup_grace_seconds
-    )
-
-    if config.run_deadline_seconds < minimum_run_budget:
-        raise ConfigError(
-            "run_deadline_seconds is shorter than stage budgets plus cleanup"
-        )
-
-    if (
-        config.deep_validation_budget_seconds
-        < config.line_deadline_seconds
-    ):
-        raise ConfigError(
-            "deep validation budget must allow at least one complete "
-            "line deadline"
-        )
-
-    # Keep container limits within the verified precheck envelope.
-    if config.validator_memory_bytes < 256 * 1024 * 1024:
-        raise ConfigError(
-            "validator_memory_bytes must be at least 256 MiB"
-        )
-
-    if config.validator_pids_limit < 8:
-        raise ConfigError(
-            "validator_pids_limit must be at least 8"
-        )
-
-    if config.validator_nofile_limit < 32:
-        raise ConfigError(
-            "validator_nofile_limit must be at least 32"
-        )
-
-    if config.validator_tmpfs_bytes < 16 * 1024 * 1024:
-        raise ConfigError(
-            "validator_tmpfs_bytes must be at least 16 MiB"
-        )
-
-    if config.validator_cpu_limit > 1.0:
-        raise ConfigError(
-            "validator_cpu_limit cannot exceed 1 CPU"
-        )
-
-    if config.validator_memory_bytes > 512 * 1024 * 1024:
-        raise ConfigError(
-            "validator_memory_bytes cannot exceed 512 MiB"
-        )
-
-    if config.validator_pids_limit > 64:
-        raise ConfigError(
-            "validator_pids_limit cannot exceed 64 PID"
-        )
-
-    if config.validator_tmpfs_bytes > 64 * 1024 * 1024:
-        raise ConfigError(
-            "validator_tmpfs_bytes cannot exceed 64 MiB"
-        )
-
-    if (
-        config.task_ttl_seconds
-        < config.validator_container_timeout_seconds
-    ):
-        raise ConfigError(
-            "task_ttl_seconds must be >= validator_container_timeout_seconds"
-        )
-
-    if config.cleanup_grace_seconds < 5:
-        raise ConfigError(
-            "cleanup_grace_seconds must be at least 5 seconds"
-        )
-
-    if config.m3u_max_line_chars < 4096:
-        raise ConfigError(
-            "M3U line limit must accommodate models.py URL limit"
-        )
-
-    return config
-
-
-def load_config(run_mode: str | None = None) -> Config:
-    """Return validated configuration; FORMAL must be explicitly selected."""
-    selected_mode = TEST_MODE if run_mode is None else run_mode
-    return validate_config(Config(run_mode=selected_mode))
-
-
-def config_as_dict(
-    config: Config = DEFAULT_CONFIG,
-) -> dict[str, object]:
-    """Return a plain dictionary for diagnostics without mutating the config."""
-    validate_config(config)
-
-    return {
-        item.name: getattr(config, item.name)
-        for item in fields(config)
-    }
-
-
-# Fail fast if source-controlled defaults are internally consistent.
-validate_config(DEFAULT_CONFIG)
-validate_source_registry()
-validate_user_channels()
+name: Validator Network-None Security Precheck
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validator-network-none-precheck
+  cancel-in-progress: false
+
+jobs:
+  validator-precheck:
+    name: Build and verify isolated validator container
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check runner and Docker
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          test -f /etc/os-release
+          . /etc/os-release
+          test "$ID" = "ubuntu"
+
+          echo "Runner: ${PRETTY_NAME}"
+          echo "Kernel: $(uname -r)"
+          echo "Architecture: $(uname -m)"
+
+          docker --version
+          docker info >/dev/null
+          docker compose version
+
+      - name: Check required files
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          test -f Dockerfile.validator
+          test -f .github/workflows/main.yml
+          test -f models.py
+
+      - name: Compile and test config.py
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== Compile config.py ==="
+          python3 -m py_compile config.py
+
+          echo "=== Run config.py tests ==="
+
+          python3 - <<'PY'
+          from dataclasses import replace
+
+          from config import (
+              Config,
+              ConfigError,
+              DEFAULT_CONFIG,
+              FORMAL_MODE,
+              TEST_MODE,
+              USER_CHANNELS,
+              config_as_dict,
+              load_config,
+              user_channel_mode,
+              validate_config,
+              validate_user_channels,
+          )
+          from models import ChannelMode, UserChannelConfig
+
+          def rejects(function, label):
+              try:
+                  function()
+              except ConfigError:
+                  return
+              raise AssertionError(
+                  f"Expected ConfigError: {label}"
+              )
+
+          # Default configuration.
+          assert validate_config(DEFAULT_CONFIG) == DEFAULT_CONFIG
+          assert load_config().run_mode == TEST_MODE
+          assert load_config(FORMAL_MODE).run_mode == FORMAL_MODE
+          assert config_as_dict(DEFAULT_CONFIG)["run_mode"] == TEST_MODE
+
+          print("PASS: default configuration and run modes.")
+
+          # Validation candidate capacity is independent of M3U output cap.
+          independent_output_cap = replace(
+              DEFAULT_CONFIG,
+              deep_validation_max_candidates=40,
+              m3u_max_entries=10,
+          )
+          assert validate_config(independent_output_cap)
+
+          print("PASS: validation capacity is independent of M3U entry cap.")
+
+          # Invalid modes and object types.
+          rejects(
+              lambda: load_config("unknown"),
+              "unknown run mode",
+          )
+
+          rejects(
+              lambda: validate_config({}),
+              "wrong configuration object",
+          )
+
+          # Invalid integer types and ranges.
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_sources=True)
+              ),
+              "boolean used as integer",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_sources=0)
+              ),
+              "zero source limit",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_redirects=-1)
+              ),
+              "negative redirect limit",
+          )
+
+          # Security switches must not be disabled.
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, require_ipv4_only=False)
+              ),
+              "IPv4-only security boundary disabled",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, verify_tls_certificates=False)
+              ),
+              "TLS verification disabled",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, m3u_encoding="ascii")
+              ),
+              "invalid output encoding",
+          )
+
+          # Contradictory request timeouts.
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, request_timeout_seconds=2)
+              ),
+              "request timeout shorter than phase timeout",
+          )
+
+          # Contradictory candidate limits.
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_candidates=100)
+              ),
+              "candidate capacity below quick-filter capacity",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(
+                      DEFAULT_CONFIG,
+                      quick_filter_max_candidates=20,
+                  )
+              ),
+              "quick-filter capacity below deep-validation capacity",
+          )
+
+          # Contradictory media budgets.
+          rejects(
+              lambda: validate_config(
+                  replace(
+                      DEFAULT_CONFIG,
+                      max_download_bytes_per_candidate=1024,
+                  )
+              ),
+              "candidate download budget below resource size",
+          )
+
+          # Contradictory run deadlines.
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, run_deadline_seconds=100)
+              ),
+              "whole-run deadline too short",
+          )
+
+          # Container security resource boundaries.
+          rejects(
+              lambda: validate_config(
+                  replace(
+                      DEFAULT_CONFIG,
+                      validator_memory_bytes=600 * 1024 * 1024,
+                  )
+              ),
+              "container memory exceeds verified boundary",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, validator_pids_limit=100)
+              ),
+              "container PID limit exceeds verified boundary",
+          )
+
+          print("PASS: invalid types, values and security boundaries.")
+
+          # New global discovery budget boundaries.
+          assert validate_config(
+              replace(
+                  DEFAULT_CONFIG,
+                  max_total_redirects=800,
+                  max_total_retries=800,
+              )
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_total_redirects=True)
+              ),
+              "boolean global redirect budget",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_total_retries=-1)
+              ),
+              "negative global retry budget",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(
+                      DEFAULT_CONFIG,
+                      max_total_redirects=801,
+                      max_total_retries=800,
+                  )
+              ),
+              "combined redirect and retry budgets exceed total request budget",
+          )
+
+          print("PASS: global redirect and retry budget boundaries.")
+
+          # Channel discovery result and report-size boundaries.
+          assert validate_config(
+              replace(
+                  DEFAULT_CONFIG,
+                  max_channel_discovery_results=DEFAULT_CONFIG.max_candidates,
+                  max_discovery_report_bytes=1,
+              )
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_channel_discovery_results=True)
+              ),
+              "boolean channel discovery result limit",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_channel_discovery_results=0)
+              ),
+              "zero channel discovery result limit",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(
+                      DEFAULT_CONFIG,
+                      max_channel_discovery_results=(
+                          DEFAULT_CONFIG.max_candidates + 1
+                      ),
+                  )
+              ),
+              "channel discovery result limit exceeds candidate limit",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_discovery_report_bytes=False)
+              ),
+              "boolean discovery report size limit",
+          )
+
+          rejects(
+              lambda: validate_config(
+                  replace(DEFAULT_CONFIG, max_discovery_report_bytes=0)
+              ),
+              "zero discovery report size limit",
+          )
+
+          print("PASS: channel discovery and report-size budget boundaries.")
+
+          # Empty user configuration selects automatic discovery.
+          assert USER_CHANNELS == ()
+          assert validate_user_channels() == ()
+          assert user_channel_mode() is ChannelMode.AUTO_DISCOVERY
+
+          # A non-empty user configuration selects user-configured mode.
+          configured_channels = (
+              UserChannelConfig("CCTV-1", "测试分组", 1),
+              UserChannelConfig("CCTV-5", "体育", 2),
+          )
+          assert validate_user_channels(configured_channels) == configured_channels
+          assert (
+              user_channel_mode(configured_channels)
+              is ChannelMode.USER_CONFIGURED
+          )
+
+          rejects(
+              lambda: validate_user_channels(
+                  (
+                      UserChannelConfig("CCTV-1", "测试分组", 1),
+                      UserChannelConfig("cctv-1", "测试分组", 2),
+                  )
+              ),
+              "duplicate channel names ignoring case",
+          )
+
+          rejects(
+              lambda: validate_user_channels(
+                  (
+                      UserChannelConfig("CCTV-1", "测试分组", 1),
+                      UserChannelConfig("CCTV-5", "体育", 1),
+                  )
+              ),
+              "duplicate channel order",
+          )
+
+          rejects(
+              lambda: validate_user_channels([]),
+              "user channel configuration must be a tuple",
+          )
+
+          print("PASS: empty and configured channel modes and invalid channel settings.")
+          print("ALL CONFIGURATION TESTS PASSED.")
+          PY
+
+      - name: Compile and test models.py contracts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== Python version ==="
+          python3 --version
+
+          echo "=== Compile models.py ==="
+          python3 -m py_compile models.py
+
+          echo "PASS: models.py Python compilation."
+
+          echo "=== Run data contract tests ==="
+
+          python3 - <<'PY'
+          from models import (
+              SCHEMA_VERSION,
+              STAGE_ORDER,
+              Candidate,
+              ContainerResult,
+              ContractError,
+              ErrorInfo,
+              HostVerification,
+              LineResult,
+              LineStatus,
+              MediaFileEntry,
+              MediaManifest,
+              ProbeEvidence,
+              PublishDecision,
+              RunMode,
+              RunSummary,
+              SourceOutcome,
+              StageResult,
+              StageStatus,
+              TaskIdentity,
+              TaskRequest,
+              TaskType,
+              validate_container_result,
+          )
+
+          def rejects(function, label):
+              try:
+                  function()
+              except ContractError:
+                  return
+              raise AssertionError(
+                  f"Expected ContractError: {label}"
+              )
+
+          now = "2026-11-07T00:00:00+00:00"
+          later = "2026-11-07T00:00:10+00:00"
+
+          identity = TaskIdentity(
+              "100",
+              1,
+              "task-1",
+              "candidate-1",
+              "resource-1",
+          )
+
+          candidate = Candidate(
+              "candidate-1",
+              "Test Channel",
+              "http://example.invalid/live.ts",
+              "source-1",
+          )
+
+          error = ErrorInfo(
+              "TEST_ERROR",
+              "Test error",
+              False,
+              "test",
+          )
+
+          evidence = ProbeEvidence(
+              ffprobe_exit_code=0,
+              ffmpeg_exit_code=0,
+              media_bytes_read=1024,
+              packets_read=10,
+              streams=("video",),
+              probe_completed=True,
+              playback_seconds=5.0,
+          )
+
+          assert evidence.sufficient_for_pass
+
+          # Serialization round trips.
+          assert ErrorInfo.from_dict(error.to_dict()) == error
+          assert Candidate.from_dict(candidate.to_dict()) == candidate
+
+          source = SourceOutcome(
+              "source-1",
+              (candidate,),
+              None,
+              True,
+          )
+          assert SourceOutcome.from_dict(
+              source.to_dict()
+          ) == source
+
+          request = TaskRequest(
+              SCHEMA_VERSION,
+              identity,
+              TaskType.MEDIA_PROBE,
+              now,
+              later,
+          )
+          assert TaskRequest.from_dict(
+              request.to_dict()
+          ) == request
+
+          entry = MediaFileEntry(
+              SCHEMA_VERSION,
+              identity,
+              "file-1",
+              "media/segment.ts",
+              "video/mp2t",
+              1024,
+              "a" * 64,
+              True,
+              now,
+          )
+          assert MediaFileEntry.from_dict(
+              entry.to_dict()
+          ) == entry
+
+          manifest = MediaManifest(
+              SCHEMA_VERSION,
+              identity,
+              (entry,),
+              now,
+          )
+          assert MediaManifest.from_dict(
+              manifest.to_dict()
+          ) == manifest
+
+          assert ProbeEvidence.from_dict(
+              evidence.to_dict()
+          ) == evidence
+
+          result = ContainerResult(
+              SCHEMA_VERSION,
+              identity,
+              "sha256:" + "b" * 64,
+              0,
+              now,
+              later,
+              evidence,
+              None,
+          )
+          assert ContainerResult.from_dict(
+              result.to_dict()
+          ) == result
+
+          line = LineResult(
+              candidate,
+              LineStatus.PASS,
+              "Successful media probe",
+              evidence,
+              None,
+          )
+          assert LineResult.from_dict(
+              line.to_dict()
+          ) == line
+
+          print("PASS: serialization round trips.")
+
+          # Task identity and request validation.
+          rejects(
+              lambda: TaskIdentity(
+                  "100",
+                  True,
+                  "task-1",
+                  "candidate-1",
+                  "resource-1",
+              ),
+              "boolean run_attempt",
+          )
+
+          rejects(
+              lambda: TaskRequest(
+                  SCHEMA_VERSION,
+                  identity,
+                  TaskType.MEDIA_PROBE,
+                  later,
+                  now,
+              ),
+              "deadline before creation",
+          )
+
+          print("PASS: task identity and deadline checks.")
+
+          # Media manifest validation.
+          rejects(
+              lambda: MediaFileEntry(
+                  SCHEMA_VERSION,
+                  identity,
+                  "file-2",
+                  "../outside.ts",
+                  "video/mp2t",
+                  1024,
+                  "a" * 64,
+                  True,
+                  now,
+              ),
+              "path traversal",
+          )
+
+          rejects(
+              lambda: MediaFileEntry(
+                  SCHEMA_VERSION,
+                  identity,
+                  "file-2",
+                  "media/incomplete.ts",
+                  "video/mp2t",
+                  1024,
+                  "a" * 64,
+                  False,
+                  now,
+              ),
+              "incomplete media",
+          )
+
+          other_identity = TaskIdentity(
+              "100",
+              1,
+              "task-1",
+              "candidate-1",
+              "resource-2",
+          )
+
+          other_entry = MediaFileEntry(
+              SCHEMA_VERSION,
+              other_identity,
+              "file-3",
+              "media/other.ts",
+              "video/mp2t",
+              1024,
+              "c" * 64,
+              True,
+              now,
+          )
+
+          rejects(
+              lambda: MediaManifest(
+                  SCHEMA_VERSION,
+                  identity,
+                  (other_entry,),
+                  now,
+              ),
+              "manifest identity mismatch",
+          )
+
+          print("PASS: media manifest checks.")
+
+          # Container result and host verification.
+          host = HostVerification(
+              identity,
+              "c" * 64,
+              True,
+              True,
+              True,
+              True,
+              True,
+          )
+
+          validate_container_result(
+              result,
+              identity,
+              host,
+          )
+
+          rejects(
+              lambda: validate_container_result(
+                  result,
+                  other_identity,
+                  host,
+              ),
+              "expected task identity mismatch",
+          )
+
+          untrusted_host = HostVerification(
+              identity,
+              "c" * 64,
+              False,
+              True,
+              True,
+              True,
+              True,
+          )
+
+          rejects(
+              lambda: validate_container_result(
+                  result,
+                  identity,
+                  untrusted_host,
+              ),
+              "untrusted host verification",
+          )
+
+          bad_exit_result = ContainerResult(
+              SCHEMA_VERSION,
+              identity,
+              "sha256:" + "b" * 64,
+              1,
+              now,
+              later,
+              evidence,
+              None,
+          )
+
+          rejects(
+              lambda: validate_container_result(
+                  bad_exit_result,
+                  identity,
+                  host,
+              ),
+              "nonzero container exit code",
+          )
+
+          no_evidence_result = ContainerResult(
+              SCHEMA_VERSION,
+              identity,
+              "sha256:" + "b" * 64,
+              0,
+              now,
+              later,
+              None,
+              None,
+          )
+
+          rejects(
+              lambda: validate_container_result(
+                  no_evidence_result,
+                  identity,
+                  host,
+              ),
+              "missing media evidence",
+          )
+
+          print("PASS: container result trust checks.")
+
+          # Line status validation.
+          insufficient_evidence = ProbeEvidence(
+              0,
+              1,
+              1024,
+              10,
+              ("video",),
+              True,
+              5.0,
+          )
+
+          rejects(
+              lambda: LineResult(
+                  candidate,
+                  LineStatus.PASS,
+                  "Invalid PASS",
+                  insufficient_evidence,
+                  None,
+              ),
+              "PASS without sufficient evidence",
+          )
+
+          rejects(
+              lambda: LineResult(
+                  candidate,
+                  LineStatus.NODE_ERROR,
+                  "Missing error details",
+                  None,
+                  None,
+              ),
+              "NODE_ERROR without error details",
+          )
+
+          print("PASS: line status checks.")
+
+          # RunSummary stores run data only; it does not decide publication.
+          pre_publish_stages = tuple(
+              StageResult(
+                  stage,
+                  StageStatus.COMPLETED,
+                  now,
+                  later,
+              )
+              for stage in STAGE_ORDER[:-1]
+          )
+
+          run_summary = RunSummary(
+              "100",
+              1,
+              RunMode.FORMAL,
+              pre_publish_stages,
+              (line,),
+              False,
+          )
+
+          summary_data = run_summary.to_dict()
+
+          assert set(summary_data) == {
+              "run_id",
+              "run_attempt",
+              "mode",
+              "stages",
+              "line_results",
+              "critical_error",
+          }
+          assert "pass_count" not in summary_data
+          assert "publish_eligible" not in summary_data
+
+          print("PASS: RunSummary data-only serialization.")
+
+          # PublishDecision contains eligibility and reasons only.
+          PublishDecision(True, ())
+          PublishDecision(False, ("No PASS lines",))
+
+          rejects(
+              lambda: PublishDecision(True, ("rejected",)),
+              "eligible decision with rejection reason",
+          )
+
+          rejects(
+              lambda: PublishDecision(False, ()),
+              "rejected decision without reason",
+          )
+
+          print("PASS: publish decision data contract.")
+          print("ALL MODELS CONTRACT TESTS PASSED.")
+          PY
+
+      - name: Build validator image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          IMAGE="china-iptv-v3-validator:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          docker build \
+            --pull \
+            --file Dockerfile.validator \
+            --tag "$IMAGE" \
+            .
+
+          echo "VALIDATOR_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Test network-none and runtime security
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          CONTAINER="validator-precheck-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          SNAPSHOT="$(mktemp -d)"
+
+          cleanup() {
+            docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+            rm -rf "$SNAPSHOT"
+          }
+
+          trap cleanup EXIT
+
+          printf 'validator-precheck-media\n' > "$SNAPSHOT/sample.ts"
+
+          chmod 0711 "$SNAPSHOT"
+          chmod 0444 "$SNAPSHOT/sample.ts"
+
+          EXPECTED_SHA="$(sha256sum "$SNAPSHOT/sample.ts" | awk '{print $1}')"
+
+          echo "=== Start validator with final security boundary ==="
+
+          docker run -d \
+            --name "$CONTAINER" \
+            --network none \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+            --mount "type=bind,src=$SNAPSHOT,dst=/input,readonly" \
+            --user 10001:10001 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --pids-limit 64 \
+            --memory 512m \
+            --cpus 1 \
+            "$VALIDATOR_IMAGE" \
+            sleep infinity
+
+          echo "=== Verify container is running ==="
+
+          test "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" = "true"
+
+          echo "=== Verify network mode ==="
+
+          NETWORK_MODE="$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CONTAINER")"
+          test "$NETWORK_MODE" = "none"
+
+          echo "PASS: Docker network mode is none."
+
+          echo "=== Verify read-only root filesystem ==="
+
+          READONLY="$(docker inspect -f '{{.HostConfig.ReadonlyRootfs}}' "$CONTAINER")"
+          test "$READONLY" = "true"
+
+          echo "PASS: root filesystem is read-only."
+
+          echo "=== Verify capability and privilege settings ==="
+
+          docker exec "$CONTAINER" sh -ec '
+            test "$(id -u)" = "10001"
+            test "$(id -g)" = "10001"
+
+            status="/proc/1/status"
+
+            read_status() {
+              sed -n "s/^$1:[[:space:]]*//p" "$status"
+            }
+
+            expected="0000000000000000"
+
+            test "$(read_status CapEff)" = "$expected"
+            test "$(read_status CapPrm)" = "$expected"
+            test "$(read_status CapInh)" = "$expected"
+            test "$(read_status CapAmb)" = "$expected"
+            test "$(read_status CapBnd)" = "$expected"
+            test "$(read_status NoNewPrivs)" = "1"
+
+            echo "PASS: non-root identity, zero capabilities and no-new-privileges."
+          '
+
+          echo "=== Verify resource limits ==="
+
+          MEMORY_LIMIT="$(docker inspect -f '{{.HostConfig.Memory}}' "$CONTAINER")"
+          CPU_LIMIT="$(docker inspect -f '{{.HostConfig.NanoCpus}}' "$CONTAINER")"
+          PID_LIMIT="$(docker inspect -f '{{.HostConfig.PidsLimit}}' "$CONTAINER")"
+
+          test "$MEMORY_LIMIT" = "536870912"
+          test "$CPU_LIMIT" = "1000000000"
+          test "$PID_LIMIT" = "64"
+
+          echo "PASS: memory, CPU and PID limits."
+
+          echo "=== Verify task snapshot is readable ==="
+
+          ACTUAL_SHA="$(
+            docker exec "$CONTAINER" sha256sum /input/sample.ts \
+              | awk '{print $1}'
+          )"
+
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA"
+
+          echo "PASS: mounted task snapshot content matches its SHA-256."
+
+          echo "=== Verify task snapshot cannot be modified ==="
+
+          if docker exec "$CONTAINER" sh -c 'touch /input/unauthorized-write'; then
+            echo "ERROR: validator modified the read-only task snapshot."
+            exit 1
+          fi
+
+          test ! -e "$SNAPSHOT/unauthorized-write"
+
+          echo "PASS: task snapshot is read-only."
+
+          echo "=== Verify temporary workspace ==="
+
+          docker exec "$CONTAINER" sh -ec '
+            touch /tmp/validator-write-test
+            test -f /tmp/validator-write-test
+            rm /tmp/validator-write-test
+          '
+
+          echo "PASS: temporary workspace is writable."
+
+          echo "=== Verify only loopback network interface exists ==="
+
+          INTERFACES="$(
+            docker exec "$CONTAINER" sh -c '
+              for item in /sys/class/net/*; do
+                basename "$item"
+              done
+            ' | sort
+          )"
+
+          test "$INTERFACES" = "lo"
+
+          echo "PASS: only loopback interface exists."
+
+          echo "=== Verify no default network route ==="
+
+          if docker exec "$CONTAINER" awk '
+            NR > 1 && $2 == "00000000" { found = 1 }
+            END { exit found ? 0 : 1 }
+          ' /proc/net/route; then
+            echo "ERROR: validator has a default network route."
+            exit 1
+          fi
+
+          echo "PASS: no default network route."
+
+          echo "=== Verify public IPv4 is unreachable ==="
+
+          if docker exec "$CONTAINER" timeout 5 \
+            ffprobe -v error \
+            -rw_timeout 2000000 \
+            -i http://1.1.1.1/ \
+            -show_entries format=format_name \
+            -of default=noprint_wrappers=1; then
+            echo "ERROR: validator unexpectedly reached public IPv4."
+            exit 1
+          fi
+
+          echo "PASS: public IPv4 access is unavailable."
+
+          echo "=== Verify DNS-based external access is unavailable ==="
+
+          if docker exec "$CONTAINER" timeout 5 \
+            ffprobe -v error \
+            -rw_timeout 2000000 \
+            -i http://example.com/ \
+            -show_entries format=format_name \
+            -of default=noprint_wrappers=1; then
+            echo "ERROR: validator unexpectedly accessed an external hostname."
+            exit 1
+          fi
+
+          echo "PASS: external hostname access is unavailable."
+
+          echo "=== Verify security gateway is unreachable ==="
+
+          if docker exec "$CONTAINER" timeout 5 \
+            ffprobe -v error \
+            -rw_timeout 2000000 \
+            -i http://172.30.10.2:8080/ \
+            -show_entries format=format_name \
+            -of default=noprint_wrappers=1; then
+            echo "ERROR: validator unexpectedly reached the security gateway."
+            exit 1
+          fi
+
+          echo "PASS: security gateway is unreachable."
+
+          echo "=== Verify FFmpeg and FFprobe ==="
+
+          docker exec "$CONTAINER" ffmpeg -version >/dev/null
+          docker exec "$CONTAINER" ffprobe -version >/dev/null
+
+          echo "PASS: FFmpeg and FFprobe execute."
+
+          echo "Validator network-none security precheck passed."
+
+      - name: Final cleanup and summary
+        if: always()
+        shell: bash
+        run: |
+          docker ps -a || true
+          docker network ls || true
