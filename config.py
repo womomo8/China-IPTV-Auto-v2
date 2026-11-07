@@ -125,8 +125,10 @@ def user_channel_mode(
     channels: tuple[UserChannelConfig, ...] = USER_CHANNELS,
 ) -> ChannelMode:
     """Return the single channel mode selected by whether config is empty."""
-    validated = validate_user_channels(channels)
-    return channel_mode_for(validated)
+    try:
+        return channel_mode_for(channels)
+    except ContractError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
