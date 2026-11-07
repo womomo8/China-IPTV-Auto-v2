@@ -4,8 +4,10 @@ China-IPTV-Auto-v3 施工计划与验收标准
 
 - CORE_FLOW.md：最高架构依据、固定流程和安全边界。
 - MASTER_PLAN.md：程序职责、接口契约、施工顺序、部署和验收标准。
-- PROGRESS.md：实际进度、测试证据、失败和未完成事项。
+- PROGRESS.md：项目重大方向变化、关键架构决策、施工顺序变化和重要问题结论的长期记录及交接依据。
 - README.md：项目用途、订阅地址和使用说明。
+
+PROGRESS.md 不是日常进度表或测试日志。
 
 本文件不得改变 CORE_FLOW.md 已锁定的架构。
 
