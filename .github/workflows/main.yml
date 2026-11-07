@@ -1,3 +1,4 @@
+
 name: Validator Network-None Security Precheck
 
 on:
@@ -76,6 +77,14 @@ jobs:
           trap cleanup EXIT
 
           printf 'validator-precheck-media\n' > "$SNAPSHOT/sample.ts"
+
+          # Permit the container user to traverse the snapshot directory.
+          # The directory remains non-writable to non-owner users.
+          chmod 0711 "$SNAPSHOT"
+
+          # The validator only needs read access to the input file.
+          chmod 0444 "$SNAPSHOT/sample.ts"
+
           EXPECTED_SHA="$(sha256sum "$SNAPSHOT/sample.ts" | awk '{print $1}')"
 
           echo "=== Start validator with final security boundary ==="
